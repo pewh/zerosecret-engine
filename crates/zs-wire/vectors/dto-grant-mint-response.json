@@ -1,0 +1,38 @@
+{
+  "about": "GrantMintResponse (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"signed_grant_json\": \"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\", \"identity_token\": \"eyJhbGciOiJFUzI1NiJ9.e30.AA\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\",\"identity_token\":\"eyJhbGciOiJFUzI1NiJ9.e30.AA\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"signed_grant_json\": \"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Signed_grant_json\": \"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\",\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

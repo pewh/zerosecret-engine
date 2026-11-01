@@ -1,0 +1,38 @@
+{
+  "about": "LoginClaim (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"subject\": \"alice@example.com\", \"enrollment_token\": \"enr-abababababababababababababababababababababababababababababababab\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"enrollment_token\":\"enr-abababababababababababababababababababababababababababababababab\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"subject\": \"alice@example.com\", \"issuer\": \"elsewhere\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Subject\": \"alice@example.com\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"subject\":\"alice@example.com\",\"subject\":\"bob@example.com\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

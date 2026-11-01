@@ -1,0 +1,38 @@
+{
+  "about": "AuditIngestRecord (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"reason\": \"policy allows\", \"credential_ref\": \"prod-db\", \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"reason\":\"policy allows\",\"credential_ref\":\"prod-db\",\"timestamp_ms\":1800000000000,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"reason\": \"policy allows\", \"credential_ref\": \"prod-db\", \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"trace_id\": \"4bf92f3577b34da6\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"reason\":\"policy allows\",\"credential_ref\":\"prod-db\",\"timestamp_ms\":1800000000000,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"reason\": \"policy allows\", \"credential_ref\": \"prod-db\", \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"Decision\": \"deny\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"reason\": \"policy allows\", \"credential_ref\": \"prod-db\", \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\",\"operation\":\"write\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

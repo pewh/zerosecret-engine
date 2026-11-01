@@ -1,0 +1,38 @@
+{
+  "about": "EnrollmentResponse (spec 5.3): one accepted text with a byte array, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"organization\": \"default\", \"client_certificate\": \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\", \"grant_verifying_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"grant_verifying_key_id\": \"control-k1\", \"wire_url\": \"https://localhost:7443\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"organization\":\"default\",\"client_certificate\":\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\",\"grant_verifying_key\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,255],\"grant_verifying_key_id\":\"control-k1\",\"wire_url\":\"https://localhost:7443\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"organization\": \"default\", \"client_certificate\": \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\", \"grant_verifying_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"grant_verifying_key_id\": \"control-k1\", \"wire_url\": \"https://localhost:7443\", \"issued_by\": \"control\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"organization\":\"default\",\"client_certificate\":\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\",\"grant_verifying_key\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,255],\"grant_verifying_key_id\":\"control-k1\",\"wire_url\":\"https://localhost:7443\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"organization\": \"default\", \"client_certificate\": \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\", \"grant_verifying_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"grant_verifying_key_id\": \"control-k1\", \"Wire_url\": \"https://localhost:7443\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"organization\": \"default\", \"client_certificate\": \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\", \"grant_verifying_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"grant_verifying_key_id\": \"control-k1\", \"wire_url\": \"https://localhost:7443\",\"wire_url\":\"https://localhost:7443\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

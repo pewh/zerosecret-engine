@@ -1,0 +1,16 @@
+[package]
+name = "zs-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+zs-vectors.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }

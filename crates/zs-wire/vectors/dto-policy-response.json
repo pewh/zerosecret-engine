@@ -1,0 +1,38 @@
+{
+  "about": "PolicyResponse (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"version\": 3, \"policy_json\": \"{\\\"version\\\":3,\\\"sources\\\":[]}\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"version\":3,\"policy_json\":\"{\\\"version\\\":3,\\\"sources\\\":[]}\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"version\": 3, \"policy_json\": \"{\\\"version\\\":3,\\\"sources\\\":[]}\", \"etag\": \"v3\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"version\":3,\"policy_json\":\"{\\\"version\\\":3,\\\"sources\\\":[]}\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Version\": 3, \"policy_json\": \"{\\\"version\\\":3,\\\"sources\\\":[]}\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"version\":3,\"version\":4,\"policy_json\":\"{}\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+/target
+**/target/
+
+# Local bootstrap policy read by `control` at startup (ZS_CONTROL_POLICY). A fresh
+# database has no policy row, and every dashboard mutation 404s without one, so this
+# seeds an empty document. Per-developer state, not repository content.
+/policy.json
+
+# The agent's local network bindings (`--policy`, default `zs-policy.json`). Carries no
+# authorization — authority comes only from signed grants — but it is per-developer.
+/zs-policy.json
+
+# Agent runtime state: the local MITM CA and its key, and the hash-chained audit log.
+/.zs-ca/
+/.zs-audit/
+/.zs-log/
+
+# The control plane's device-issuing CA (ZS_CONTROL_CA_DIR). Contains a private key.
+/.zs-control-ca/
+
+# Playwright MCP session captures.
+/.playwright-mcp/
+
+# Node / Astro / Video
+node_modules/
+.astro/
+dist/
+out/
+
+# Filesystem
+.DS_Store
+
+# Go control plane build outputs.
+/control/bin/
+/control/control
+
+# Generated Go (`*_templ.go`, `internal/store/db/`, the copied migration and Cedar files)
+# is committed on purpose: `go build` needs no generator, and CI regenerates and fails on
+# any diff. Only templ's watch-mode text files are local.
+*_templ.txt

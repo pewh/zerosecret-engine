@@ -1,0 +1,81 @@
+{
+  "about": "V4: Grant JSON accepted or refused; a pre-source agent shape refuses an AwsSsm grant",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "file grant is accepted",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"stripe-production\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"credential_ref\":\"vault:kv/stripe\",\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": true,
+        "grant_id": "g-1"
+      }
+    },
+    {
+      "name": "aws ssm grant is accepted",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"acme-db\",\"host\":\"db.acme.internal\",\"protocol\":\"postgres\",\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": true,
+        "grant_id": "g-1"
+      }
+    },
+    {
+      "name": "both credential_ref and source are refused",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"acme-db\",\"host\":\"db.acme.internal\",\"protocol\":\"postgres\",\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false,\"credential_ref\":\"vault:kv/stripe\"}"
+      },
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "neither credential_ref nor source is refused",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"stripe-production\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "a grant without connection fields is refused",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"stripe-production\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"credential_ref\":\"vault:kv/stripe\",\"operations\":[\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\"}"
+      },
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "a pre-source agent accepts a file grant",
+      "input": {
+        "parser": "pre_source",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"stripe-production\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"credential_ref\":\"vault:kv/stripe\",\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": true,
+        "grant_id": "g-1"
+      }
+    },
+    {
+      "name": "a pre-source agent refuses an aws ssm grant",
+      "input": {
+        "parser": "pre_source",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"acme-db\",\"host\":\"db.acme.internal\",\"protocol\":\"postgres\",\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,851 @@
+{
+  "about": "Policy decisions outside the ADR-0040 grid: the `*` grant and the cedar.rs unit cases.",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/GET",
+      "input": {
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/GET/environment",
+      "input": {
+        "environment": "development",
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/POST",
+      "input": {
+        "operation": "POST",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/POST/environment",
+      "input": {
+        "environment": "development",
+        "operation": "POST",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/*",
+      "input": {
+        "operation": "*",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/*/environment",
+      "input": {
+        "environment": "development",
+        "operation": "*",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/connect",
+      "input": {
+        "operation": "connect",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "alice@company.com has no grant for claude-code on any-api"
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/connect/environment",
+      "input": {
+        "environment": "development",
+        "operation": "connect",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "alice@company.com has no grant for claude-code on any-api"
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/CONNECT",
+      "input": {
+        "operation": "CONNECT",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/CONNECT/environment",
+      "input": {
+        "environment": "development",
+        "operation": "CONNECT",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/PATCH",
+      "input": {
+        "operation": "PATCH",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "the_any_method_rule_agrees_with_permits/star/PATCH/environment",
+      "input": {
+        "environment": "development",
+        "operation": "PATCH",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "*"
+              ],
+              "resource": "any-api",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "any-api",
+              "operations": [
+                "*",
+                "connect"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "any-api",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "each_forbid_fires_alone/environment",
+      "input": {
+        "environment": "production",
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "stripe-production",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "host": "api.stripe.com",
+              "materialization": "retrieve",
+              "name": "stripe-production",
+              "operations": [
+                "GET",
+                "POST"
+              ],
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "stripe-production",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "alice@company.com has no grant for claude-code on stripe-production in environment production"
+      }
+    },
+    {
+      "name": "each_forbid_fires_alone/no_grant",
+      "input": {
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "stripe-production",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "host": "api.stripe.com",
+              "materialization": "retrieve",
+              "name": "stripe-production",
+              "operations": [
+                "GET",
+                "POST"
+              ],
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "openai-production",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "alice@company.com has no grant for claude-code on openai-production"
+      }
+    },
+    {
+      "name": "each_forbid_fires_alone/resource_operation",
+      "input": {
+        "operation": "DELETE",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "DELETE"
+              ],
+              "resource": "limited",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "limited",
+              "operations": [
+                "GET"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "limited",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "operation DELETE not allowed on limited"
+      }
+    },
+    {
+      "name": "each_forbid_fires_alone/project",
+      "input": {
+        "environment": "development",
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "billing-api",
+              "subject": "alice@acme.test",
+              "workload": "claude-code"
+            },
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "shared-api",
+              "subject": "alice@acme.test",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "billing-api",
+              "operations": [
+                "GET"
+              ],
+              "project": "billing",
+              "protocol": "https"
+            },
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "shared-api",
+              "operations": [
+                "GET"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "project": "analytics",
+        "resource": "billing-api",
+        "subject": "alice@acme.test",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "billing-api is in project billing, which is not the caller's project analytics"
+      }
+    },
+    {
+      "name": "a_granted_request_fires_nothing",
+      "input": {
+        "environment": "development",
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "stripe-production",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "host": "api.stripe.com",
+              "materialization": "retrieve",
+              "name": "stripe-production",
+              "operations": [
+                "GET",
+                "POST"
+              ],
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "stripe-production",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "names_with_cedar_syntax_are_data/matching",
+      "input": {
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "r::\"s\"",
+              "subject": "a\"b@x.test",
+              "workload": "w\\n"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "r::\"s\"",
+              "operations": [
+                "GET"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "r::\"s\"",
+        "subject": "a\"b@x.test",
+        "workload": "w\\n"
+      },
+      "expect": {
+        "ok": {
+          "grant_index": 0
+        }
+      }
+    },
+    {
+      "name": "names_with_cedar_syntax_are_data/other_name",
+      "input": {
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "r::\"s\"",
+              "subject": "a\"b@x.test",
+              "workload": "w\\n"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "r::\"s\"",
+              "operations": [
+                "GET"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "r::\"t\"",
+        "subject": "a\"b@x.test",
+        "workload": "w\\n"
+      },
+      "expect": {
+        "err": "a\"b@x.test has no grant for w\\n on r::\"t\""
+      }
+    },
+    {
+      "name": "an_unknown_resource_errors_and_is_not_allowed",
+      "input": {
+        "operation": "GET",
+        "policy": {
+          "grants": [
+            {
+              "environment": "development",
+              "operations": [
+                "GET"
+              ],
+              "resource": "ghost",
+              "subject": "alice@company.com",
+              "workload": "claude-code"
+            }
+          ],
+          "resources": [
+            {
+              "credential_ref": null,
+              "host": "host.test",
+              "materialization": "retrieve",
+              "name": "known",
+              "operations": [
+                "GET"
+              ],
+              "project": null,
+              "protocol": "https"
+            }
+          ],
+          "version": 1
+        },
+        "resource": "ghost",
+        "subject": "alice@company.com",
+        "workload": "claude-code"
+      },
+      "expect": {
+        "err": "unknown resource ghost"
+      }
+    }
+  ]
+}

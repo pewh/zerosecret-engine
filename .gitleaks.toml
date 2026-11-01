@@ -1,0 +1,20 @@
+title = "ZeroSecret gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Vendored AWS SigV4 test vectors: AWS's published example credentials"
+paths = ['''^crates/zs-conformance/vectors/aws-sig-v4-test-suite/''']
+
+[[allowlists]]
+description = "Dummy credentials in tests, and the RFC 6455 sample nonce"
+regexTarget = "line"
+regexes = [
+  '''sk_live_12345\b''',
+  '''sk-proj-67890\b''',
+  '''sk-proj-abcde987654321\b''',
+  '''sk_live_supersecret12345\b''',
+  '''sk_test_stripesecret999\b''',
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+]

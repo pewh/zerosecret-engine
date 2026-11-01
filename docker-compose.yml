@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:16
+    # Check port availability by `lsof -nP -iTCP:5434 -sTCP:LISTEN`
+    ports: ["5434:5432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zerosecret_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zerosecret_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  mysql:
+    image: mysql:8.4
+    profiles: ["mysql"]
+    command:
+      - --mysql-native-password=ON
+      - --ssl-ca=/certs/ca.pem
+      - --ssl-cert=/certs/server.pem
+      - --ssl-key=/certs/server-key.pem
+    ports: ["3307:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: zs-test-root
+    volumes:
+      - ./target/db-test-certs:/certs:ro
+      - ./fixtures/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pzs-test-root --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+
+  mysql-plain:
+    image: mysql:8.4
+    profiles: ["mysql"]
+    command:
+      - --mysql-native-password=ON
+      - --tls-version=
+    ports: ["3308:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: zs-test-root
+    volumes:
+      - ./fixtures/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pzs-test-root --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+
+  postgres-tls:
+    image: postgres:16
+    profiles: ["pgtls"]
+    ports: ["5435:5432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zerosecret_test
+      POSTGRES_INITDB_ARGS: "--auth-local=trust --auth-host=scram-sha-256"
+    volumes:
+      - ./target/db-test-certs:/certs:ro
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        install -o postgres -g postgres -m 600 /certs/server-key.pem /var/lib/postgresql/server-key.pem &&
+        install -o postgres -g postgres -m 644 /certs/server.pem /var/lib/postgresql/server.pem &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/server.pem
+        -c ssl_key_file=/var/lib/postgresql/server-key.pem
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zerosecret_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  mongo:
+    image: mongo:8.0
+    profiles: ["mongo"]
+    ports: ["27018:27017"]
+    volumes:
+      - ./target/db-test-certs:/certs:ro
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        cat /certs/server.pem /certs/server-key.pem > /tmp/mongo.pem &&
+        head -c 512 /dev/urandom | base64 -w0 > /tmp/keyfile &&
+        chown mongodb:mongodb /tmp/mongo.pem /tmp/keyfile &&
+        chmod 400 /tmp/mongo.pem /tmp/keyfile &&
+        exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --keyFile /tmp/keyfile
+        --tlsMode allowTLS --tlsCertificateKeyFile /tmp/mongo.pem --tlsCAFile /certs/ca.pem
+        --tlsAllowConnectionsWithoutCertificates
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm
+    # Check port availability by `lsof -nP -iTCP:8180 -sTCP:LISTEN`
+    ports: ["8180:8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ./fixtures/keycloak/zerosecret-realm.json:/opt/keycloak/data/import/zerosecret-realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 5s
+      retries: 25
+      start_period: 10s

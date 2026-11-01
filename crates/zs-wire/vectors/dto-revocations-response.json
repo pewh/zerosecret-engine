@@ -1,0 +1,38 @@
+{
+  "about": "RevocationsResponse (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"revoked_grant_ids\": [\"g-0123456789abcdef0123456789abcdef\", \"g-1\"]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"revoked_grant_ids\":[\"g-0123456789abcdef0123456789abcdef\",\"g-1\"]}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"revoked_grant_ids\": [\"g-0123456789abcdef0123456789abcdef\"], \"next\": \"g-2\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"revoked_grant_ids\":[\"g-0123456789abcdef0123456789abcdef\"]}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Revoked_grant_ids\": [\"g-0123456789abcdef0123456789abcdef\"]}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"revoked_grant_ids\":[\"g-0123456789abcdef0123456789abcdef\"],\"revoked_grant_ids\":[]}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[package]
+name = "zs-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zs-identity.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

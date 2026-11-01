@@ -1,0 +1,38 @@
+{
+  "about": "WireRefusal (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"code\": \"device_unknown\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"code\":\"device_unknown\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"code\": \"not_a_member\", \"subject\": \"alice@example.com\", \"detail\": \"member\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"code\":\"not_a_member\",\"subject\":\"alice@example.com\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Code\": \"device_unknown\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"code\":\"device_unknown\",\"code\":\"not_a_member\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

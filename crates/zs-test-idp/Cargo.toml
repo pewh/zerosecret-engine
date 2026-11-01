@@ -1,0 +1,17 @@
+[package]
+name = "zs-test-idp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+ring.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+tokio.workspace = true

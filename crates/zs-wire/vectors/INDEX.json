@@ -1,0 +1,17 @@
+{
+  "files": {
+    "device-signature.json": 10,
+    "dto-audit-ingest-record.json": 4,
+    "dto-enrollment-request.json": 4,
+    "dto-enrollment-response.json": 4,
+    "dto-enrollment-token-response.json": 4,
+    "dto-grant-mint-request.json": 4,
+    "dto-grant-mint-response.json": 4,
+    "dto-login-claim.json": 4,
+    "dto-policy-response.json": 4,
+    "dto-revocations-response.json": 4,
+    "dto-revoke-request.json": 4,
+    "dto-wire-refusal.json": 4,
+    "login-code.json": 1
+  }
+}

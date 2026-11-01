@@ -1,0 +1,19 @@
+[package]
+name = "zs-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cedar-policy.workspace = true
+zs-identity.workspace = true
+zs-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+zs-vectors.workspace = true

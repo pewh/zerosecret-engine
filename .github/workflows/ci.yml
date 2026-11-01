@@ -1,0 +1,456 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --check --ignore-missing "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          tar -xzf "$archive" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks "$archive" "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+      - name: Release gates
+        env:
+          FORBIDDEN_NAMES: ${{ secrets.FORBIDDEN_NAMES }}
+        run: |
+          if [ -z "$FORBIDDEN_NAMES" ]; then
+            echo "::notice::FORBIDDEN_NAMES is not available (a pull request from a fork); the name gate is skipped"
+            export SKIP_NAME_GATE=1
+          fi
+          tools/public-gates.sh
+
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24"
+      - name: Workspace tests on a private Secret Service
+        env:
+          ZS_TEST_NODE: node
+          ZS_BUILD_TEST_ENDPOINTS: "1"
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            cargo test --workspace --locked
+          '
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  conformance:
+    # MongoDB 8.x refuses to start on the ubuntu-24.04 runner kernel (7.0.0, in the
+    # affected range 6.19 through 7.0.13). The ubuntu-22.04 image runs 6.8.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring mysql-client-8.0
+      - run: npm install -g mongosh
+      - run: tools/db-test-certs.sh target/db-test-certs
+      - run: docker compose --profile pgtls --profile mysql --profile mongo up -d --wait postgres postgres-tls mysql mongo
+      - run: tools/mongo-test-setup.sh
+      - run: cargo build --locked -p zs
+      - name: Conformance suite on a private Secret Service
+        env:
+          ZS_CONFORMANCE_REQUIRE_FIXTURES: "1"
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            cargo test --locked -p zs-conformance
+            cargo run --locked -p zs-conformance -- run --config crates/zs-conformance/conformance.toml
+          '
+      - if: failure()
+        run: docker compose --profile pgtls --profile mysql --profile mongo logs postgres postgres-tls mysql mongo
+
+  # The macOS jobs run only while this repository is public: hosted macOS minutes are free on a
+  # public repository and billed at ten times the Linux rate on a private one.
+  macos-check:
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Create disposable keychain
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-ci.keychain-db
+        run: |
+          set -euo pipefail
+          password=$(openssl rand -hex 16)
+          security create-keychain -p "$password" "$ZS_CI_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$ZS_CI_KEYCHAIN"
+          security unlock-keychain -p "$password" "$ZS_CI_KEYCHAIN"
+          security default-keychain -d user -s "$ZS_CI_KEYCHAIN"
+          security list-keychains -d user -s "$ZS_CI_KEYCHAIN"
+      # The H4 test runs a real Node `fetch` through the agent and needs Node 24 or later.
+      # With ZS_TEST_NODE set, a missing or older Node fails the test instead of skipping it.
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24"
+      - name: Workspace tests on a disposable keychain
+        run: cargo build --locked -p zs && cargo test --workspace --locked
+        env:
+          ZS_TEST_NODE: node
+          ZS_BUILD_TEST_ENDPOINTS: "1"
+      # Positive control for the release refusal below: the same check sees the names here.
+      - run: strings target/debug/zs | grep -q ZS_TEST_AWS_RESOLVE
+      # Build the release binaries first, as their own step. The budget tests measure
+      # cold start and added latency against wall-clock budgets, so compiling in the same
+      # step that times them puts a full cargo build in competition with the measurement:
+      # cold start measures 151-262 ms idle but 427-550 ms under concurrent build load,
+      # against a 400 ms budget. Separating the steps is what keeps the budgets honest
+      # rather than widening them to absorb the runner's own noise.
+      - run: cargo build --locked --release -p zs --tests
+      # A release binary must not carry the test-endpoint names or their reader.
+      - run: '! strings target/release/zs | grep -q ZS_TEST_'
+      - run: cargo test --locked --release -p zs --test test_endpoints
+      - run: cargo test --locked --release -p zs --test budget_latency --test budget_footprint
+      # The steps above are the last to start the agent. Each agent-spawning test deletes
+      # the exact record its CA directory names when its fixture drops, so this disposable
+      # keychain must now hold no `zerosecret.ca.v1` record. A planted canary must be counted
+      # exactly once first, so a count that sees nothing cannot pass as zero. Only this
+      # disposable file is dumped, and without `-d`, which prints attributes and no secret.
+      - name: No CA records left in the disposable keychain
+        timeout-minutes: 2
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-ci.keychain-db
+        run: |
+          set -euo pipefail
+          count() {
+            security dump-keychain "$ZS_CI_KEYCHAIN" | { grep -Fc '"svce"<blob>="zerosecret.ca.v1"' || true; }
+          }
+          security add-generic-password -a zs-ci-record-canary -s zerosecret.ca.v1 -w canary "$ZS_CI_KEYCHAIN"
+          seen=$(count)
+          security delete-generic-password -a zs-ci-record-canary -s zerosecret.ca.v1 "$ZS_CI_KEYCHAIN" > /dev/null
+          left=$(count)
+          echo "zerosecret.ca.v1 records: $seen with the canary, $left after deleting it"
+          if [ "$seen" -ne 1 ] || [ "$left" -ne 0 ]; then
+            echo "expected exactly the canary, then no zerosecret.ca.v1 record" >&2
+            exit 1
+          fi
+      - name: Delete disposable keychain
+        if: always()
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-ci.keychain-db
+        run: |
+          security delete-keychain "$ZS_CI_KEYCHAIN"
+          test ! -e "$ZS_CI_KEYCHAIN"
+          ! security list-keychains -d user | grep -Fq "\"$ZS_CI_KEYCHAIN\""
+
+
+  db-real:
+    # MongoDB 8.x refuses to start on the ubuntu-24.04 runner kernel (7.0.0, in the
+    # affected range 6.19 through 7.0.13). The ubuntu-22.04 image runs 6.8.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      ZS_REQUIRE_MYSQL: "1"
+      ZS_TEST_MYSQL: 127.0.0.1:3307
+      ZS_TEST_MYSQL_PLAIN: 127.0.0.1:3308
+      ZS_TEST_MYSQL_CLIENTS: "1"
+      ZS_REQUIRE_PG_TLS: "1"
+      ZS_TEST_PG_TLS: postgres://postgres:postgres@127.0.0.1:5435/zerosecret_test
+      ZS_REQUIRE_MONGO: "1"
+      ZS_TEST_MONGO: 127.0.0.1:27018
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: tools/db-test-certs.sh target/db-test-certs
+      - run: docker compose up -d --wait mysql mysql-plain postgres-tls mongo
+      - run: tools/mongo-test-setup.sh
+      - run: for image in mysql:5.7 mysql:8.0 mysql:9; do docker pull -q "$image"; done
+      - run: cargo test --locked -p zs-proto-mysql --test mysql_real -- --test-threads=1 --include-ignored --nocapture
+        env:
+          ZS_TEST_MYSQL_CERTS: ${{ github.workspace }}/target/db-test-certs
+      - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
+        env:
+          ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
+      - run: cargo test --locked -p zs --test postgres_real tls_ -- --test-threads=1 --nocapture
+      - if: failure()
+        run: docker compose --profile mysql --profile pgtls --profile mongo logs mysql mysql-plain postgres-tls mongo
+
+  # The Keychain tests are ignored by default and panic unless the run proves it targets a
+  # disposable keychain: `ZS_CI_KEYCHAIN` must name a keychain file under RUNNER_TEMP that is
+  # the user default keychain and the only user search-list entry. Only the lock tests need
+  # the password: it is masked and written to a 0600 file whose path only the create, native
+  # adapter, process and delete steps receive. The job builds the whole agent. A locked
+  # keychain is refused by the agent's lock check, so no step waits out the 30 s bound.
+  macos-native:
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Create disposable keychain
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+          ZS_CI_KEYCHAIN_PASSWORD_FILE: ${{ runner.temp }}/zerosecret-native.keychain-password
+        run: |
+          set -euo pipefail
+          password=$(openssl rand -hex 16)
+          echo "::add-mask::$password"
+          (umask 077 && printf '%s' "$password" > "$ZS_CI_KEYCHAIN_PASSWORD_FILE")
+          security create-keychain -p "$password" "$ZS_CI_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$ZS_CI_KEYCHAIN"
+          security unlock-keychain -p "$password" "$ZS_CI_KEYCHAIN"
+          security default-keychain -d user -s "$ZS_CI_KEYCHAIN"
+          security list-keychains -d user -s "$ZS_CI_KEYCHAIN"
+      # The filter also matches the ignored native tests of `tests_macos`, counted as ignored.
+      - name: Core CA storage tests
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm ca::platform::tests -- --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 104 passed; 0 failed; 19 ignored;" "$log" || { echo "expected exactly 104 core CA storage tests to pass" >&2; exit 1; }
+      - name: Native macOS CA adapter tests
+        timeout-minutes: 8
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+          ZS_CI_KEYCHAIN_PASSWORD_FILE: ${{ runner.temp }}/zerosecret-native.keychain-password
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_ca_macos_ -- --ignored --test-threads=1 --show-output | tee "$log"
+          grep -Fq "test result: ok. 19 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 19 native macOS CA tests to pass" >&2; exit 1; }
+      - name: Native macOS device record tests
+        timeout-minutes: 8
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+          ZS_CI_KEYCHAIN_PASSWORD_FILE: ${{ runner.temp }}/zerosecret-native.keychain-password
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_device_macos_ -- --ignored --test-threads=1 --show-output | tee "$log"
+          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 3 native macOS device record tests to pass" >&2; exit 1; }
+      - name: Keychain integration tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm --test keychain -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 7 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 7 Keychain integration tests to pass" >&2; exit 1; }
+      - name: Build macOS CA process tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test --locked -p zs --test platform_ca_startup --no-run
+      - name: macOS CA process tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+          ZS_CI_KEYCHAIN_PASSWORD_FILE: ${{ runner.temp }}/zerosecret-native.keychain-password
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 15 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 15 macOS CA process tests to pass" >&2; exit 1; }
+      # The real verifier drives the real agent through one synthetic HTTPS workload with
+      # secure CA startup in this disposable keychain, then once more expecting a different
+      # credential, which must fail on the auth mismatch alone. `zs-verify` has no library
+      # target, so the test finds the binary next to `zs`, built here into the same target
+      # directory. The test prints only a predicate summary of each JSON report (counts,
+      # booleans, file counts, each vector's status and finding), never a credential. It
+      # needs no keychain password.
+      - name: Hardened verifier evidence on secure CA startup
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+        run: |
+          set -euo pipefail
+          cargo build --locked -p zs-verify --bin zs-verify
+          cargo test --locked -p zs --test verifier_ca_evidence --no-run
+          log=$(mktemp)
+          cargo test --locked -p zs --test verifier_ca_evidence -- --ignored --test-threads=1 --show-output | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 1 hardened verifier evidence test to pass" >&2; exit 1; }
+      - name: Delete disposable keychain
+        if: always()
+        env:
+          ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
+          ZS_CI_KEYCHAIN_PASSWORD_FILE: ${{ runner.temp }}/zerosecret-native.keychain-password
+        run: |
+          rm -f "$ZS_CI_KEYCHAIN_PASSWORD_FILE"
+          test ! -e "$ZS_CI_KEYCHAIN_PASSWORD_FILE"
+          security delete-keychain "$ZS_CI_KEYCHAIN"
+          test ! -e "$ZS_CI_KEYCHAIN"
+          ! security list-keychains -d user | grep -Fq "\"$ZS_CI_KEYCHAIN\""
+
+  linux-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring libsecret-tools
+      - run: cargo clippy --locked -p zs-mitm --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      # The filter also matches the ignored native tests of `tests_linux`, counted as ignored.
+      - name: Core CA storage tests
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm ca::platform::tests -- --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 89 passed; 0 failed; 12 ignored;" "$log" || { echo "expected exactly 89 core CA storage tests to pass" >&2; exit 1; }
+      - run: cargo check --locked -p zs --lib --bins
+      - run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_ca_linux_ -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 12 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 12 native Linux CA tests to pass" >&2; exit 1; }
+      - run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_device_linux_ -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 3 native Linux device record tests to pass" >&2; exit 1; }
+      - run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 11 Linux CA process tests to pass" >&2; exit 1; }
+      # Agent-spawning tests reach the session bus they inherit, and `TestHome` deletes the
+      # exact item each test's `.ca-storage-id` names (service `zerosecret.ca.v1`, that
+      # account, schema 1). Run one such file against a private session bus with a disposable
+      # keyring, then require no `zerosecret.ca.v1` item left there. A planted canary must be
+      # counted exactly once first, so a count that sees nothing cannot pass as zero. The
+      # count prints object paths only, never a secret. The bus and keyring are this step's
+      # own; the keyring is unlocked with a random password and lives under a temp directory.
+      - name: Agent-spawning tests leave no CA item on a private bus
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          cargo test --locked -p zs --test absolute_uri --no-run
+          root=$(mktemp -d)
+          mkdir -p "$root/data"
+          isolated=(env -i PATH="$PATH" HOME="$root" XDG_RUNTIME_DIR="$root" XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/data" XDG_CACHE_HOME="$root/data")
+          bus_pid=
+          keyring_pid=
+          trap 'kill $keyring_pid $bus_pid 2> /dev/null || true' EXIT
+          "${isolated[@]}" dbus-daemon --session --nofork --address="unix:path=$root/bus" --print-address=1 < /dev/null > "$root/address" 2> /dev/null &
+          bus_pid=$!
+          for _ in $(seq 200); do [ -s "$root/address" ] && break; sleep 0.05; done
+          address=$(head -n 1 "$root/address")
+          case $address in "unix:path=$root/bus,"*) ;; *) echo "private session bus did not start" >&2; exit 1 ;; esac
+          export DBUS_SESSION_BUS_ADDRESS="$address"
+          openssl rand -hex 16 | "${isolated[@]}" DBUS_SESSION_BUS_ADDRESS="$address" gnome-keyring-daemon --foreground --unlock --components=secrets > /dev/null 2>&1 &
+          keyring_pid=$!
+          send() { dbus-send --session --print-reply --reply-timeout=10000 "$@" 2> /dev/null; }
+          secrets() { send --dest=org.freedesktop.secrets "$@"; }
+          # Ask for the name's owner first, so no call auto-starts a second, locked keyring.
+          ready() {
+            send --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -F 'boolean true' > /dev/null || return 1
+            collection=$(secrets /org/freedesktop/secrets org.freedesktop.Secret.Service.ReadAlias string:default | sed -n 's/^ *object path "\(.*\)"$/\1/p')
+            [ -n "$collection" ] && [ "$collection" != / ] || return 1
+            secrets "$collection" org.freedesktop.DBus.Properties.Get string:org.freedesktop.Secret.Collection string:Locked | grep -F 'boolean false' > /dev/null
+          }
+          for _ in $(seq 200); do ready && break; sleep 0.05; done
+          ready || { echo "private secret service did not start" >&2; exit 1; }
+          log=$(mktemp)
+          cargo test --locked -p zs --test absolute_uri -- --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 4 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 4 agent-spawning tests to pass" >&2; exit 1; }
+          count() {
+            secrets /org/freedesktop/secrets org.freedesktop.Secret.Service.SearchItems dict:string:string:service,zerosecret.ca.v1 | { grep -c '^ *object path ' || true; }
+          }
+          printf canary | secret-tool store --label=zs-ci-record-canary service zerosecret.ca.v1 account zs-ci-record-canary
+          seen=$(count)
+          secret-tool clear service zerosecret.ca.v1 account zs-ci-record-canary
+          left=$(count)
+          echo "zerosecret.ca.v1 items: $seen with the canary, $left after deleting it"
+          if [ "$seen" -ne 1 ] || [ "$left" -ne 0 ]; then
+            echo "expected exactly the canary, then no zerosecret.ca.v1 item" >&2
+            exit 1
+          fi
+
+  windows-native:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5.1.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p zs-mitm --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      # The filter also matches the ignored native tests of `tests_windows`, counted as ignored.
+      - name: Core CA storage tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm ca::platform::tests -- --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 87 passed; 0 failed; 12 ignored;" "$log" || { echo "expected exactly 87 core CA storage tests to pass" >&2; exit 1; }
+      - run: cargo check --locked -p zs --lib --bins
+      - shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_ca_windows_ -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 12 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 12 native Windows CA tests to pass" >&2; exit 1; }
+      - shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-mitm native_device_windows_ -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 3 native Windows device record tests to pass" >&2; exit 1; }
+      - shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 11 Windows CA process tests to pass" >&2; exit 1; }

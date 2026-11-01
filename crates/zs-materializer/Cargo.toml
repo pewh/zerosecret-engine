@@ -1,0 +1,30 @@
+[package]
+name = "zs-materializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zs-credential.workspace = true
+zs-grant.workspace = true
+zs-policy.workspace = true
+zs-upstream = { workspace = true, features = ["reqwest"] }
+zs-proto-http.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
+form_urlencoded = "1"
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+zs-test-aws.workspace = true

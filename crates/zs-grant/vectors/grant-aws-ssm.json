@@ -1,0 +1,43 @@
+{
+  "about": "V2: AwsSsm-grant canonical payload and Ed25519 signature for the acme-db input",
+  "version": 1,
+  "frozen": true,
+  "context": {
+    "key_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "key_id": "k1"
+  },
+  "cases": [
+    {
+      "name": "acme-db aws ssm grant",
+      "input": {
+        "subject": "alice@company.com",
+        "workload": "claude-code",
+        "resource": "acme-db",
+        "host": "db.acme.internal",
+        "protocol": "postgres",
+        "source": {
+          "kind": "aws_ssm",
+          "role_arn": "arn:aws:iam::123456789012:role/zs-acme-db",
+          "region": "ap-southeast-1",
+          "parameter": "/acme/prod/DB_PASSWORD"
+        },
+        "operations": [
+          "POST",
+          "GET"
+        ],
+        "environment": "development",
+        "expires_at_ms": 1700000000000,
+        "grant_id": "g-1",
+        "materialization": "retrieve",
+        "upstream_host": "api.stripe.com",
+        "upstream_port": 443,
+        "upstream_tls": "default",
+        "local_endpoint": false
+      },
+      "expect": {
+        "payload_hex": "656e7669726f6e6d656e741f646576656c6f706d656e741e657870697265735f61745f6d731f313730303030303030303030301e6772616e745f69641f672d311e686f73741f64622e61636d652e696e7465726e616c1e6c6f63616c5f656e64706f696e741f66616c73651e6d6174657269616c697a6174696f6e1f72657472696576651e6f7065726174696f6e731f4745541d504f53541e70726f746f636f6c1f706f7374677265731e7265736f757263651f61636d652d64621e736f757263652e6b696e641f6177735f73736d1e736f757263652e706172616d657465721f2f61636d652f70726f642f44425f50415353574f52441e736f757263652e726567696f6e1f61702d736f757468656173742d311e736f757263652e726f6c655f61726e1f61726e3a6177733a69616d3a3a3132333435363738393031323a726f6c652f7a732d61636d652d64621e7375626a6563741f616c69636540636f6d70616e792e636f6d1e757073747265616d5f686f73741f6170692e7374726970652e636f6d1e757073747265616d5f706f72741f3434331e757073747265616d5f746c731f64656661756c741e776f726b6c6f61641f636c617564652d636f64651e",
+        "signature_b64": "kJIAfL8iHtlHL2MrTaIkUSfGZdrSi+2gT7IVf1GrEij2PT3bup1Mj3Ncc15FrcD4lI6HnbB4KAYNH2g9ZbWYBA=="
+      }
+    }
+  ]
+}

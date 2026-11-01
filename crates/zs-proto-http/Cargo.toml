@@ -1,0 +1,22 @@
+[package]
+name = "zs-proto-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zs-credential.workspace = true
+zs-identity.workspace = true
+zs-protocol.workspace = true
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-credential-types = { version = "1", default-features = false }
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"] }

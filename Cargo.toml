@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zs-vectors",
+    "crates/zs-diag",
+    "crates/zs-identity",
+    "crates/zs-credential",
+    "crates/zs-policy",
+    "crates/zs-grant",
+    "crates/zs-protocol",
+    "crates/zs-upstream",
+    "crates/zs-wire",
+    "crates/zs-proto-http",
+    "crates/zs-proto-postgres",
+    "crates/zs-proto-mysql",
+    "crates/zs-proto-mongo",
+    "crates/zs-materializer",
+    "crates/zs-audit",
+    "crates/zs-mitm",
+    "crates/zs-test-keychain",
+    "crates/zs-test-idp",
+    "crates/zs-test-aws",
+    "crates/zs-conformance",
+    "apps/zs",
+    "tools/zs-verify",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zs_test_endpoints)'] }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[workspace.dependencies]
+zs-vectors = { path = "crates/zs-vectors" }
+zs-identity = { path = "crates/zs-identity" }
+zs-policy = { path = "crates/zs-policy" }
+zs-grant = { path = "crates/zs-grant" }
+zs-materializer = { path = "crates/zs-materializer" }
+zs-wire = { path = "crates/zs-wire" }
+zs-proto-postgres = { path = "crates/zs-proto-postgres" }
+zs-proto-mysql = { path = "crates/zs-proto-mysql" }
+zs-proto-mongo = { path = "crates/zs-proto-mongo" }
+md-5 = "0.10"
+zs-upstream = { path = "crates/zs-upstream" }
+sha1 = "0.10"
+zs-diag = { path = "crates/zs-diag" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hmac = "0.12"
+base64 = "0.22"
+axum = "0.8"
+cedar-policy = { version = "4.14", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+zs-credential = { path = "crates/zs-credential" }
+zs-protocol = { path = "crates/zs-protocol" }
+zs-proto-http = { path = "crates/zs-proto-http" }
+zs-mitm = { path = "crates/zs-mitm" }
+zs-audit = { path = "crates/zs-audit" }
+zs-test-keychain = { path = "crates/zs-test-keychain" }
+zs-test-idp = { path = "crates/zs-test-idp" }
+zs-test-aws = { path = "crates/zs-test-aws" }
+thiserror = "1"
+async-trait = "0.1"
+zeroize = "1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "process"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", package = "rustls-pki-types" }
+# Already in the tree under rustls. `zs-test-idp` signs RS256 ID tokens with it directly
+# rather than adding a JWT crate.
+ring = "0.17"
+webpki-roots = "0.26"
+rcgen = { version = "0.13", features = ["ring", "pem", "x509-parser"] }
+dbus-secret-service = { version = "=4.0.1", default-features = false }
+windows-sys = { version = "0.61.2", default-features = false }
+tempfile = "3"
+
+[profile.dev]
+split-debuginfo = "packed"
+
+[profile.release]
+lto = "thin"

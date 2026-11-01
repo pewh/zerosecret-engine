@@ -1,0 +1,38 @@
+{
+  "about": "EnrollmentTokenResponse (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"token\": \"enr-abababababababababababababababababababababababababababababababab\", \"expires_at_ms\": 1800000000000}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"token\":\"enr-abababababababababababababababababababababababababababababababab\",\"expires_at_ms\":1800000000000}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"token\": \"enr-abababababababababababababababababababababababababababababababab\", \"expires_at_ms\": 1800000000000, \"ttl_seconds\": 900}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"token\":\"enr-abababababababababababababababababababababababababababababababab\",\"expires_at_ms\":1800000000000}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Token\": \"enr-abababababababababababababababababababababababababababababababab\", \"expires_at_ms\": 1800000000000}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"token\":\"enr-abababababababababababababababababababababababababababababababab\",\"token\":\"enr-abababababababababababababababababababababababababababababababab\",\"expires_at_ms\":1}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "about": "Policy documents: accepted or refused with the reason, and re-serialized as /wire/policy serves them.",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "an_old_resource_without_a_connection_reads_as_default",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"a\",\"host\":\"h\",\"protocol\":\"https\",\"operations\":[\"GET\"]}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"a\",\"host\":\"h\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"project\":null}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_connection_with_a_port_round_trips",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"a\",\"host\":\"h\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"connection\":{\"upstream_port\":8443}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"a\",\"host\":\"h\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"project\":null,\"connection\":{\"upstream_host\":null,\"upstream_port\":8443,\"upstream_tls\":\"default\",\"local_endpoint\":false}}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_ca_sha256_tls_mode_round_trips",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_tls\":\"ca-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"project\":null,\"connection\":{\"upstream_host\":null,\"upstream_port\":null,\"upstream_tls\":\"ca-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\",\"local_endpoint\":false}}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "an_upper_case_pin_sha256_is_normalized",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_tls\":\"pin-sha256:00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"project\":null,\"connection\":{\"upstream_host\":null,\"upstream_port\":null,\"upstream_tls\":\"pin-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\",\"local_endpoint\":false}}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_wrong_case_tls_mode_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_tls\":\"CA-SHA256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "upstream_tls must be default, plaintext, ca-sha256:<64 hex> or pin-sha256:<64 hex>"
+      }
+    },
+    {
+      "name": "a_short_ca_digest_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_tls\":\"ca-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeef\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "upstream_tls ca-sha256: must be followed by 64 hex digits"
+      }
+    },
+    {
+      "name": "plaintext_is_refused_on_a_remote_https_upstream",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"api\",\"host\":\"api.example.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"connection\":{\"upstream_tls\":\"plaintext\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource api: upstream_tls plaintext is allowed only on mongo, or on https with a loopback upstream_host"
+      }
+    },
+    {
+      "name": "a_ca_digest_is_refused_on_https",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"api\",\"host\":\"api.example.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"connection\":{\"upstream_tls\":\"ca-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource api: upstream_tls ca-sha256 and pin-sha256 are allowed only on postgres, mysql and mongo"
+      }
+    },
+    {
+      "name": "a_zero_port_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_port\":0}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource db: upstream_port must be 1 to 65535"
+      }
+    },
+    {
+      "name": "local_endpoint_is_refused_on_postgres",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"postgres\",\"operations\":[\"connect\"],\"connection\":{\"local_endpoint\":true}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource db: local_endpoint is allowed only on an https resource"
+      }
+    },
+    {
+      "name": "connection_fields_are_refused_on_a_protocol_the_agent_does_not_intercept",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"x\",\"host\":\"x\",\"protocol\":\"ftp\",\"operations\":[\"GET\"],\"connection\":{\"upstream_port\":22}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource x: connection fields are not allowed on a ftp resource"
+      }
+    },
+    {
+      "name": "a_host_with_a_port_is_refused_as_an_upstream_host",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"db\",\"host\":\"db.x\",\"protocol\":\"mysql\",\"operations\":[\"connect\"],\"connection\":{\"upstream_host\":\"db.x:3306\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource db: upstream_host must be a host name or an IP literal, with no port"
+      }
+    },
+    {
+      "name": "both_source_and_credential_ref_are_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"credential_ref\":\"billing-key\"}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource stripe: both source and credential_ref are set"
+      }
+    },
+    {
+      "name": "a_file_source_is_accepted",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"file\",\"reference\":\"billing-key\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"source\":{\"kind\":\"file\",\"reference\":\"billing-key\"},\"project\":null}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_file_reference_with_a_control_character_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"file\",\"reference\":\"a\\u001eb\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource stripe: credential reference has a control character"
+      }
+    },
+    {
+      "name": "an_aws_ssm_source_with_exchange_materialization_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"exchange\",\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "resource stripe: source does not match materialization"
+      }
+    },
+    {
+      "name": "an_aws_ssm_source_is_accepted",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"project\":null}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_role_name_with_every_allowed_character_is_accepted",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/a+b=c,d.e@f_g-h/i\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/a+b=c,d.e@f_g-h/i\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"project\":null}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_foreign_partition_role_arn_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws-cn:iam::123456789012:role/zs\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "role_arn is not arn:aws:iam::<12 digits>:role/<name>"
+      }
+    },
+    {
+      "name": "an_eleven_digit_account_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::12345678901:role/zs\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "role_arn is not arn:aws:iam::<12 digits>:role/<name>"
+      }
+    },
+    {
+      "name": "a_user_arn_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:user/zs\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "role_arn is not arn:aws:iam::<12 digits>:role/<name>"
+      }
+    },
+    {
+      "name": "an_empty_role_name_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "role_arn is not arn:aws:iam::<12 digits>:role/<name>"
+      }
+    },
+    {
+      "name": "a_government_region_is_accepted",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"us-gov-west-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"materialization\":\"retrieve\",\"credential_ref\":null,\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"us-gov-west-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"},\"project\":null}],\"grants\":[],\"version\":1}"
+      }
+    },
+    {
+      "name": "a_region_without_the_final_dash_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "region is not an AWS region name"
+      }
+    },
+    {
+      "name": "an_upper_case_region_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"AP-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "region is not an AWS region name"
+      }
+    },
+    {
+      "name": "a_two_digit_region_number_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-12\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "region is not an AWS region name"
+      }
+    },
+    {
+      "name": "an_empty_region_part_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap--1\",\"parameter\":\"/acme/prod/DB_PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "region is not an AWS region name"
+      }
+    },
+    {
+      "name": "a_parameter_without_a_leading_slash_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"acme/prod\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "parameter must start with '/'"
+      }
+    },
+    {
+      "name": "a_parameter_with_a_space_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB PASSWORD\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "parameter has a character SSM refuses"
+      }
+    },
+    {
+      "name": "a_parameter_over_1760_characters_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "parameter is longer than 1760 characters"
+      }
+    },
+    {
+      "name": "an_unknown_source_kind_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"vault\",\"reference\":\"x\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "unknown variant `vault`, expected `file` or `aws_ssm`"
+      }
+    },
+    {
+      "name": "a_wrong_case_source_key_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"file\",\"Reference\":\"x\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "unknown field `Reference`, expected `reference`"
+      }
+    },
+    {
+      "name": "a_duplicate_source_key_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"file\",\"reference\":\"a\",\"reference\":\"b\"}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "duplicate field `reference`"
+      }
+    },
+    {
+      "name": "an_unknown_field_in_an_aws_ssm_source_is_refused",
+      "input": "{\"version\":1,\"resources\":[{\"name\":\"stripe\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"source\":{\"kind\":\"aws_ssm\",\"role_arn\":\"arn:aws:iam::123456789012:role/zs-acme-db\",\"region\":\"ap-southeast-1\",\"parameter\":\"/acme/prod/DB_PASSWORD\",\"extra\":1}}],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "unknown field `extra`, expected one of `role_arn`, `region`, `parameter`"
+      }
+    },
+    {
+      "name": "a_duplicate_version_key_is_refused",
+      "input": "{\"version\":1,\"version\":1,\"resources\":[],\"grants\":[]}",
+      "expect": {
+        "accepted": false,
+        "error": "duplicate field `version`"
+      }
+    }
+  ]
+}

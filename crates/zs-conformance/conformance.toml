@@ -1,0 +1,10 @@
+[implementation]
+name = "zerosecret"
+adapter = "adapters/zerosecret.sh"
+capabilities = ["postgres", "mysql", "mongodb", "http"]
+
+[fixtures]
+postgres = "127.0.0.1:5434"
+postgres_tls = "127.0.0.1:5435"
+mysql = "127.0.0.1:3307"
+mongodb = "127.0.0.1:27018"

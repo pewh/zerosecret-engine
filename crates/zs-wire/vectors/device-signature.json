@@ -1,0 +1,156 @@
+{
+  "about": "The device-signature message V8: compact JSON, spec key order, spec escaping",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "less_than",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "<",
+        "workload": "<",
+        "resource": "<",
+        "operations": [
+          "<"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"<\",\"workload\":\"<\",\"resource\":\"<\",\"operations\":[\"<\"]}"
+      }
+    },
+    {
+      "name": "greater_than",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": ">",
+        "workload": ">",
+        "resource": ">",
+        "operations": [
+          ">"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\">\",\"workload\":\">\",\"resource\":\">\",\"operations\":[\">\"]}"
+      }
+    },
+    {
+      "name": "ampersand",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "&",
+        "workload": "&",
+        "resource": "&",
+        "operations": [
+          "&"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"&\",\"workload\":\"&\",\"resource\":\"&\",\"operations\":[\"&\"]}"
+      }
+    },
+    {
+      "name": "line_separator_u2028",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": " ",
+        "workload": " ",
+        "resource": " ",
+        "operations": [
+          " "
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\" \",\"workload\":\" \",\"resource\":\" \",\"operations\":[\" \"]}"
+      }
+    },
+    {
+      "name": "paragraph_separator_u2029",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": " ",
+        "workload": " ",
+        "resource": " ",
+        "operations": [
+          " "
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\" \",\"workload\":\" \",\"resource\":\" \",\"operations\":[\" \"]}"
+      }
+    },
+    {
+      "name": "bell_u0007",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "\u0007",
+        "workload": "\u0007",
+        "resource": "\u0007",
+        "operations": [
+          "\u0007"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"\\u0007\",\"workload\":\"\\u0007\",\"resource\":\"\\u0007\",\"operations\":[\"\\u0007\"]}"
+      }
+    },
+    {
+      "name": "newline",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "line\nbreak",
+        "workload": "line\nbreak",
+        "resource": "line\nbreak",
+        "operations": [
+          "line\nbreak"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"line\\nbreak\",\"workload\":\"line\\nbreak\",\"resource\":\"line\\nbreak\",\"operations\":[\"line\\nbreak\"]}"
+      }
+    },
+    {
+      "name": "e_acute",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "café",
+        "workload": "café",
+        "resource": "café",
+        "operations": [
+          "café"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"café\",\"workload\":\"café\",\"resource\":\"café\",\"operations\":[\"café\"]}"
+      }
+    },
+    {
+      "name": "emoji",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "🔐",
+        "workload": "🔐",
+        "resource": "🔐",
+        "operations": [
+          "🔐"
+        ]
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"🔐\",\"workload\":\"🔐\",\"resource\":\"🔐\",\"operations\":[\"🔐\"]}"
+      }
+    },
+    {
+      "name": "no_operations",
+      "input": {
+        "device_id": "dev-0123456789abcdef0123456789abcdef",
+        "subject": "alice@example.com",
+        "workload": "checkout",
+        "resource": "acme-db",
+        "operations": []
+      },
+      "expect": {
+        "message": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"operations\":[]}"
+      }
+    }
+  ]
+}

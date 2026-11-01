@@ -1,0 +1,15 @@
+{
+  "about": "The login code V10: the first six challenge characters, upper case",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "twelve_lowercase_hex",
+      "input": "ab12cd34ef56",
+      "expect": {
+        "code": "AB12CD"
+      }
+    }
+  ]
+}

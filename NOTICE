@@ -1,0 +1,12 @@
+ZeroSecret
+Copyright 2026 The ZeroSecret Authors
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+The directory crates/zs-conformance/vectors/aws-sig-v4-test-suite/ holds test
+vectors copied unchanged from AWS C Auth (https://github.com/awslabs/aws-c-auth,
+tag v0.9.0). Their notice follows:
+
+AWS C Auth
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0.

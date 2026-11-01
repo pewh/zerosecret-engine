@@ -1,0 +1,13 @@
+[package]
+name = "zs-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zs-credential.workspace = true
+zs-identity.workspace = true
+thiserror.workspace = true

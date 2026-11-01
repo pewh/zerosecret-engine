@@ -1,0 +1,38 @@
+{
+  "about": "EnrollmentRequest (spec 5.3): one accepted text with a byte array, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"device_public_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"device_name\": \"laptop\", \"enrollment_token\": \"enr-abababababababababababababababababababababababababababababababab\", \"csr\": \"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_public_key\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,255],\"device_name\":\"laptop\",\"enrollment_token\":\"enr-abababababababababababababababababababababababababababababababab\",\"csr\":\"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\"}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"device_public_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"device_name\": \"laptop\", \"enrollment_token\": \"enr-abababababababababababababababababababababababababababababababab\", \"csr\": \"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\", \"os\": \"linux\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_public_key\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,255],\"device_name\":\"laptop\",\"enrollment_token\":\"enr-abababababababababababababababababababababababababababababababab\",\"csr\":\"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\"}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"Device_public_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"device_name\": \"laptop\", \"enrollment_token\": \"enr-abababababababababababababababababababababababababababababababab\", \"csr\": \"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"device_public_key\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 255], \"device_name\": \"laptop\", \"enrollment_token\": \"enr-abababababababababababababababababababababababababababababababab\", \"csr\": \"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\",\"csr\":\"-----BEGIN CERTIFICATE REQUEST-----\\nMIIB\\n-----END CERTIFICATE REQUEST-----\\n\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}

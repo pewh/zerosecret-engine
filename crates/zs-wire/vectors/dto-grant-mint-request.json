@@ -1,0 +1,38 @@
+{
+  "about": "GrantMintRequest (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "version": 1,
+  "frozen": false,
+  "context": {},
+  "cases": [
+    {
+      "name": "accepted",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"operations\": [\"read\", \"write\"]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"operations\":[\"read\",\"write\"]}"
+      }
+    },
+    {
+      "name": "unknown_field_is_ignored",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"operations\": [\"read\"], \"approval\": \"appr-1\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"operations\":[\"read\"]}"
+      }
+    },
+    {
+      "name": "wrong_case_key_is_refused",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"Operations\": [\"read\"]}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "duplicate_key_is_refused",
+      "input": "{\"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"operations\": [\"read\"],\"resource\":\"other-db\"}",
+      "expect": {
+        "accepted": false
+      }
+    }
+  ]
+}
