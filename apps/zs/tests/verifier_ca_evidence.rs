@@ -91,6 +91,16 @@ fn verifier_binary() -> PathBuf {
     path
 }
 
+/// The grant is signed over the upstream it authorises, so the port has to be chosen before the
+/// grant is minted and handed to the verifier. The verifier binds it with `--upstream-port`.
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe socket binds");
+    probe
+        .local_addr()
+        .expect("the probe socket has an address")
+        .port()
+}
+
 struct Fixture {
     root: PathBuf,
     policy: PathBuf,
@@ -100,11 +110,14 @@ struct Fixture {
     tmp: PathBuf,
     ca_dir: PathBuf,
     workload: PathBuf,
+    upstream_port: u16,
 }
 
 impl Fixture {
     fn new(root: &Path) -> Self {
-        let (policy, creds, audit, _, _) = common::write_test_setup(root, 0, true, false);
+        let upstream_port = free_port();
+        let (policy, creds, audit, _, _) =
+            common::write_test_setup(root, upstream_port, true, false);
         private_dir(&creds);
         let work = root.join("work");
         let tmp = root.join("tmp");
@@ -122,6 +135,7 @@ impl Fixture {
             work,
             tmp,
             workload,
+            upstream_port,
         }
     }
 
@@ -143,6 +157,7 @@ impl Fixture {
             .arg(format!("--credential-file={}", credential_file.display()))
             .arg(format!("--creds-dir={}", template_safe(&self.creds)))
             .arg(format!("--audit-file={}", template_safe(&self.audit)))
+            .arg(format!("--upstream-port={}", self.upstream_port))
             .arg(agent)
             .arg(child)
             .env_clear()

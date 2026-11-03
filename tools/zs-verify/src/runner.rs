@@ -27,7 +27,7 @@ pub(crate) fn run(args: VerifyArgs) -> i32 {
         Err(message) => return refuse(message),
     };
     let started = Instant::now();
-    let (listener, upstream_addr) = match upstream::bind() {
+    let (listener, upstream_addr) = match upstream::bind(args.upstream_port) {
         Ok(bound) => bound,
         Err(message) => return refuse(message),
     };

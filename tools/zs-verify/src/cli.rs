@@ -16,6 +16,7 @@ pub(crate) const ERR_SECRET_PLACEHOLDER: &str = "the {CREDENTIAL} template is re
 pub(crate) const ERR_UNKNOWN_ARGUMENT: &str = "unknown argument";
 pub(crate) const ERR_MALFORMED_ARGUMENT: &str = "every argument must be --name=value";
 pub(crate) const ERR_REPEATED_ARGUMENT: &str = "an argument is repeated";
+pub(crate) const ERR_UPSTREAM_PORT: &str = "--upstream-port= must be a port from 0 to 65535";
 
 pub(crate) struct VerifyArgs {
     pub(crate) agent_cmd: String,
@@ -26,6 +27,9 @@ pub(crate) struct VerifyArgs {
     pub(crate) audit_file: PathBuf,
     pub(crate) exclude: String,
     pub(crate) proxy_addr: Option<String>,
+    /// Port the fake upstream binds. Zero asks the kernel for one; a caller that must sign a
+    /// grant naming the upstream before the verifier starts (a grant pins the port) passes it.
+    pub(crate) upstream_port: u16,
 }
 
 fn uses_secret_placeholder(template: &str) -> bool {
@@ -53,6 +57,7 @@ where
     let mut audit_file = None;
     let mut exclude = None;
     let mut proxy_addr = None;
+    let mut upstream_port: Option<u16> = None;
 
     for arg in args {
         let arg: String = arg.into();
@@ -68,6 +73,12 @@ where
             "--audit-file" => set_once(&mut audit_file, value)?,
             "--exclude" => set_once(&mut exclude, value)?,
             "--proxy-addr" => set_once(&mut proxy_addr, value)?,
+            "--upstream-port" => {
+                if upstream_port.is_some() {
+                    return Err(ERR_REPEATED_ARGUMENT);
+                }
+                upstream_port = Some(value.parse().map_err(|_| ERR_UPSTREAM_PORT)?);
+            }
             "--credential-value" => return Err(ERR_CREDENTIAL_VALUE_REMOVED),
             _ => return Err(ERR_UNKNOWN_ARGUMENT),
         }
@@ -96,6 +107,7 @@ where
         audit_file: PathBuf::from(audit_file.unwrap_or_default()),
         exclude: exclude.unwrap_or_default(),
         proxy_addr,
+        upstream_port: upstream_port.unwrap_or(0),
     })
 }
 
@@ -303,6 +315,24 @@ mod tests {
         let mut args = minimal(&cred);
         args.push("--not-a-flag=1".to_string());
         assert_eq!(parse(args).err_of(), ERR_UNKNOWN_ARGUMENT);
+    }
+
+    #[test]
+    fn an_upstream_port_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred = credential_file(dir.path(), SYNTHETIC);
+        let mut args = minimal(&cred);
+        args.push("--upstream-port=34567".to_string());
+        assert_eq!(parse(args).ok_of().upstream_port, 34567);
+    }
+
+    #[test]
+    fn an_upstream_port_outside_the_range_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred = credential_file(dir.path(), SYNTHETIC);
+        let mut args = minimal(&cred);
+        args.push("--upstream-port=70000".to_string());
+        assert_eq!(parse(args).err_of(), ERR_UPSTREAM_PORT);
     }
 
     #[test]

@@ -126,8 +126,10 @@ pub(crate) fn credential_expectation(policy_file: &str, credential: &str) -> Exp
     }
 }
 
-pub(crate) fn bind() -> Result<(TcpListener, SocketAddr), &'static str> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| ERR_UPSTREAM)?;
+/// Binds the fake upstream. `port` 0 asks the kernel for a free one; a caller that must sign a
+/// grant naming the upstream first passes the port that grant carries.
+pub(crate) fn bind(port: u16) -> Result<(TcpListener, SocketAddr), &'static str> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|_| ERR_UPSTREAM)?;
     let addr = listener.local_addr().map_err(|_| ERR_UPSTREAM)?;
     Ok((listener, addr))
 }
@@ -342,7 +344,7 @@ mod tests {
     }
 
     fn start(policy: &str, credential: &str) -> (SocketAddr, Arc<FakeUpstreamState>) {
-        let (listener, addr) = bind().unwrap();
+        let (listener, addr) = bind(0).unwrap();
         let state = Arc::new(FakeUpstreamState::default());
         serve(
             listener,
@@ -529,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_negative_control_without_an_upstream_fails() {
-        let (listener, addr) = bind().unwrap();
+        let (listener, addr) = bind(0).unwrap();
         drop(listener);
         let state = FakeUpstreamState::default();
         assert!(!run_negative_control(addr, "", &state));
