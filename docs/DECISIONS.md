@@ -7,6 +7,57 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0050 — This repository is the upstream; the commercial layer pins a release of it
+
+**2026-11-02 · Accepted** · owner request 2026-11-02 (Option B) · supersedes ADR-0045 D3
+
+ADR-0045 D3 kept engine work in a private repository and exported a fixed file list for each
+release. The export ran once: this repository held commit `86a1be8`, tag `v0.1.0`, with a green
+CI. From then on every engine file existed twice, the export script had to be maintained, and a
+change from an outside contributor was ported by hand. The owner chose to make this repository
+the upstream.
+
+**Decision.**
+- **D1.** This repository is the upstream for all engine code: `crates/*`, `apps/zs`,
+  `tools/zs-verify`, the conformance suite and its fixtures. Engine changes are made here, under
+  the DCO rule of ADR-0045 D5, and a pull request is merged here.
+- **D2.** The commercial layer — the control plane, its tests, the customer harness records and
+  the execution state — lives in a separate private repository that clones this one beside
+  itself as `engine/`: locally a symlink, in CI a checkout at the pinned tag. No commercial
+  source file is tracked here.
+- **D3.** This repository keeps its own Cargo workspace and its own `Cargo.lock`. The commercial
+  repository takes the engine crates as path dependencies through `engine/` and holds a separate
+  lock, so no change here needs a lock file there until a tag moves.
+- **D4.** The commercial repository pins a `vX.Y.Z` tag of this repository and the commit that
+  tag resolves to, and refuses to build when the tag resolves to another commit. A published tag
+  is therefore an identity, not a moving label; moving one breaks every pin that names it.
+- **D5.** This repository is public since 2026-11-03. The commercial CI checks out the pinned tag
+  with a read-only deploy key, or with its default token now that the tag is publicly readable.
+- **D6.** Engine tests run only in this repository's CI: `gates`, `check`, `conformance`,
+  `db-real`, and the macOS, Linux and Windows native jobs. `macos-check` and `macos-native` run
+  only while this repository is public, where hosted macOS minutes are free.
+- **D7.** The export tooling of ADR-0045 D3 is deleted and not maintained here:
+  `release/build-tree.sh`, `release/public-set.txt`, `release/overlay/` and
+  `release/README.head.md`. The release gates are `tools/public-gates.sh`, run by CI on every
+  push and pull request. The forbidden-name list stays in the commercial repository as the
+  source of this repository's `FORBIDDEN_NAMES` secret, because the gate must not contain it.
+- **D8.** In a developer's workspace both Cargo workspaces build into one target directory: the
+  clone carries an untracked `.cargo/config.toml` pointing at the commercial repository's
+  `target/`, so an engine build does not fill a second one. CI builds each workspace on its own.
+
+**Consequence.** One copy of each engine file. An engine change and the commercial change that
+uses it are two commits in two repositories, joined by a pin bump, so a commercial test that
+needs new engine behaviour waits for that behaviour to land here. The owner documents — PRODUCT,
+ARCHITECTURE, SECURITY, ROADMAP and DECISIONS — exist in both repositories and can drift; an
+engine-facing change to one is made here. This entry and the commercial repository's copy record
+the same decision from opposite sides.
+
+**Reverse it if** most changes need an engine edit and a commercial edit in the same step, so
+that pin bumps become the bottleneck. Then the engine returns to the commercial repository with
+an export, as ADR-0045 D3 had it.
+
+---
+
 ## ADR-0049 — The Rust control plane is deleted before C7 is proven
 
 **2026-10-31 · Accepted** · owner override 2026-10-31 of plan D3 Step 1 · amends ADR-0047 D5 and ADR-0048 D4 and D5

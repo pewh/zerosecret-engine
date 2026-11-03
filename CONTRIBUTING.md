@@ -2,9 +2,14 @@
 
 ## How changes reach this repository
 
-The maintainers develop ZeroSecret in a private upstream repository. Each release arrives here as
-one commit. When a maintainer accepts a pull request, they apply it upstream by hand, and the
-change appears in the next release commit. The pull request is not merged directly.
+This repository is the upstream for the engine: `crates/*`, `apps/zs`, `tools/zs-verify`, the
+conformance suite and its fixtures. An engine change is made here, reviewed here and merged
+here. The pull request is the change, not a proposal for one that a maintainer replays
+somewhere else.
+
+The commercial layer — the hosted control plane, SSO federation, organizations and the
+dashboard — is a separate private repository. It depends on a released tag of this repository,
+so an engine change reaches it through a tag bump, never through this history.
 
 ## Sign off your commits
 
