@@ -804,7 +804,9 @@ fn test_home_cleanup_removes_exactly_its_own_record() {
     let store = Store::new();
     let kept = Workspace::new();
     let _cleanup = Cleanup::new(&store, &kept);
+    eprintln!("th:1 armed");
     assert_started(&kept.run(&store));
+    eprintln!("th:2 kept run");
     let kept_account = kept.account();
     let exe = std::env::current_exe().unwrap();
     let child = [
@@ -817,6 +819,7 @@ fn test_home_cleanup_removes_exactly_its_own_record() {
     let started = |home: &common::TestHome| {
         let (policy, creds, audit, ca_dir, _) =
             common::write_test_setup(home.path(), common::free_port(), true, true);
+        eprintln!("th:3 policy");
         common::spawn_agent_capturing(
             &common::bin_path(),
             &policy,
@@ -826,20 +829,27 @@ fn test_home_cleanup_removes_exactly_its_own_record() {
             &child,
         )
         .unwrap();
+        eprintln!("th:4 spawned");
         std::fs::read_to_string(ca_dir.join(ID_FILE)).unwrap()
     };
 
     let home = common::TestHome::new(".zs-ca");
     let account = started(&home);
+    eprintln!("th:5 started");
     assert_eq!(store.stored(&account), 1);
+    eprintln!("th:6 stored");
     drop(home);
+    eprintln!("th:7 dropped");
     assert_eq!(store.stored(&account), 0);
 
     let absent = common::TestHome::new(".zs-ca");
     let account = started(&absent);
+    eprintln!("th:8 absent");
     assert!(store.remove(&account));
+    eprintln!("th:9 removed");
     drop(absent);
     drop(common::TestHome::new(".zs-ca"));
+    eprintln!("th:10 tail");
 
     let inexact = common::TestHome::new(".zs-ca");
     let ca_dir = inexact.path().join(".zs-ca");

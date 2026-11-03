@@ -1030,27 +1030,32 @@ fn run_bounded(
 ) -> Result<(Option<i32>, String, String), String> {
     use std::io::Read;
     let mut child = command.spawn().map_err(|e| e.to_string())?;
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    // The drains report over a channel. Joining the threads would block on a pipe that a
+    // grandchild still holds, which is the same hang the deadline exists to escape.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+    for (index, pipe) in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tx = tx.clone();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
+            let _ = tx.send((index, bytes));
+        });
+    }
+    drop(tx);
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
@@ -1063,9 +1068,27 @@ fn run_bounded(
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     };
-    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
-    Ok((status.and_then(|s| s.code()), stdout, stderr))
+    let mut out = [String::new(), String::new()];
+    let mut received = 0;
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while received < 2 {
+        let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((index, bytes)) => {
+                out[index] = String::from_utf8_lossy(&bytes).into_owned();
+                received += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((
+        status.and_then(|s| s.code()),
+        out[0].clone(),
+        out[1].clone(),
+    ))
 }
 
 pub struct Tripwire {

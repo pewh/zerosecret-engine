@@ -454,5 +454,5 @@ jobs:
         run: |
           set -euo pipefail
           log=$(mktemp)
-          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 --nocapture | tee "$log"
           grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 11 Windows CA process tests to pass" >&2; exit 1; }
