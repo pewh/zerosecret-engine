@@ -987,7 +987,8 @@ pub fn spawn_agent_capturing(
     ca_dir: &std::path::Path,
     child: &[&str],
 ) -> Result<CapturedAgent, String> {
-    let output = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
             "run",
             "--policy",
@@ -1003,12 +1004,68 @@ pub fn spawn_agent_capturing(
             "--",
         ])
         .args(child)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // `.output()` waits forever. A workload or an agent that never exits took the whole
+    // Windows job to its 15-minute limit once, which reports nothing about which one hung.
+    // Bound it, and name the process that did not exit.
+    let (code, stdout, stderr) = run_bounded(command, AGENT_TIMEOUT)?;
+    if code.is_none() {
+        return Err(format!(
+            "the agent did not exit within {AGENT_TIMEOUT:?}; stdout={stdout:?} stderr={stderr:?}"
+        ));
+    }
     Ok(CapturedAgent {
-        child_output: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        child_output: stdout,
+        stderr,
     })
+}
+
+const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn run_bounded(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<(Option<i32>, String, String), String> {
+    use std::io::Read;
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    Ok((status.and_then(|s| s.code()), stdout, stderr))
 }
 
 pub struct Tripwire {

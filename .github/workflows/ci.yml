@@ -448,7 +448,9 @@ jobs:
           log=$(mktemp)
           cargo test --locked -p zs-mitm native_device_windows_ -- --ignored --test-threads=1 | tee "$log"
           grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 3 native Windows device record tests to pass" >&2; exit 1; }
-      - shell: bash
+      - name: Windows CA process tests
+        shell: bash
+        timeout-minutes: 4
         run: |
           set -euo pipefail
           log=$(mktemp)
