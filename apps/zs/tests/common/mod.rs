@@ -762,10 +762,11 @@ pub fn free_port() -> u16 {
     for _ in 0..TEST_PORT_SPAN {
         let offset = (base + NEXT.fetch_add(1, Ordering::Relaxed)) % TEST_PORT_SPAN;
         let port = FIRST_TEST_PORT + offset as u16;
-        let probe = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let refused = std::net::TcpStream::connect_timeout(&probe, Duration::from_millis(200))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused);
-        if refused {
+        // Binding is the portable test of "free": it also refuses a port the operating system
+        // has reserved. `connect_timeout` does not — it waits the full timeout wherever the
+        // platform reports a dropped connection rather than a refusal, which Windows does, so
+        // the scan cost 200 ms per candidate and the Windows job timed out before it found one.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
