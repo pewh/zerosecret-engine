@@ -6,6 +6,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZS_BUILD_VERSION");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // A commit rewrites the branch ref, not HEAD, so watch the ref HEAD names. Without this a
+    // rebuild after a commit keeps reporting the previous commit.
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD")
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=../../.git/{reference}");
+    }
     if std::env::var("ZS_BUILD_TEST_ENDPOINTS").as_deref() == Ok("1") {
         if std::env::var("PROFILE").as_deref() == Ok("release") {
             panic!("ZS_BUILD_TEST_ENDPOINTS=1 is refused in a release build");
