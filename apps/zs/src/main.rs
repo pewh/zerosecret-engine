@@ -61,7 +61,7 @@ struct Args {
     init_opts: init::InitOptions,
 }
 
-const USAGE: &str = "usage: zs <login|logout|status|doctor|run|resources|ca|ca-sha256|schema|agent-instructions|init> [options]\n\
+const USAGE: &str = "usage: zs <login|logout|status|doctor|run|resources|ca|ca-sha256|schema|agent-instructions|init|version> [options]\n\
     \n\
     Control plane (omit for offline development against local config):\n\
     \x20 --control <url>             base URL of the control plane\n\
@@ -85,11 +85,14 @@ const CA_SHA256_USAGE: &str = "usage: zs ca-sha256 <file>\n\
 
 const SIMPLE_COMMANDS: &[&str] = &["login", "logout", "status", "resources"];
 
-const NO_ARGUMENT_COMMANDS: &[&str] = &["schema", "agent-instructions"];
+const NO_ARGUMENT_COMMANDS: &[&str] = &["schema", "agent-instructions", "version"];
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let command = it.next().ok_or(USAGE)?;
+    let command = match it.next().ok_or(USAGE)?.as_str() {
+        "--version" | "-V" => "version".to_string(),
+        name => name.to_string(),
+    };
     let mut args = Args {
         command,
         policy: PathBuf::from("zs-policy.json"),
@@ -362,12 +365,28 @@ fn real_main() -> i32 {
         "ca-sha256" => ca_sha256(&args),
         "schema" => schema::print_schema(),
         "agent-instructions" => instructions::print_instructions(),
+        "version" => version(),
         "init" => init::run_init(&args.init_opts),
         _ => {
             stderr_line!("zs: unknown command: {}\n{USAGE}", args.command);
             2
         }
     }
+}
+
+fn version() -> i32 {
+    stdout_line!("{}", version_line());
+    0
+}
+
+fn version_line() -> String {
+    format!(
+        "zs {} ({}, built {}, {})",
+        env!("ZS_BUILD_VERSION"),
+        env!("ZS_BUILD_COMMIT"),
+        env!("ZS_BUILD_TIME"),
+        env!("ZS_BUILD_TARGET")
+    )
 }
 
 fn zs_home() -> PathBuf {
@@ -665,4 +684,15 @@ fn doctor_json(args: &Args, policy_res: &Result<AgentFile, zs::ConfigError>) -> 
     });
     stdout_line!("{val}");
     if file.is_some() { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn the_version_line_names_the_build() {
+        let line = super::version_line();
+        assert!(line.starts_with("zs "), "{line}");
+        assert!(line.contains(", built "), "{line}");
+        assert!(line.ends_with(')'), "{line}");
+    }
 }

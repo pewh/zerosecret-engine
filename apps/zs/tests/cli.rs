@@ -440,12 +440,36 @@ fn an_unknown_command_exits_2_and_lists_the_real_ones() {
         "run",
         "resources",
         "ca",
+        "version",
     ] {
         assert!(
             text.contains(command),
             "usage must list `{command}`: {text}"
         );
     }
+}
+
+#[test]
+fn version_prints_the_build_and_exits_0() {
+    let home = workspace();
+    let out = zs(home.path(), &["version"]);
+
+    assert_eq!(out.code, 0, "{}", out.combined());
+    let line = out.stdout.trim_end();
+    assert!(line.starts_with("zs "), "{line}");
+    assert!(line.contains(", built 20"), "{line}");
+
+    let flag = zs(home.path(), &["--version"]);
+    assert_eq!(flag.code, 0, "{}", flag.combined());
+    assert_eq!(flag.stdout.trim_end(), line);
+
+    let extra = zs(home.path(), &["version", "extra"]);
+    assert_eq!(extra.code, 2, "{}", extra.combined());
+    assert!(
+        extra.stderr.contains("unknown version argument"),
+        "{}",
+        extra.combined()
+    );
 }
 
 fn ca_dir(home: &Path) -> PathBuf {

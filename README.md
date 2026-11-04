@@ -177,6 +177,7 @@ Run `zs agent-instructions` and follow the protocol to integrate ZeroSecret into
 | `zs init [--dry-run]` | Scans `.env`, writes a timestamped backup (`0600`), updates `.gitignore`, scaffolds `zs-policy.json`, and replaces the secrets it brokers with placeholders. Other secrets stay in `.env` and are listed by key name as "not brokered". A second run on a sanitized file is refused; restore the backup first |
 | `zs doctor --json` | Outputs policy validation as JSON; a policy error is in `diagnostics` and exits 1 |
 | `zs status --json` | Outputs session and device enrolment as JSON; exits 1 when signed out |
+| `zs version` | Prints the build version, the commit, the UTC build time and the target triple; `zs --version` prints the same line |
 
 Design: [agentic CLI spec](docs/specs/2026-10-22-agentic-cli.md), amended by [review fixes](docs/specs/2026-10-23-agentic-cli-review-fixes.md).
 
