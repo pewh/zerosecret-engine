@@ -150,7 +150,9 @@ fn parse_proxy_target(method: &str, target: &str) -> Option<ProxyTarget> {
 }
 
 fn strip_userinfo(authority: &str) -> &str {
-    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
