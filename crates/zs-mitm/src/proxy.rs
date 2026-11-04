@@ -122,7 +122,10 @@ enum ProxyTarget {
 // crosses the network in cleartext only where the binding says so (ADR-0033).
 fn parse_proxy_target(method: &str, target: &str) -> Option<ProxyTarget> {
     if method == "CONNECT" {
-        let (host, port) = split_authority(target, 443);
+        let (host, port) = split_authority(strip_userinfo(target), 443);
+        if host.is_empty() {
+            return None;
+        }
         return Some(ProxyTarget::Tunnel { host, port });
     }
     let (scheme, rest) = match target.strip_prefix("https://") {
@@ -133,6 +136,7 @@ fn parse_proxy_target(method: &str, target: &str) -> Option<ProxyTarget> {
         Some(at) => (rest.get(..at)?, rest.get(at..)?),
         None => (rest, "/"),
     };
+    let authority = strip_userinfo(authority);
     if authority.is_empty() {
         return None;
     }
@@ -143,6 +147,10 @@ fn parse_proxy_target(method: &str, target: &str) -> Option<ProxyTarget> {
         port,
         path: path.to_string(),
     })
+}
+
+fn strip_userinfo(authority: &str) -> &str {
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
 }
 
 fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
@@ -1881,6 +1889,29 @@ mod tests {
             parse_proxy_target("GET", "/v3/scopes").is_none(),
             "origin-form has no host, so the proxy cannot route it"
         );
+    }
+
+    #[test]
+    fn userinfo_is_stripped_before_the_target_is_parsed() {
+        match parse_proxy_target("GET", "https://user:pw@api.stripe.com:8443/v1/customers") {
+            Some(ProxyTarget::Absolute {
+                host, port, path, ..
+            }) => {
+                assert_eq!(host, "api.stripe.com");
+                assert_eq!(port, 8443);
+                assert_eq!(path, "/v1/customers");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_proxy_target("CONNECT", "user:pw@api.stripe.com:443") {
+            Some(ProxyTarget::Tunnel { host, port }) => {
+                assert_eq!(host, "api.stripe.com");
+                assert_eq!(port, 443);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_proxy_target("GET", "https://user:pw@/x").is_none());
+        assert!(parse_proxy_target("CONNECT", "user:pw@").is_none());
     }
 
     #[test]

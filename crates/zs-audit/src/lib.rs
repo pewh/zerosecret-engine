@@ -97,6 +97,10 @@ fn hash_record(req: &AuditRequest, seq: u64, timestamp_ms: u64, prev_hash: &str)
     format!("{:x}", hasher.finalize())
 }
 
+fn normalize_operation(value: &str) -> String {
+    value.replace('\0', "\u{FFFD}")
+}
+
 fn normalize(value: Option<&str>) -> Option<String> {
     value
         .filter(|value| !value.is_empty())
@@ -166,6 +170,7 @@ impl Journal {
             .map_err(|_| AuditError::SinkUnavailable("audit state lock poisoned".into()))?;
         let seq = state.seq + 1;
         let request = AuditRequest {
+            operation: normalize_operation(&request.operation),
             reason: normalize(request.reason.as_deref()),
             credential_ref: normalize(request.credential_ref.as_deref()),
             ..request.clone()
@@ -400,6 +405,23 @@ mod tests {
             hash_record(&with_reason, 1, 1000, "prev"),
             hash_record(&without_reason, 1, 1000, "prev")
         );
+    }
+
+    #[test]
+    fn a_nul_in_an_operation_is_replaced_so_later_records_still_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let journal = Journal::open(&path).unwrap();
+        journal.append(&request("alice", "X\0deny"), 1000).unwrap();
+        journal.append(&request("alice", "GET"), 2000).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines();
+        let first: AuditRecord = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: AuditRecord = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first.operation, "X\u{FFFD}deny");
+        assert!(!content.contains('\0'));
+        assert_eq!(second.seq, 2);
+        assert!(verify_chain(&path).is_ok());
     }
 
     #[test]

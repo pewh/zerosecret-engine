@@ -34,3 +34,34 @@ async fn an_allowed_https_request_records_file_credential_ref() {
         "the credential value must never reach the journal: {journal}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn userinfo_in_the_target_never_reaches_the_audit_host() {
+    let agent = common::setup_agent(true, true);
+    let process = agent.agent.as_ref().expect("agent must run");
+    let proxy = process.proxy_addr.clone();
+    let response = common::raw_exchange(
+        &proxy,
+        b"GET https://leak:zs-audit-userinfo-secret@api.stripe.com/v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "positive control: {response}"
+    );
+
+    let journal = std::fs::read_to_string(agent.dir.join(".zs-audit").join("audit.jsonl")).unwrap();
+    assert!(
+        journal.contains("\"resource\":\"api.stripe.com:443\""),
+        "the audit host must be the bare host: {journal}"
+    );
+    assert!(
+        !journal.contains("zs-audit-userinfo-secret"),
+        "the userinfo password must never reach the journal: {journal}"
+    );
+    assert!(
+        !journal.contains("leak:"),
+        "the userinfo user must never reach the journal: {journal}"
+    );
+}
