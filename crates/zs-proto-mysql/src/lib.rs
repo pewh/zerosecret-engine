@@ -3,7 +3,7 @@ pub mod scramble;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
@@ -713,7 +713,12 @@ impl Ending {
     }
 }
 
-async fn forward_commands<R, W>(client: &mut R, upstream: &mut W, bytes: &AtomicU64) -> Ending
+async fn forward_commands<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    bytes: &AtomicU64,
+    quit: &AtomicBool,
+) -> Ending
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -732,6 +737,10 @@ where
         if header[3] == 0 && payload.first() == Some(&COM_CHANGE_USER) {
             return Ending::ChangeUser;
         }
+        let quitting = header[3] == 0 && payload.first() == Some(&COM_QUIT);
+        if quitting {
+            quit.store(true, Ordering::SeqCst);
+        }
         let sent = async {
             upstream.write_all(&header).await?;
             upstream.write_all(&payload).await?;
@@ -742,7 +751,7 @@ where
             return Ending::Broken(zs_diag::io_kind(&error));
         }
         bytes.fetch_add((len + 4) as u64, Ordering::Relaxed);
-        if header[3] == 0 && payload.first() == Some(&COM_QUIT) {
+        if quitting {
             return Ending::Client;
         }
     }
@@ -776,8 +785,12 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, conn: &Conn) {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let ending = {
+        // A server closes in answer to COM_QUIT, so the backward half can report EOF before the
+        // forward half returns. The flag records the client's intent before the write, which keeps
+        // the attribution to the client whatever order the halves finish in.
+        let quit = AtomicBool::new(false);
         let forward = async {
-            let ending = forward_commands(&mut client_read, &mut upstream_write, &up).await;
+            let ending = forward_commands(&mut client_read, &mut upstream_write, &up, &quit).await;
             let _ = upstream_write.shutdown().await;
             ending
         };
@@ -792,7 +805,13 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, conn: &Conn) {
                     _ => other,
                 },
             },
-            ending = &mut backward => ending,
+            ending = &mut backward => {
+                if quit.load(Ordering::SeqCst) {
+                    Ending::Client
+                } else {
+                    ending
+                }
+            }
         }
     };
     if let Ending::Broken(kind) = ending {
