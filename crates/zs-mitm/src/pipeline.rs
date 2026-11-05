@@ -12,7 +12,7 @@ use zs_audit::{AuditError, Decision};
 use zs_credential::Credential;
 use zs_protocol::{Context as FlowContext, Destination, InjectedRequest, Protocol};
 
-use crate::echo::{EchoNeedles, RequestSnapshot};
+use crate::echo::{self, EchoNeedles, RequestSnapshot};
 use crate::http1::{self, Body, Sender};
 use crate::proxy::{FlowHandler, ProxyError, Upstream, connect_upstream, outbound};
 use crate::scope::{PathScope, Refusal, ScopeDecision, target_refusal};
@@ -342,11 +342,16 @@ async fn send(pending: Pending) -> Response<Body> {
             }
         }
     };
-    if pending
-        .echo
-        .as_ref()
-        .is_some_and(|echo| echo.found_in_response_head(&response))
-    {
+    let refusal = pending.echo.as_ref().and_then(|needles| {
+        if needles.found_in_response_head(&response) {
+            Some("response echo")
+        } else if echo::encoded(response.headers()) {
+            Some("response encoded")
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = refusal {
         // The response and its connection are dropped unread; nothing of it reaches the client.
         drop(response);
         drop(sender);
@@ -354,7 +359,7 @@ async fn send(pending: Pending) -> Response<Body> {
             &*pending.report,
             &pending.facts,
             Decision::Deny,
-            Some("response echo"),
+            Some(reason),
         ) {
             Ok(seq) => {
                 pending.report.denied(&pending.facts, "response", seq);
@@ -367,8 +372,20 @@ async fn send(pending: Pending) -> Response<Body> {
         *senders.lock().await = Some(sender);
     }
     let status = response.status().as_u16();
-    let report = pending.report.clone();
-    let facts = pending.facts;
+    let report = pending.report;
+    let facts = Arc::new(pending.facts);
+    let mut response = response.map(http1::boxed);
+    if let Some(needles) = pending.echo {
+        let (report, facts) = (report.clone(), facts.clone());
+        response = response.map(|body| {
+            echo::guarded(body, needles, move || {
+                match report.audit(&facts, Decision::Deny, Some("response echo")) {
+                    Ok(seq) => report.denied(&facts, "response", seq),
+                    Err(error) => report.audit_failed(error),
+                }
+            })
+        });
+    }
     http1::counted(response, move |bytes| {
         report.relayed(&facts, status, bytes);
     })

@@ -189,6 +189,53 @@ async fn a_refused_upgrade_whose_head_echoes_the_credential_is_withheld() {
     assert!(denied, "{audit}");
 }
 
+fn denied_because(agent: &WsAgent, reason: &str) -> bool {
+    audit_text(agent)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| record["decision"] == "deny" && record["reason"] == reason)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_upgrade_whose_body_echoes_the_credential_is_cut() {
+    let quiet = setup(Reply::Status).await;
+    let (mut tls, head) = upgrade(&quiet).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    let mut body = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut body)).await;
+    assert!(String::from_utf8_lossy(&body).contains("denied"));
+    assert!(!denied_because(&quiet, "response echo"));
+
+    let agent = setup(Reply::StatusBodyEcho).await;
+    let (mut tls, head) = upgrade(&agent).await;
+    let mut body = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut body)).await;
+    let reply = format!("{head}{}", String::from_utf8_lossy(&body));
+    assert!(!reply.contains(SECRET), "{reply}");
+    assert!(
+        denied_because(&agent, "response echo"),
+        "{}",
+        audit_text(&agent)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_upgrade_with_a_coded_body_is_denied() {
+    let quiet = setup(Reply::Status).await;
+    let (_tls, head) = upgrade(&quiet).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(!denied_because(&quiet, "response encoded"));
+
+    let agent = setup(Reply::StatusGzip).await;
+    let (_tls, head) = upgrade(&agent).await;
+    assert!(head.starts_with("HTTP/1.1 502 ZeroSecret denied"), "{head}");
+    assert!(
+        denied_because(&agent, "response encoded"),
+        "{}",
+        audit_text(&agent)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_extension_is_refused_and_audited() {
     let agent = setup(Reply::Extensions).await;

@@ -3898,8 +3898,8 @@ async fn row_88_trace_on_an_injected_binding_is_refused_before_the_upstream() {
     let (served, upstream) = echo_served(common::EchoMode::Trace, any).await;
     let reply = echo_exchange(&served, "GET").await;
     assert!(
-        reply.starts_with("HTTP/1.1 200"),
-        "row 88 positive control: {reply}"
+        !reply.contains(CREDENTIAL),
+        "row 88 positive control: the echoed head is cut: {reply}"
     );
     let reached = || upstream.requests.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(reached(), 1, "row 88 positive control");
@@ -3914,5 +3914,81 @@ async fn row_88_trace_on_an_injected_binding_is_refused_before_the_upstream() {
             && l.contains(r#""decision":"deny""#)
             && l.contains(r#""reason":"trace refused""#)),
         "row 88: {journal}"
+    );
+}
+
+fn journal_denies(served: &Served, reason: &str) -> bool {
+    journal_text(served).lines().any(|l| {
+        l.contains(r#""decision":"deny""#) && l.contains(&format!(r#""reason":"{reason}""#))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_89_a_response_body_that_carries_the_credential_is_cut() {
+    let (quiet, _) = echo_served(common::EchoMode::Nothing, binding()).await;
+    let reply = echo_exchange(&quiet, "GET").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 200") && reply.ends_with(r#"{"object":"list","data":[]}"#),
+        "row 89 positive control: {reply}"
+    );
+    assert!(!journal_denies(&quiet, "response echo"), "row 89");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for chunked in [false, true] {
+        let (served, upstream) =
+            echo_served(common::EchoMode::AuthorizationInBody { chunked }, binding()).await;
+        let mut tls = common::open_tunnel(&served.addr.to_string(), &served.ca_pem, HOST, 443)
+            .await
+            .unwrap();
+        tls.write_all(
+            b"GET /v1/charges HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tls.read_to_end(&mut reply),
+        )
+        .await;
+        let reply = String::from_utf8_lossy(&reply);
+        assert_eq!(
+            upstream.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "row 89 chunked={chunked}"
+        );
+        assert!(
+            !reply.contains(CREDENTIAL),
+            "row 89 chunked={chunked}: {reply}"
+        );
+        assert!(
+            journal_denies(&served, "response echo"),
+            "row 89 chunked={chunked}: {}",
+            journal_text(&served)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_90_a_coded_response_to_an_injected_request_is_refused() {
+    let (quiet, _) = echo_served(common::EchoMode::Nothing, binding()).await;
+    let reply = echo_exchange(&quiet, "GET").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "row 90 positive control: {reply}"
+    );
+
+    let (served, upstream) = echo_served(common::EchoMode::GzipBody, binding()).await;
+    let reply = echo_exchange(&served, "GET").await;
+    assert!(reply.starts_with("HTTP/1.1 502"), "row 90: {reply}");
+    assert_eq!(
+        upstream.requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "row 90"
+    );
+    assert!(
+        journal_denies(&served, "response encoded"),
+        "row 90: {}",
+        journal_text(&served)
     );
 }

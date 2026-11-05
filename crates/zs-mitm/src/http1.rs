@@ -29,7 +29,8 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
     "Transfer-Encoding",
 ];
 
-pub(crate) type Body = BoxBody<Bytes, hyper::Error>;
+pub(crate) type BodyError = Box<dyn StdError + Send + Sync>;
+pub(crate) type Body = BoxBody<Bytes, BodyError>;
 
 #[derive(Clone, Default)]
 pub(crate) struct TargetGuard {
@@ -399,12 +400,15 @@ pub(crate) fn empty_body() -> Body {
     fixed_body(Bytes::new())
 }
 
+pub(crate) fn boxed(body: Incoming) -> Body {
+    body.map_err(BodyError::from).boxed()
+}
+
 pub(crate) fn counted(
-    response: Response<Incoming>,
+    response: Response<Body>,
     finish: impl FnOnce(u64) + Send + Sync + 'static,
 ) -> Response<Body> {
-    let (parts, body) = response.into_parts();
-    Response::from_parts(parts, Relayed::new(body, finish).boxed())
+    response.map(|body| Relayed::new(body, finish).boxed())
 }
 
 pub(crate) fn text_response(body: String) -> Response<Body> {
@@ -418,7 +422,7 @@ pub(crate) fn text_response(body: String) -> Response<Body> {
 
 fn fixed_body(bytes: Bytes) -> Body {
     Full::new(bytes)
-        .map_err(|never: std::convert::Infallible| -> hyper::Error { match never {} })
+        .map_err(|never: std::convert::Infallible| -> BodyError { match never {} })
         .boxed()
 }
 

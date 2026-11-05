@@ -18,7 +18,7 @@ use zs_diag::{Component, DiagLog, Event};
 use zs_protocol::{Context, Destination, InjectedRequest, Protocol};
 
 use crate::ca::LocalCa;
-use crate::echo::{EchoNeedles, RequestSnapshot};
+use crate::echo::{self, EchoNeedles, RequestSnapshot};
 use crate::http1::{self, Guarded, TargetGuard};
 use crate::pipeline;
 use crate::scope::{PathScope, Refusal, ScopeDecision};
@@ -1602,10 +1602,17 @@ async fn serve_websocket(
             return http1::reply(http1::Reply::UpstreamUnreachable);
         }
     };
-    if echo
-        .as_ref()
-        .is_some_and(|echo| echo.found_in_response_head(&response))
-    {
+    let switching = response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
+    let refusal = echo.as_ref().and_then(|needles| {
+        if needles.found_in_response_head(&response) {
+            Some("response echo")
+        } else if !switching && echo::encoded(response.headers()) {
+            Some("response encoded")
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = refusal {
         drop(response);
         drop(sender);
         let seq = audit(
@@ -1613,7 +1620,7 @@ async fn serve_websocket(
             record,
             Decision::Deny,
             &request.method,
-            Some("response echo"),
+            Some(reason),
         )
         .ok();
         shared
@@ -1621,9 +1628,34 @@ async fn serve_websocket(
             .emit(with_seq(event("websocket_refused").warn(), seq));
         return http1::reply(http1::Reply::Denied);
     }
-    drop(echo);
     let upstream_upgrade = hyper::upgrade::on(&mut response);
-    if response.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+    if !switching {
+        let mut response = response.map(http1::boxed);
+        if let Some(needles) = echo {
+            let shared = shared.clone();
+            let record = record.clone();
+            let method = request.method.clone();
+            let resource = resource.to_string();
+            response = response.map(|body| {
+                echo::guarded(body, Arc::new(needles), move || {
+                    let seq = audit(
+                        &shared,
+                        &record,
+                        Decision::Deny,
+                        &method,
+                        Some("response echo"),
+                    )
+                    .ok();
+                    shared.diag.emit(with_seq(
+                        proxy_event(conn, "websocket_refused")
+                            .req(req)
+                            .resource(&resource)
+                            .warn(),
+                        seq,
+                    ));
+                })
+            });
+        }
         let mut response = http1::counted(response, |_| {});
         response.headers_mut().insert(
             hyper::header::CONNECTION,
@@ -1631,6 +1663,7 @@ async fn serve_websocket(
         );
         return response;
     }
+    drop(echo);
     if response.headers().contains_key("sec-websocket-extensions") {
         let seq = audit(
             shared,

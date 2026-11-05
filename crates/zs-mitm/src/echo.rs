@@ -2,8 +2,17 @@
 // raw and percent-encoded, and every header or query value that `inject` added or changed.
 // Needle bytes are zeroized on drop, and the type has no `Debug`.
 
-use zeroize::Zeroizing;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::{Frame, SizeHint};
+use zeroize::{Zeroize, Zeroizing};
 use zs_protocol::InjectedRequest;
+
+use crate::http1::{Body, BodyError};
 
 // Upstream messages that end with this many bytes of the credential's start are held.
 pub(crate) const HOLD_PREFIX: usize = 8;
@@ -65,6 +74,9 @@ impl EchoNeedles {
                 .any(|(was, prior)| was.eq_ignore_ascii_case(name) && prior == value);
             if !unchanged {
                 echo.push(Zeroizing::new(value.as_bytes().to_vec()));
+                if let Some(token) = scheme_token(value) {
+                    echo.push(Zeroizing::new(token.as_bytes().to_vec()));
+                }
             }
         }
         let prior = query_pairs(&before.path);
@@ -109,10 +121,154 @@ impl EchoNeedles {
                 .is_some_and(|phrase| self.found_in(phrase.as_bytes()))
     }
 
-    // A streaming scan keeps one byte fewer than this between chunks; no body scan exists yet.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn longest(&self) -> usize {
-        self.needles.iter().map(|n| n.len()).max().unwrap_or(0)
+    // The longest end of `window` that is a start of some needle.
+    fn started(&self, window: &[u8]) -> usize {
+        self.needles
+            .iter()
+            .map(|needle| started_prefix(window, needle))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+// `Basic …`, `Bearer …`: the token alone can come back without its scheme.
+fn scheme_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (!scheme.is_empty()
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && token.len() >= SHORTEST_INJECTED)
+        .then_some(token)
+}
+
+// A coded body cannot be scanned, so only an absent or `identity` coding is relayed.
+pub(crate) fn encoded(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| match value.to_str() {
+            Ok(codings) => codings
+                .split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+            Err(_) => true,
+        })
+}
+
+#[derive(Debug)]
+struct Echoed;
+
+impl std::fmt::Display for Echoed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("response echo")
+    }
+}
+
+impl std::error::Error for Echoed {}
+
+type Polled = Poll<Option<Result<Frame<Bytes>, BodyError>>>;
+
+// Holds back only an end that starts a needle, so a needle split across chunks is seen whole.
+struct Guarded {
+    inner: Body,
+    needles: Arc<EchoNeedles>,
+    held: Zeroizing<Vec<u8>>,
+    trailers: Option<hyper::HeaderMap>,
+    on_echo: Option<Box<dyn FnOnce() + Send + Sync>>,
+    done: bool,
+}
+
+pub(crate) fn guarded(
+    body: Body,
+    needles: Arc<EchoNeedles>,
+    on_echo: impl FnOnce() + Send + Sync + 'static,
+) -> Body {
+    Guarded {
+        inner: body,
+        needles,
+        held: Zeroizing::new(Vec::new()),
+        trailers: None,
+        on_echo: Some(Box::new(on_echo)),
+        done: false,
+    }
+    .boxed()
+}
+
+impl Guarded {
+    fn echo(&mut self) -> Polled {
+        self.done = true;
+        self.held.zeroize();
+        self.trailers = None;
+        if let Some(on_echo) = self.on_echo.take() {
+            on_echo();
+        }
+        Poll::Ready(Some(Err(Box::new(Echoed))))
+    }
+
+    fn release_tail(&mut self) -> Polled {
+        self.done = true;
+        if self.needles.started(&self.held) >= HOLD_PREFIX {
+            return self.echo();
+        }
+        if self.held.is_empty() {
+            return Poll::Ready(self.trailers.take().map(|t| Ok(Frame::trailers(t))));
+        }
+        let tail = Bytes::copy_from_slice(&self.held);
+        self.held.zeroize();
+        Poll::Ready(Some(Ok(Frame::data(tail))))
+    }
+}
+
+impl hyper::body::Body for Guarded {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Polled {
+        let this = self.get_mut();
+        loop {
+            if this.done {
+                return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
+            }
+            let frame = match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                None => return this.release_tail(),
+                Some(Err(error)) => {
+                    this.done = true;
+                    this.held.zeroize();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Some(Ok(frame)) => frame,
+            };
+            match frame.into_data() {
+                Ok(data) => {
+                    this.held.extend_from_slice(&data);
+                    if this.needles.found_in(&this.held) {
+                        return this.echo();
+                    }
+                    let cut = this.held.len() - this.needles.started(&this.held);
+                    if cut > 0 {
+                        let released = Bytes::copy_from_slice(&this.held[..cut]);
+                        this.held.drain(..cut);
+                        return Poll::Ready(Some(Ok(Frame::data(released))));
+                    }
+                }
+                Err(frame) => {
+                    let Ok(trailers) = frame.into_trailers() else {
+                        continue;
+                    };
+                    if this.needles.found_in_head(&trailers) {
+                        return this.echo();
+                    }
+                    this.trailers = Some(trailers);
+                    return this.release_tail();
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -162,6 +318,7 @@ pub(crate) fn started_prefix(window: &[u8], needle: &[u8]) -> usize {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn request(path: &str) -> InjectedRequest {
         InjectedRequest {
@@ -246,7 +403,219 @@ mod tests {
             "1".parse().unwrap(),
         );
         assert!(needles.found_in_head(&in_name));
-        assert_eq!(needles.longest(), "sk_live_head_42".len());
+        assert_eq!(needles.started(b"xx sk_live_he"), "sk_live_he".len());
+        assert_eq!(needles.started(b"xx sk_live_head_42 "), 0);
+    }
+
+    #[test]
+    fn the_token_after_an_injected_scheme_is_a_needle() {
+        let before = request("/v1");
+        let mut after = request("/v1");
+        after.set_header("Authorization", "Basic dXNlcjpzM2NyZXQrdmFsdWUh");
+        after.set_header("X-Api-Auth", "Token short");
+        let needles =
+            EchoNeedles::from_injection(&RequestSnapshot::of(&before), &after, b"s3cret+value!");
+        assert!(needles.found_in(b"{\"seen\":\"dXNlcjpzM2NyZXQrdmFsdWUh\"}"));
+        assert!(needles.found_in(b"Token short"));
+        assert!(!needles.found_in(b"short"));
+        assert!(!needles.found_in(b"Basic"));
+    }
+
+    struct Chunks(std::collections::VecDeque<Frame<Bytes>>);
+
+    impl hyper::body::Body for Chunks {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+            Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+        }
+    }
+
+    fn frames(frames: Vec<Frame<Bytes>>) -> Body {
+        Chunks(frames.into()).boxed()
+    }
+
+    fn chunks(parts: &[&[u8]]) -> Body {
+        frames(
+            parts
+                .iter()
+                .map(|part| Frame::data(Bytes::copy_from_slice(part)))
+                .collect(),
+        )
+    }
+
+    fn needles() -> Arc<EchoNeedles> {
+        let before = request("/v1");
+        Arc::new(EchoNeedles::from_injection(
+            &RequestSnapshot::of(&before),
+            &before,
+            b"sk_test_ws_guard_value_7c2d",
+        ))
+    }
+
+    async fn collect(body: Body) -> Result<Vec<u8>, BodyError> {
+        body.collect().await.map(|c| c.to_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_body_without_the_credential_passes_unchanged() {
+        let out = collect(guarded(chunks(&[b"hello ", b"world"]), needles(), || {})).await;
+        assert_eq!(out.unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn a_credential_split_across_chunks_is_caught() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = fired.clone();
+        let out = collect(guarded(
+            chunks(&[b"x sk_test_ws_gu", b"ard_value_7c2d y"]),
+            needles(),
+            move || f.store(true, Ordering::SeqCst),
+        ))
+        .await;
+        assert!(out.is_err());
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    struct Fed(tokio::sync::mpsc::UnboundedReceiver<&'static [u8]>);
+
+    impl hyper::body::Body for Fed {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+            self.get_mut()
+                .0
+                .poll_recv(cx)
+                .map(|part| part.map(|p| Ok(Frame::data(Bytes::from_static(p)))))
+        }
+    }
+
+    async fn next_data(body: &mut Body) -> Vec<u8> {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .expect("a frame must come out without waiting for the next chunk");
+        frame.unwrap().unwrap().into_data().unwrap().to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_ends_in_no_needle_start_is_released_at_once() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut body = guarded(Fed(rx).boxed(), needles(), || {});
+        feed.send(b"data: {\"token\":\"hi\"}\n\n").unwrap();
+        assert_eq!(next_data(&mut body).await, b"data: {\"token\":\"hi\"}\n\n");
+        feed.send(b"data: next\n\n").unwrap();
+        assert_eq!(next_data(&mut body).await, b"data: next\n\n");
+    }
+
+    #[tokio::test]
+    async fn only_a_needle_start_at_the_end_of_a_chunk_is_held() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut body = guarded(Fed(rx).boxed(), needles(), || {});
+        feed.send(b"abc sk_test").unwrap();
+        assert_eq!(next_data(&mut body).await, b"abc ");
+        feed.send(b"!more").unwrap();
+        assert_eq!(next_data(&mut body).await, b"sk_test!more");
+        drop(feed);
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_held_prefix_at_end_of_stream_is_withheld() {
+        let out = collect(guarded(chunks(&[b"tail sk_test_ws"]), needles(), || {})).await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_short_prefix_at_end_of_stream_is_released() {
+        let out = collect(guarded(chunks(&[b"tail ", b"sk_test"]), needles(), || {})).await;
+        assert_eq!(out.unwrap(), b"tail sk_test");
+    }
+
+    #[tokio::test]
+    async fn an_echo_fires_once_and_ends_the_data() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = fired.clone();
+        let mut body = guarded(
+            chunks(&[
+                b"0123456789012345678901234567890123456789 ",
+                b"sk_test_ws_guard_value_7c2d",
+                b" after",
+            ]),
+            needles(),
+            move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let mut released = Vec::new();
+        let mut errors = 0;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => released.extend_from_slice(frame.data_ref().unwrap()),
+                Err(error) => {
+                    assert_eq!(fired.load(Ordering::SeqCst), 1);
+                    assert_eq!(error.to_string(), "response echo");
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(errors, 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(!contains(&released, b"sk_test", |a, b| a == b));
+        assert!(!contains(&released, b"after", |a, b| a == b));
+    }
+
+    #[tokio::test]
+    async fn trailers_are_checked_and_follow_the_released_tail() {
+        let mut quiet = hyper::HeaderMap::new();
+        quiet.insert("x-checksum", "abc".parse().unwrap());
+        let mut body = guarded(
+            frames(vec![
+                Frame::data(Bytes::from_static(b"payload")),
+                Frame::trailers(quiet),
+            ]),
+            needles(),
+            || {},
+        );
+        let first = body.frame().await.unwrap().unwrap();
+        assert_eq!(first.data_ref().unwrap().as_ref(), b"payload");
+        assert!(body.frame().await.unwrap().unwrap().is_trailers());
+        assert!(body.frame().await.is_none());
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = fired.clone();
+        let mut loud = hyper::HeaderMap::new();
+        loud.insert("x-debug", "sk_test_ws_guard_value_7c2d".parse().unwrap());
+        let out = collect(guarded(
+            frames(vec![
+                Frame::data(Bytes::from_static(b"payload")),
+                Frame::trailers(loud),
+            ]),
+            needles(),
+            move || f.store(true, Ordering::SeqCst),
+        ))
+        .await;
+        assert!(out.is_err());
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn only_an_identity_content_encoding_is_scannable() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(!encoded(&headers));
+        headers.insert("content-encoding", "identity".parse().unwrap());
+        assert!(!encoded(&headers));
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        assert!(encoded(&headers));
+        headers.insert("content-encoding", "identity, br".parse().unwrap());
+        assert!(encoded(&headers));
     }
 
     #[test]

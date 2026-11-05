@@ -68,6 +68,11 @@ token or the AWS session keys.
 ZeroSecret does not stop her, or her coding agent, reading and forwarding that data.
 Authorization is not DLP.
 
+**A body echo found after the head is sent truncates the response.** The agent sends an
+injected response's head before it reads the body, so when the body echoes the credential
+(§4 rule 9) the agent ends the response and the workload sees a truncated response, not a
+502, with the bytes before the echo already delivered.
+
 **Malicious code on the agent host.** Root, kernel, or EDR-level compromise defeats the
 agent. ZeroSecret is not a sandbox.
 
@@ -367,8 +372,16 @@ These are enforced in code review and in CI, not by convention.
    value and the reason phrase, and runs before any byte of the response reaches the
    workload, on the upgrade answer of a WebSocket binding too. An injected header or query
    value shorter than 8 bytes, `Host`, `Accept-Encoding`, and every `x-amz-*` header except
-   `x-amz-security-token` are not matched. An injected request asks the upstream for
-   `Accept-Encoding: identity`. The response body is not checked by this rule.
+   `x-amz-security-token` are not matched. When an injected value is `<scheme> <token>`
+   (`Basic …`, `Bearer …`), a token of 8 bytes or more is also matched alone. An injected
+   request asks the upstream for `Accept-Encoding: identity`. A response with any other
+   `Content-Encoding` is refused with 502 and audited `deny` `response encoded`, because its
+   body cannot be scanned. The body and its trailers are checked as a stream: the agent holds
+   back only the end of a chunk that is the start of a matched value, so a value split across
+   chunks is seen whole, and releases the other bytes at once. A body that carries a matched value, or that ends with
+   8 or more bytes of the start of one, is cut and audited `deny` `response echo` (§3). A WebSocket
+   binding's refused upgrade answer gets the same checks. A copy of the credential that is
+   transformed, or that has other bytes between its parts, is not matched.
 
 **A policy evaluation that does not allow denies.** `zs-policy` evaluates every request with the
 Cedar engine over a fixed policy set (ADR-0040). `Ok` requires an explicit allow, no diagnostic
@@ -791,6 +804,8 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Upstream response head to an injected request carries the credential, raw or percent-encoded, or an injected header or query value ≥ 8 bytes (a redirect `Location` included) | Refuse with 502 before any byte reaches the workload. Drop the response and its connection unread. Audit `deny` `response echo` (`apps/zs/tests/response_echo.rs`) |
 | A WebSocket binding's upgrade answer carries the credential in its head | Refuse with 502. Audit `deny` `response echo` (`apps/zs/tests/websocket_binding.rs`) |
 | `TRACE` request on an injected binding | Refuse with 502 before materialization; nothing reaches the upstream. Audit `deny` `trace refused` (`apps/zs/tests/response_echo.rs`) |
+| Upstream response body or trailer to an injected request (a WebSocket binding's refused upgrade answer included) carries the credential, raw or percent-encoded, or an injected value ≥ 8 bytes, whole or split across chunks, or ends with 8 or more bytes of its start | Cut the response before those bytes reach the workload; the workload sees a truncated response. Audit `deny` `response echo` (`apps/zs/tests/response_echo.rs`, `apps/zs/tests/websocket_binding.rs`) |
+| Upstream response to an injected request has a `Content-Encoding` other than `identity` | Refuse with 502 before any byte reaches the workload. Audit `deny` `response encoded` (`apps/zs/tests/response_echo.rs`, `apps/zs/tests/websocket_binding.rs`) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository

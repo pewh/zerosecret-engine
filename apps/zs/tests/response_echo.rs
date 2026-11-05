@@ -171,8 +171,9 @@ fn a_redirect_that_keeps_a_query_credential_is_refused() {
 fn trace_on_an_injected_binding_is_refused_before_materialization() {
     let agent = setup_echo(EchoMode::Trace);
     let reply = agent.get("/v1/charges");
-    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(!reply.contains(SECRET), "{reply}");
     assert_eq!(agent.upstream.requests.load(Ordering::SeqCst), 1);
+    assert!(denied_because(&agent, "response echo"));
 
     let reply = agent.request("TRACE", "/v1/charges");
     assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
@@ -201,4 +202,45 @@ fn an_injected_request_asks_for_identity_encoding() {
         .unwrap()
         .to_ascii_lowercase();
     assert!(head.contains("accept-encoding: identity"), "{head}");
+}
+
+const QUIET_BODY: &str = r#"{"object":"list","data":[]}"#;
+
+#[test]
+fn a_body_that_echoes_the_credential_is_cut_and_audited() {
+    let quiet = setup_echo(EchoMode::Nothing);
+    assert!(quiet.get("/v1/charges").ends_with(QUIET_BODY));
+    assert!(!denied_because(&quiet, "response echo"));
+    for chunked in [false, true] {
+        let agent = setup_echo(EchoMode::AuthorizationInBody { chunked });
+        let reply = agent.get("/v1/charges");
+        assert_eq!(
+            agent.upstream.requests.load(Ordering::SeqCst),
+            1,
+            "chunked={chunked}"
+        );
+        assert!(!reply.contains(SECRET), "chunked={chunked}");
+        assert!(
+            audit_records(&agent.audit)
+                .iter()
+                .any(|r| r["decision"] == "deny" && r["reason"] == "response echo"),
+            "chunked={chunked}: {:?}",
+            audit_records(&agent.audit)
+        );
+    }
+}
+
+#[test]
+fn a_compressed_response_to_an_injected_request_is_denied() {
+    let quiet = setup_echo(EchoMode::Nothing);
+    assert!(quiet.get("/v1/charges").starts_with("HTTP/1.1 200"));
+    let agent = setup_echo(EchoMode::GzipBody);
+    let reply = agent.get("/v1/charges");
+    assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+    assert_eq!(agent.upstream.requests.load(Ordering::SeqCst), 1);
+    assert!(
+        denied_because(&agent, "response encoded"),
+        "{:?}",
+        audit_records(&agent.audit)
+    );
 }

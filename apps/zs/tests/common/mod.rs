@@ -310,6 +310,10 @@ pub enum EchoMode {
     QueryInLocation,
     // 200 `message/http` whose body is the request head, as a TRACE server answers.
     Trace,
+    // 200 whose body names the request's Authorization value; chunked splits it across chunks.
+    AuthorizationInBody { chunked: bool },
+    // 200 with `Content-Encoding: gzip`.
+    GzipBody,
 }
 
 pub fn spawn_echo_upstream(mode: EchoMode) -> FakeUpstream {
@@ -381,6 +385,35 @@ pub fn spawn_echo_upstream(mode: EchoMode) -> FakeUpstream {
                         )
                     }
                     EchoMode::Trace => ("200 OK", String::new(), "message/http", buf.clone()),
+                    EchoMode::AuthorizationInBody { chunked: false } => (
+                        "200 OK",
+                        String::new(),
+                        "application/json",
+                        format!(r#"{{"seen":"{authorization}"}}"#).into_bytes(),
+                    ),
+                    EchoMode::AuthorizationInBody { chunked: true } => {
+                        let body = format!(r#"{{"seen":"{authorization}"}}"#).into_bytes();
+                        let at = body.len() / 2;
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        );
+                        for part in [&body[..at], &body[at..]] {
+                            let _ = stream.write_all(format!("{:x}\r\n", part.len()).as_bytes());
+                            let _ = stream.write_all(part);
+                            let _ = stream.write_all(b"\r\n");
+                            let _ = stream.flush();
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        let _ = stream.write_all(b"0\r\n\r\n");
+                        let _ = stream.flush();
+                        return;
+                    }
+                    EchoMode::GzipBody => (
+                        "200 OK",
+                        "Content-Encoding: gzip\r\n".to_string(),
+                        "application/json",
+                        b"\x1f\x8b\x08\x00\x00\x00\x00\x00".to_vec(),
+                    ),
                 };
                 let _ = stream.write_all(
                     format!(
