@@ -3767,3 +3767,152 @@ fn row_85_a_remote_source_in_zs_policy_json_is_refused_at_load() {
         assert!(!marker.exists(), "row 85: the child must not start");
     }
 }
+
+async fn echo_served(
+    mode: common::EchoMode,
+    binding: ResourceBinding,
+) -> (Served, common::FakeUpstream) {
+    let key = ControlSigningKey::generate("k1");
+    let upstream = common::spawn_echo_upstream(mode);
+    let served = serve_with_upstream(
+        binding,
+        granted(&key, &["*"], "https"),
+        &key,
+        Some(CREDENTIAL),
+        Recorder {
+            port: upstream.addr.port(),
+            heads: Arc::default(),
+        },
+    )
+    .await;
+    (served, upstream)
+}
+
+async fn echo_exchange(served: &Served, method: &str) -> String {
+    common::tunneled_exchange(
+        &served.addr.to_string(),
+        &served.ca_pem,
+        HOST,
+        443,
+        format!(
+            "{method} /v1/charges HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_86_a_response_head_that_carries_the_credential_is_refused() {
+    let query = || {
+        with_auth(HttpAuth::QueryParam {
+            param: "api_key".into(),
+        })
+    };
+    let (quiet, _) = echo_served(common::EchoMode::Nothing, binding()).await;
+    let reply = echo_exchange(&quiet, "GET").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "row 86 positive control: {reply}"
+    );
+    let (moved, _) = echo_served(common::EchoMode::QueryInLocation, binding()).await;
+    let reply = echo_exchange(&moved, "GET").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 302"),
+        "row 86 positive control: a redirect without the credential is relayed: {reply}"
+    );
+
+    for (mode, binding) in [
+        (
+            common::EchoMode::AuthorizationInHeader("x-debug-auth"),
+            binding(),
+        ),
+        (common::EchoMode::QueryInLocation, query()),
+    ] {
+        let (served, upstream) = echo_served(mode, binding).await;
+        let reply = echo_exchange(&served, "GET").await;
+        assert!(reply.starts_with("HTTP/1.1 502"), "row 86: {reply}");
+        assert_eq!(
+            upstream.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "row 86"
+        );
+        assert!(!reply.contains(CREDENTIAL), "row 86: {reply}");
+        let journal = journal_text(&served);
+        assert!(
+            journal
+                .lines()
+                .any(|l| l.contains(r#""decision":"deny""#)
+                    && l.contains(r#""reason":"response echo""#)),
+            "row 86: {journal}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_87_a_websocket_upgrade_answer_that_carries_the_credential_is_refused() {
+    let (quiet, _) = ws_served(ws_fake::Reply::Status).await;
+    let (_tls, head) = ws_upgrade(&quiet).await;
+    assert!(
+        head.starts_with("HTTP/1.1 403"),
+        "row 87 positive control: {head}"
+    );
+
+    // ws_fake's StatusEcho names this value in its 403 head.
+    let echoed = "sk_test_zsv_synthetic_value_9f27c4d1";
+    let key = ControlSigningKey::generate("k1");
+    let seen = Arc::new(std::sync::Mutex::new(ws_fake::Seen::default()));
+    let port = ws_fake::spawn_ws_upstream(ws_fake::Reply::StatusEcho, seen).await;
+    let served = serve_with_upstream(
+        with_auth(HttpAuth::WebsocketJsonField {
+            field: "apiKey".into(),
+        }),
+        granted(&key, &["GET"], "https"),
+        &key,
+        Some(echoed),
+        Recorder {
+            port,
+            heads: Arc::default(),
+        },
+    )
+    .await;
+    let (_tls, head) = ws_upgrade(&served).await;
+    assert!(
+        head.starts_with("HTTP/1.1 502 ZeroSecret denied"),
+        "row 87: {head}"
+    );
+    assert!(!head.contains(echoed), "row 87: {head}");
+    let journal = journal_text(&served);
+    assert!(
+        journal.lines().any(
+            |l| l.contains(r#""decision":"deny""#) && l.contains(r#""reason":"response echo""#)
+        ),
+        "row 87: {journal}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_88_trace_on_an_injected_binding_is_refused_before_the_upstream() {
+    let mut any = binding();
+    any.operations = vec!["*".to_string()];
+    let (served, upstream) = echo_served(common::EchoMode::Trace, any).await;
+    let reply = echo_exchange(&served, "GET").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "row 88 positive control: {reply}"
+    );
+    let reached = || upstream.requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(reached(), 1, "row 88 positive control");
+
+    let reply = echo_exchange(&served, "TRACE").await;
+    assert!(reply.starts_with("HTTP/1.1 502"), "row 88: {reply}");
+    assert!(!reply.contains(CREDENTIAL), "row 88: {reply}");
+    assert_eq!(reached(), 1, "row 88: TRACE must not reach the upstream");
+    let journal = journal_text(&served);
+    assert!(
+        journal.lines().any(|l| l.contains(r#""operation":"TRACE""#)
+            && l.contains(r#""decision":"deny""#)
+            && l.contains(r#""reason":"trace refused""#)),
+        "row 88: {journal}"
+    );
+}

@@ -13,6 +13,8 @@ pub enum Reply {
     Masked,
     Reserved,
     Status,
+    // A 403 whose head names the credential the agent injects.
+    StatusEcho,
     Extensions,
 }
 
@@ -99,6 +101,12 @@ pub async fn spawn_ws_upstream(reply: Reply, seen: Arc<Mutex<Seen>>) -> u16 {
                         .await;
                     return;
                 }
+                if matches!(reply, Reply::StatusEcho) {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nX-Debug-Key: sk_test_zsv_synthetic_value_9f27c4d1\r\nContent-Length: 6\r\n\r\ndenied")
+                        .await;
+                    return;
+                }
                 if matches!(reply, Reply::Extensions) {
                     let _ = stream
                         .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
@@ -139,7 +147,9 @@ pub async fn spawn_ws_upstream(reply: Reply, seen: Arc<Mutex<Seen>>) -> u16 {
                             f[0] |= 0x40;
                             f
                         }
-                        Reply::Status | Reply::Extensions => frame(1, &ok, None),
+                        Reply::Status | Reply::StatusEcho | Reply::Extensions => {
+                            frame(1, &ok, None)
+                        }
                     };
                     if stream.write_all(&answer).await.is_err() {
                         return;

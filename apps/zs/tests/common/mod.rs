@@ -299,6 +299,104 @@ pub fn spawn_fake_upstream() -> FakeUpstream {
     }
 }
 
+// How a fake upstream answers an injected request, for the response echo guard.
+#[derive(Clone, Copy)]
+pub enum EchoMode {
+    // 200 with a body that names nothing from the request.
+    Nothing,
+    // 200 that copies the request's Authorization value into the named response header.
+    AuthorizationInHeader(&'static str),
+    // 302 whose Location keeps the request's query string.
+    QueryInLocation,
+    // 200 `message/http` whose body is the request head, as a TRACE server answers.
+    Trace,
+}
+
+pub fn spawn_echo_upstream(mode: EchoMode) -> FakeUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = FakeUpstream {
+        addr: listener.local_addr().unwrap(),
+        requests: Arc::new(AtomicUsize::new(0)),
+        connections: Arc::new(AtomicUsize::new(0)),
+        saw_authorization: Arc::new(AtomicBool::new(false)),
+        last_auth: Arc::new(std::sync::Mutex::new(String::new())),
+        last_head: Arc::new(std::sync::Mutex::new(String::new())),
+        last_body: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let requests = upstream.requests.clone();
+    let connections = upstream.connections.clone();
+    let last_head = upstream.last_head.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            connections.fetch_add(1, Ordering::SeqCst);
+            let requests = requests.clone();
+            let last_head = last_head.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") && buf.len() <= 65536 {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    buf.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                *last_head.lock().unwrap() = head.clone();
+                requests.fetch_add(1, Ordering::SeqCst);
+                let target = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("");
+                let authorization = head
+                    .lines()
+                    .skip(1)
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+                            .map(|(_, v)| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let (status, extra, content_type, body) = match mode {
+                    EchoMode::Nothing => (
+                        "200 OK",
+                        String::new(),
+                        "application/json",
+                        br#"{"object":"list","data":[]}"#.to_vec(),
+                    ),
+                    EchoMode::AuthorizationInHeader(name) => (
+                        "200 OK",
+                        format!("{name}: {authorization}\r\n"),
+                        "application/json",
+                        br#"{"object":"list","data":[]}"#.to_vec(),
+                    ),
+                    EchoMode::QueryInLocation => {
+                        let query = target.split_once('?').map_or("", |(_, q)| q);
+                        (
+                            "302 Found",
+                            format!("Location: /next?{query}\r\n"),
+                            "text/plain",
+                            b"moved".to_vec(),
+                        )
+                    }
+                    EchoMode::Trace => ("200 OK", String::new(), "message/http", buf.clone()),
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\n{extra}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            });
+        }
+    });
+    upstream
+}
+
 pub fn write_test_setup(
     dir: &std::path::Path,
     upstream_port: u16,

@@ -7,6 +7,46 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0051 — The commercial suite is Go; tests that need engine internals live here
+
+**2026-11-04 · Accepted** · owner request 2026-11-03 ("port suite to go") · amends ADR-0050
+D1, D2, D3, D6 and D8
+
+The commercial suite was a Rust crate in the commercial repository, `apps/zs-control-tests`: 25 test
+binaries and 269 test functions. Its harness spawned the `zs` binary and the Go control binary,
+and opened TLS, minted grants and read the schema in Rust. The owner asked for a Go suite and
+for no Rust in the commercial repository. That left 39 tests that inspect engine internals
+without a home: they cannot move to Go, because they call the engine in process.
+
+**Decision.**
+- **D1.** Those 39 tests live here, in `apps/zs/tests/`: `signed_connection_in_process.rs`
+  (12), `wire_client_contract.rs` (3), `startup_lifecycle_agent.rs` (17) and
+  `agent_flags.rs` (7). A test that needs engine internals is added here, not in the
+  commercial repository. They run in `check` under `cargo test --workspace --locked`.
+- **D2.** The commercial suite is the nested Go module `control/e2e` in the commercial repository, one
+  package per former Rust file, with `control/e2e/internal/harness`. It links no engine
+  crate: it runs the `zs` binary built from a pinned checkout of this repository (`ZS_BIN`)
+  and the Go control binary (`ZS_CONTROL_BIN`).
+- **D3.** The commercial repository holds no Cargo workspace, `Cargo.lock`,
+  `rust-toolchain.toml` or `deny.toml`. This repository is the only Rust workspace;
+  `engine-pin` remains the join between the two.
+- **D4.** Coverage parity is recorded, not asserted by a script: the baseline was 269 tests;
+  39 moved here and 230 are Go tests there. The commercial harness's grant verifier is pinned
+  to this repository's golden vectors (`crates/zs-grant/vectors/grant-file.json`), run as a Go
+  test, so the two implementations cannot drift silently. A vector change is a contract
+  change: both sides are green before the pin moves.
+
+**Consequence.** A test that needs engine internals has a home here, and the commercial
+repository has one language. The moved tests run in this repository's CI before a tag exists,
+so a pin bump cannot carry a regression they would catch. A commercial test reaches the agent
+only through its binary and the wire contract.
+
+**Reverse it if** the commercial suite needs in-process access to engine internals that the
+process interface cannot expose. The answer is a test hook in the engine or a test here, not
+a second language in the commercial repository.
+
+---
+
 ## ADR-0050 — This repository is the upstream; the commercial layer pins a release of it
 
 **2026-11-02 · Accepted** · owner request 2026-11-02 (Option B) · supersedes ADR-0045 D3
@@ -19,38 +59,42 @@ the upstream.
 
 **Decision.**
 - **D1.** This repository is the upstream for all engine code: `crates/*`, `apps/zs`,
-  `tools/zs-verify`, the conformance suite and its fixtures. Engine changes are made here, under
-  the DCO rule of ADR-0045 D5, and a pull request is merged here.
+  `tools/zs-verify`, the conformance suite and its fixtures, and the engine-internal tests
+  moved here by ADR-0051. Engine changes are made here, under the DCO rule of ADR-0045 D5,
+  and a pull request is merged here.
 - **D2.** The commercial layer — the control plane, its tests, the customer harness records and
   the execution state — lives in a separate private repository that clones this one beside
   itself as `engine/`: locally a symlink, in CI a checkout at the pinned tag. No commercial
   source file is tracked here.
-- **D3.** This repository keeps its own Cargo workspace and its own `Cargo.lock`. The commercial
-  repository takes the engine crates as path dependencies through `engine/` and holds a separate
-  lock, so no change here needs a lock file there until a tag moves.
+- **D3.** This repository keeps its own Cargo workspace and its own `Cargo.lock`. The
+  commercial repository holds no Cargo workspace (ADR-0051 D3): it builds the `zs` binary
+  from the engine checkout and runs it as a process, so no change here needs a lock file
+  there until a tag moves.
 - **D4.** The commercial repository pins a `vX.Y.Z` tag of this repository and the commit that
   tag resolves to, and refuses to build when the tag resolves to another commit. A published tag
   is therefore an identity, not a moving label; moving one breaks every pin that names it.
 - **D5.** This repository is public since 2026-11-03. The commercial CI checks out the pinned tag
   with a read-only deploy key, or with its default token now that the tag is publicly readable.
 - **D6.** Engine tests run only in this repository's CI: `gates`, `check`, `conformance`,
-  `db-real`, and the macOS, Linux and Windows native jobs. `macos-check` and `macos-native` run
-  only while this repository is public, where hosted macOS minutes are free.
+  `db-real`, and the macOS, Linux and Windows native jobs. The 39 tests moved here by
+  ADR-0051 run in `check`. `macos-check` and `macos-native` run only while this repository is
+  public, where hosted macOS minutes are free.
 - **D7.** The export tooling of ADR-0045 D3 is deleted and not maintained here:
   `release/build-tree.sh`, `release/public-set.txt`, `release/overlay/` and
   `release/README.head.md`. The release gates are `tools/public-gates.sh`, run by CI on every
   push and pull request. The forbidden-name list stays in the commercial repository as the
   source of this repository's `FORBIDDEN_NAMES` secret, because the gate must not contain it.
-- **D8.** In a developer's workspace both Cargo workspaces build into one target directory: the
-  clone carries an untracked `.cargo/config.toml` pointing at the commercial repository's
-  `target/`, so an engine build does not fill a second one. CI builds each workspace on its own.
+- **D8.** Only this Cargo workspace builds (ADR-0051 D3). In CI it builds into `engine/target`;
+  locally the clone may carry an untracked `.cargo/config.toml` pointing at a shared `target/`,
+  so an engine build does not fill a second one.
 
 **Consequence.** One copy of each engine file. An engine change and the commercial change that
 uses it are two commits in two repositories, joined by a pin bump, so a commercial test that
 needs new engine behaviour waits for that behaviour to land here. The owner documents — PRODUCT,
 ARCHITECTURE, SECURITY, ROADMAP and DECISIONS — exist in both repositories and can drift; an
-engine-facing change to one is made here. This entry and the commercial repository's copy record
-the same decision from opposite sides.
+engine-facing change to one is made here. The commercial suite reaches this repository only
+through the pinned binary and the wire contract (ADR-0051). This entry and the commercial
+repository's copy record the same decision from opposite sides.
 
 **Reverse it if** most changes need an engine edit and a commercial edit in the same step, so
 that pin bumps become the bottleneck. Then the engine returns to the commercial repository with
@@ -2003,7 +2047,8 @@ language, and worse debuggability at precisely the boundary most needed during a
 incident.
 
 **Consequence:** no `.proto` files, no codegen step. If server-push is needed for
-revocation, SSE over the existing axum server is a smaller step than adopting tonic.
+revocation, SSE from the control plane's `chi` server (ADR-0049, ADR-0051) is a smaller step
+than adopting tonic.
 `zs-wire` DTOs stay deliberately stringly-typed rather than depending on `zs-identity`,
 so a change to `Subject`'s internals cannot break the wire format of deployed agents.
 

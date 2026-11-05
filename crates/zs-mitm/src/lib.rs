@@ -1,5 +1,6 @@
 pub mod ca;
 pub mod device_store;
+mod echo;
 mod http1;
 mod pipeline;
 pub mod proxy;

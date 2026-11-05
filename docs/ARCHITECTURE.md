@@ -55,6 +55,11 @@ Materialization is a **capability**, not a binary. It runs at either trusted bou
 
 ## 2. Workspace
 
+This repository is the open-source engine (ADR-0050), and the paths below start at its root.
+The commercial layer — the Go control plane in `control/`, the dashboard, and its Go
+end-to-end suite `control/e2e` — is a separate private repository, which pins a released
+tag of this repository (ADR-0051). No commercial source file is tracked here.
+
 ```
 crates/
   zs-vectors           golden vector files: one format, one index, one meta-check
@@ -88,8 +93,8 @@ apps/
   zs                   CLI and agent daemon, one binary
 ```
 
-The control plane is a separate Go module in `control/`. It serves the JSON wire API and
-the dashboard from one binary:
+The control plane is a separate Go module in `control/` in the commercial repository. It
+serves the JSON wire API and the dashboard from one binary:
 
 ```
 control/
@@ -164,17 +169,18 @@ runtime, control-plane enrolment, any listener, any background task, and the chi
 failure exits 1 with nothing to release. No shipped path calls the plaintext
 `LocalCa::load_or_create`.
 
-**A language-neutral spec and golden vectors hold the two control planes in step.** A vector
-lives next to the code that owns its contract: `crates/zs-grant/vectors/`,
-`crates/zs-policy/vectors/`, `crates/zs-wire/vectors/`, and `control/vectors/` for
-federation, dashboard forms, OIDC ID tokens, and URL and identifier rules. A vector is a
-JSON file with `about`, a `version`, and `cases`; each case pins exact bytes, an exact error
-text, or an exact status code. Every directory has an `INDEX.json`, and a meta-test in each
-language fails when a listed file or case did not run, or when a file is not listed. Rust
-reads a vector with `include_str!`; Go reads it by a path relative to its module, so the Go
-tests run only inside this repository. A changed vector is a contract change: both
-languages and both suites must be green in the same change. The spec owns the wire schema
-(ADR-0048 D7); `zs-wire` is the agent's implementation of it.
+**A language-neutral spec and golden vectors hold the engine and the control plane in
+step.** A vector lives next to the code that owns its contract: `crates/zs-grant/vectors/`,
+`crates/zs-policy/vectors/`, `crates/zs-wire/vectors/`, and `control/vectors/` in the
+commercial repository for federation, dashboard forms, OIDC ID tokens, and URL and
+identifier rules. A vector is a JSON file with `about`, a `version`, and `cases`; each case
+pins exact bytes, an exact error text, or an exact status code. Every directory has an
+`INDEX.json`, and a meta-test in each language fails when a listed file or case did not run,
+or when a file is not listed. Rust reads a vector with `include_str!`; Go reads it by a path
+relative to its module, so the Go tests run only inside the commercial repository. A
+changed vector is a contract change: the engine workspace and the commercial suite must
+both be green before the pin moves. The spec owns the wire schema (ADR-0048 D7); `zs-wire`
+is the agent's implementation of it.
 
 **Dependency rule:** `apps/` depends on `crates/`. Crates never depend on apps. A crate
 may depend only on crates listed **above** it; every dependency must appear strictly

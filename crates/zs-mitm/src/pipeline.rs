@@ -12,6 +12,7 @@ use zs_audit::{AuditError, Decision};
 use zs_credential::Credential;
 use zs_protocol::{Context as FlowContext, Destination, InjectedRequest, Protocol};
 
+use crate::echo::{EchoNeedles, RequestSnapshot};
 use crate::http1::{self, Body, Sender};
 use crate::proxy::{FlowHandler, ProxyError, Upstream, connect_upstream, outbound};
 use crate::scope::{PathScope, Refusal, ScopeDecision, target_refusal};
@@ -64,6 +65,8 @@ pub(crate) struct Pending {
     pub route: Route,
     pub report: Arc<dyn Report>,
     pub skip_inject: bool,
+    // What the response head must not carry, set when a credential was injected.
+    pub echo: Option<Arc<EchoNeedles>>,
 }
 
 fn audit_or_reply(
@@ -155,6 +158,12 @@ pub(crate) fn inject_only(
     if facts.resource.is_empty() {
         return Ok(None);
     }
+    // A TRACE answer reflects the request, so it would carry the injected credential back.
+    if request.method.eq_ignore_ascii_case("TRACE") {
+        let seq = audit_or_reply(report, facts, Decision::Deny, Some("trace refused"))?;
+        report.denied(facts, "method", seq);
+        return Err(Box::new(http1::reply(http1::Reply::Denied)));
+    }
     let stage = std::cell::Cell::new("identity");
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let protocol = handler.protocol_for(&facts.resource).ok_or_else(|| {
@@ -164,6 +173,8 @@ pub(crate) fn inject_only(
         let credential = handler.materialize(&facts.resource, &facts.operation)?;
         stage.set("inject");
         request.set_header("Host", authority);
+        // A coded response body cannot be scanned for an echoed credential.
+        request.set_header("Accept-Encoding", "identity");
         protocol.inject(request, &credential)?;
         Ok::<_, zs_protocol::Denied>((protocol, credential))
     }));
@@ -245,6 +256,7 @@ where
 
     fn call(&mut self, mut pending: Pending) -> Self::Future {
         if !pending.skip_inject {
+            let before = RequestSnapshot::of(&pending.request);
             match inject_only(
                 &self.handler,
                 &*self.report,
@@ -252,7 +264,15 @@ where
                 &mut pending.request,
                 &pending.authority,
             ) {
-                Ok(_) => {}
+                Ok(Some((_, credential))) => {
+                    pending.echo = Some(Arc::new(EchoNeedles::from_injection(
+                        &before,
+                        &pending.request,
+                        credential.expose(),
+                    )));
+                    drop(credential);
+                }
+                Ok(None) => {}
                 Err(reply) => return Box::pin(async move { Ok(*reply) }),
             }
         }
@@ -282,7 +302,7 @@ async fn send(pending: Pending) -> Response<Body> {
         Route::Fresh { upstream } => (None, upstream.clone()),
     };
     let mut attempt = 0;
-    let response = loop {
+    let (response, sender) = loop {
         let (mut sender, reused) = match open(&senders, &upstream).await {
             Ok(pair) => pair,
             Err(error) => {
@@ -310,12 +330,7 @@ async fn send(pending: Pending) -> Response<Body> {
             continue;
         }
         match sender.try_send_request(request).await {
-            Ok(response) => {
-                if let Some(senders) = &senders {
-                    *senders.lock().await = Some(sender);
-                }
-                break response;
-            }
+            Ok(response) => break (response, sender),
             Err(mut error) => {
                 let unwritten = error.take_message().is_some();
                 let kind = ProxyError::Http(error.into_error()).code();
@@ -327,6 +342,30 @@ async fn send(pending: Pending) -> Response<Body> {
             }
         }
     };
+    if pending
+        .echo
+        .as_ref()
+        .is_some_and(|echo| echo.found_in_response_head(&response))
+    {
+        // The response and its connection are dropped unread; nothing of it reaches the client.
+        drop(response);
+        drop(sender);
+        return match audit_or_reply(
+            &*pending.report,
+            &pending.facts,
+            Decision::Deny,
+            Some("response echo"),
+        ) {
+            Ok(seq) => {
+                pending.report.denied(&pending.facts, "response", seq);
+                http1::reply(http1::Reply::Denied)
+            }
+            Err(reply) => *reply,
+        };
+    }
+    if let Some(senders) = &senders {
+        *senders.lock().await = Some(sender);
+    }
     let status = response.status().as_u16();
     let report = pending.report.clone();
     let facts = pending.facts;
@@ -670,6 +709,7 @@ mod tests {
             },
             report: Arc::new(report),
             skip_inject: false,
+            echo: None,
         };
         let reply = run(handler.clone(), scope, pending.report.clone(), pending).await;
         assert_eq!(reply.status(), hyper::StatusCode::BAD_GATEWAY);

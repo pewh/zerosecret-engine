@@ -361,6 +361,14 @@ These are enforced in code review and in CI, not by convention.
    `websocket withheld`). At most 7 bytes of the credential's start (fewer than half of a
    credential under 16 bytes) can reach the workload this way. A signing scheme gives the
    workload a signature, never the secret (ADR-0035).
+9. An injected response whose head carries the credential (raw, percent-encoded, or an
+   injected header or query value) is refused with 502 and audited `deny` `response echo`.
+   `TRACE` is refused on an injected binding. The head check covers every header name and
+   value and the reason phrase, and runs before any byte of the response reaches the
+   workload, on the upgrade answer of a WebSocket binding too. An injected header or query
+   value shorter than 8 bytes, `Host`, `Accept-Encoding`, and every `x-amz-*` header except
+   `x-amz-security-token` are not matched. An injected request asks the upstream for
+   `Accept-Encoding: identity`. The response body is not checked by this rule.
 
 **A policy evaluation that does not allow denies.** `zs-policy` evaluates every request with the
 Cedar engine over a fixed policy set (ADR-0040). `Ok` requires an explicit allow, no diagnostic
@@ -385,7 +393,11 @@ pair that makes an edit detectable. Each line is `sync_all`'d **before the decis
 proceeds**, so a record cannot be lost by a crash that still let the request through.
 
 **A deny record says why (ADR-0032).** `operation` names the action: the request method,
-`connect`, or a protocol operation. `reason` is set on deny records only. It holds text the
+`connect`, or a protocol operation. A NUL byte in `operation`, `reason` or `credential_ref` is
+replaced with U+FFFD before the record is hashed, so a control character the ingest database
+refuses cannot stop later records from shipping. The recorded resource is the authority's host
+without any userinfo: a request target that carries `user:password@` is parsed down to its host,
+and the diagnostic log withholds that destination. `reason` is set on deny records only. It holds text the
 agent makes: a grant or policy reason, a refusal rule code, or a fixed text. It never holds
 an upstream message or request content. It is part of the hash chain.
 
@@ -684,10 +696,10 @@ still chooses `auth` and the local-only fields" owns what stays unsigned.
 
 ## 7. Fail-closed matrix
 
-A row marked `(commercial suite)` runs in `apps/zs-control-tests` against `control/bin/control`,
-the Go control plane (ADR-0047, ADR-0049). Those rows move the control plane into its failure
-states through its process interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the
-suite starts.
+A row marked `(commercial suite)` runs in `control/e2e`, the Go suite in the commercial
+repository, against `control/bin/control`, the Go control plane (ADR-0049,
+ADR-0051). Those rows move the control plane into its failure states through its process
+interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts.
 
 | Condition | Result |
 |---|---|
@@ -776,10 +788,13 @@ suite starts.
 | The cached AWS session has expired and its refresh at STS fails | Deny: `materialization failed: aws_ssm refused`. The session is dropped; the next request asks STS again |
 | A grant is revoked while its AWS session and value are cached | The agent drops both at once. The next request is denied as revoked and makes no AWS call |
 | A local `zs-policy.json` holds a grant whose source is not `file`, or a binding with a `source` key | Stop before any listener and the child: `zs: policy: <resource>: a local grant may only use a file source`, or `zs: policy: <resource>: source is set only by the control plane` (ADR-0043) |
+| Upstream response head to an injected request carries the credential, raw or percent-encoded, or an injected header or query value ≥ 8 bytes (a redirect `Location` included) | Refuse with 502 before any byte reaches the workload. Drop the response and its connection unread. Audit `deny` `response echo` (`apps/zs/tests/response_echo.rs`) |
+| A WebSocket binding's upgrade answer carries the credential in its head | Refuse with 502. Audit `deny` `response echo` (`apps/zs/tests/websocket_binding.rs`) |
+| `TRACE` request on an injected binding | Refuse with 502 before materialization; nothing reaches the upstream. Audit `deny` `trace refused` (`apps/zs/tests/response_echo.rs`) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
-`control/`, driven as a process by `apps/zs-control-tests` with `ZS_CONTROL_BIN` set to it.
-The Rust reference no longer exists (ADR-0049).
+`control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
+with `ZS_CONTROL_BIN` set to it. The Rust reference no longer exists (ADR-0049, ADR-0051).
 
 At renewal, a 401, a transport error, a 5xx, a grant that does not verify, and a grant whose
 `host`, `protocol` or connection differs do not stop the run. The agent prints one line and skips that renewal, so the binding keeps its

@@ -5,9 +5,9 @@ use zeroize::Zeroize;
 use zs_credential::Credential;
 use zs_protocol::{InjectedRequest, Protocol};
 
+use crate::echo::{HOLD_PREFIX, started_prefix};
+
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
-// Upstream messages that end with this many bytes of the credential's start are held.
-const HOLD_PREFIX: usize = 8;
 const HOLD_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 const CONTINUATION: u8 = 0x0;
@@ -337,14 +337,6 @@ where
             }
         }
     }
-}
-
-// The length of the longest end of `window` that is a start of `secret`, shorter than `secret`.
-fn started_prefix(window: &[u8], secret: &[u8]) -> usize {
-    (1..secret.len().min(window.len() + 1))
-        .rev()
-        .find(|&n| window.ends_with(&secret[..n]))
-        .unwrap_or(0)
 }
 
 pub(crate) async fn relay<C, U>(

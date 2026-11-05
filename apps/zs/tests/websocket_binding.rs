@@ -172,6 +172,24 @@ async fn an_upstream_that_refuses_the_upgrade_reaches_the_client() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_refused_upgrade_whose_head_echoes_the_credential_is_withheld() {
+    let quiet = setup(Reply::Status).await;
+    let (_tls, head) = upgrade(&quiet).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+
+    let agent = setup(Reply::StatusEcho).await;
+    let (_tls, head) = upgrade(&agent).await;
+    assert!(head.starts_with("HTTP/1.1 502 ZeroSecret denied"), "{head}");
+    assert!(!head.contains(SECRET), "{head}");
+    let audit = audit_text(&agent);
+    let denied = audit
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| record["decision"] == "deny" && record["reason"] == "response echo");
+    assert!(denied, "{audit}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_extension_is_refused_and_audited() {
     let agent = setup(Reply::Extensions).await;
     let (_tls, head) = upgrade(&agent).await;

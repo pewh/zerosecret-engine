@@ -49,6 +49,10 @@ describe how the agent works with a control plane.
 | [ROADMAP.md](docs/ROADMAP.md) | Phases and exit criteria |
 | [DECISIONS.md](docs/DECISIONS.md) | Irreversible choices |
 
+Working on this repository — human or agent — start at [AGENTS.md](AGENTS.md). Adapters for
+other tools point at it: `CLAUDE.md`, `CODEX.md`, `GEMINI.md`,
+`.github/copilot-instructions.md`.
+
 ## Build and test
 
 The toolchain version is in `rust-toolchain.toml`.

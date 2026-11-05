@@ -18,6 +18,7 @@ use zs_diag::{Component, DiagLog, Event};
 use zs_protocol::{Context, Destination, InjectedRequest, Protocol};
 
 use crate::ca::LocalCa;
+use crate::echo::{EchoNeedles, RequestSnapshot};
 use crate::http1::{self, Guarded, TargetGuard};
 use crate::pipeline;
 use crate::scope::{PathScope, Refusal, ScopeDecision};
@@ -1273,6 +1274,7 @@ async fn handle_absolute(
         route: pipeline::Route::Fresh { upstream },
         report: report.clone(),
         skip_inject: false,
+        echo: None,
     };
     pipeline::run(shared.handler.clone(), scope, report, pending).await
 }
@@ -1495,9 +1497,10 @@ async fn tunneled_request(
             Ok(skip) => skip,
             Err(reply) => return *reply,
         };
-        let injection = if skip_inject {
-            None
+        let (injection, echo) = if skip_inject {
+            (None, None)
         } else {
+            let before = RequestSnapshot::of(&injected);
             match pipeline::inject_only(
                 &shared.handler,
                 &*report,
@@ -1505,7 +1508,12 @@ async fn tunneled_request(
                 &mut injected,
                 &authority,
             ) {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    let echo = pair.as_ref().map(|(_, credential)| {
+                        EchoNeedles::from_injection(&before, &injected, credential.expose())
+                    });
+                    (pair, echo)
+                }
                 Err(reply) => return *reply,
             }
         };
@@ -1520,7 +1528,7 @@ async fn tunneled_request(
             &extensions,
             &upstream,
             &origin,
-            injection,
+            (injection, echo),
             (conn, number, &resource),
         )
         .await;
@@ -1534,6 +1542,7 @@ async fn tunneled_request(
         route: pipeline::Route::Tunnel { senders, upstream },
         report: report.clone(),
         skip_inject: false,
+        echo: None,
     };
     pipeline::run(shared.handler.clone(), scope, report, pending).await
 }
@@ -1547,7 +1556,7 @@ async fn serve_websocket(
     extensions: &hyper::http::Extensions,
     upstream: &Upstream,
     origin: &Destination,
-    injection: Option<(Arc<dyn Protocol>, zs_credential::Credential)>,
+    (injection, echo): (pipeline::Injected, Option<EchoNeedles>),
     (conn, req, resource): (u64, u64, &str),
 ) -> Response<http1::Body> {
     let event = |name: &'static str| proxy_event(conn, name).req(req).resource(resource);
@@ -1593,6 +1602,26 @@ async fn serve_websocket(
             return http1::reply(http1::Reply::UpstreamUnreachable);
         }
     };
+    if echo
+        .as_ref()
+        .is_some_and(|echo| echo.found_in_response_head(&response))
+    {
+        drop(response);
+        drop(sender);
+        let seq = audit(
+            shared,
+            record,
+            Decision::Deny,
+            &request.method,
+            Some("response echo"),
+        )
+        .ok();
+        shared
+            .diag
+            .emit(with_seq(event("websocket_refused").warn(), seq));
+        return http1::reply(http1::Reply::Denied);
+    }
+    drop(echo);
     let upstream_upgrade = hyper::upgrade::on(&mut response);
     if response.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
         let mut response = http1::counted(response, |_| {});
