@@ -63,6 +63,8 @@ The conformance suite (Docker and real PostgreSQL, MySQL and MongoDB) is in
 7. Sign off every commit under the DCO: `git commit -s`.
 8. This repository is public: never commit a credential, a private key, a customer name or a
    private hostname. The `gates` job scans for secrets on every change.
+   Run `tools/public-gates.sh` with the forbidden-names list before every push. CI runs it only
+   after the push, and only on the tree, so a name it catches there is already public in history.
 9. A published tag is an identity. Never retag or force-move one (ADR-0050 D4).
 
 ## Verification

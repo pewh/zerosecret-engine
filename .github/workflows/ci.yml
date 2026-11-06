@@ -92,7 +92,7 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring mysql-client-8.0
-      - run: npm install -g mongosh
+      - run: npm install -g mongosh@2.14.1
       - run: tools/db-test-certs.sh target/db-test-certs
       - run: docker compose --profile pgtls --profile mysql --profile mongo up -d --wait postgres postgres-tls mysql mongo
       - run: tools/mongo-test-setup.sh

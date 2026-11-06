@@ -438,8 +438,9 @@ devices.
 
 `ZS_CONTROL_ADMINS` sets the first admins. It is a comma-separated list of subjects, for example
 `ZS_CONTROL_ADMINS=ana@example.com,ben@example.com`. The subject is the `email` claim of the
-sign-in when the ID token also carries `email_verified: true`, and `sub` otherwise. The match is
-exact, case included.
+sign-in when the ID token also carries `email_verified: true`, and `sub` otherwise. An
+`email_verified` that is not a JSON boolean, such as the string `"true"`, refuses the sign-in.
+The match is exact, case included.
 
 An IdP that does not send `email_verified` always signs in by `sub`. Microsoft Entra ID is one: it
 omits the claim by default, so a user there is identified by their `sub` value, and

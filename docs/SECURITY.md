@@ -26,9 +26,9 @@ the policy that authorizes its use.
 
 **The IdP's `email_verified` claim decides whether `email` names the signer-in (D2).** The
 control plane uses the `email` claim of an ID token as the session subject only when the same
-token carries `"email_verified": true`. An unverified email, a missing `email_verified` claim and
-an `email_verified` that is not a JSON boolean all fall back to `sub` (a non-boolean is refused as
-a malformed token). The subject is what `ZS_CONTROL_ADMINS` and the dashboard member check
+token carries `"email_verified": true`. An unverified email and a missing `email_verified` claim
+fall back to `sub`. An `email_verified` that is not a JSON boolean (the string `"true"` included)
+refuses the sign-in as a malformed token. The subject is what `ZS_CONTROL_ADMINS` and the dashboard member check
 match, so an IdP that lets a user set an unverified email must not be able to pick the
 subject. An IdP that never sends `email_verified`, such as Microsoft Entra ID by default, signs
 in by `sub`, and the operator lists `sub` values.
@@ -348,9 +348,10 @@ names another user before it materializes the credential, with SQLSTATE `28000` 
 1045, and audits `deny` `connect`, reason `user mismatch` (§7). The refusal text never names the
 user. `user` binds the role, not the database or the startup options. PostgreSQL `SET ROLE`
 still reaches each role that the bound user is a member of. MySQL sends its greeting before the
-client names a user, so with `user` set the agent reads the server greeting first: a refused
-MySQL client still opens one upstream connection, and the agent closes it before it sends a
-handshake response. A MySQL policy denial on such a binding also comes after the greeting. The
+client names a user, so on every MySQL binding, with or without `user`, the agent reads the
+server greeting before any decision: every refused MySQL client (a policy denial or a user
+mismatch) still opens one upstream connection, and the agent closes it before it sends a
+handshake response. The
 agent always refuses a PostgreSQL startup that carries the `replication` parameter, whatever its
 value and whatever the binding says, and audits `deny` `connect`, reason `replication refused`.
 
@@ -959,7 +960,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | MySQL client sets `CLIENT_LOCAL_FILES` | The agent clears it: the response forwarded to the server never carries it (`apps/zs/tests/fail_closed_matrix.rs`) |
 | PostgreSQL startup or MySQL handshake names a user other than the binding's `user` | Refuse before materialization: PostgreSQL SQLSTATE `28000`, MySQL ERR 1045. The refusal text never names the user. Audit `deny` `connect`, reason `user mismatch`. PostgreSQL never connects upstream; MySQL reads the server greeting but never sends the server a handshake response (`apps/zs/tests/fail_closed_matrix.rs`) |
 | PostgreSQL startup carries the `replication` parameter, whatever its value | Refuse with SQLSTATE `28000` before materialization and before any upstream connection. Audit `deny` `connect`, reason `replication refused` (`apps/zs/tests/fail_closed_matrix.rs`) |
-| More than 30 requests in one minute from one TCP peer host to `/login`, `/login/callback`, `/login/confirm`, `/login/claim`, `/enrollment-token` and `/wire/enroll` together | The 31st and later get 429 `too many requests` before the handler runs, so no token is minted. The limit keys on the TCP peer address, never on `X-Forwarded-For`. `/healthz` and `/ca` are not limited (D11) (commercial suite) |
+| More than 30 requests in one minute from one TCP peer host to `/login`, `/login/callback`, `/login/confirm`, `/login/claim`, `/logout`, `/enrollment-token` and `/wire/enroll` together | The 31st and later get 429 `too many requests` before the handler runs, so no token is minted. The limit keys on the TCP peer address, never on `X-Forwarded-For`. `/healthz` and `/ca` are not limited (D11) (commercial suite) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository

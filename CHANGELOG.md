@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- Two `zs run` processes that share a CA directory no longer race on the Bun preload: the file
+  is written under a private temporary name and renamed into place, so neither run loses Bun
+  WebSocket interception.
+- Docs: a non-boolean `email_verified` refuses the sign-in (it does not fall back to `sub`);
+  `/logout` shares the control plane's sign-in rate limit; every MySQL binding reads the server
+  greeting before any decision, with or without `user`.
+
 ## [0.2.0] - 2026-11-06
 
 Security fixes and hardening from the 2026-11-05 deep review. No exploitation detail is given.
@@ -24,6 +33,13 @@ Security fixes and hardening from the 2026-11-05 deep review. No exploitation de
   timeouts. The local CA root is constrained and leaves are valid for 24 h. The renewal
   lineage is bounded and a torn journal line is repaired. No raw print macro remains in the
   agent.
+- A presigned URL is also capped at 15 minutes from now: `X-Amz-Date` plus `X-Amz-Expires`
+  may not pass that point.
+- `zs login` polls the sign-in claim every 3 s and retries a 429, waiting for `Retry-After`.
+- A PostgreSQL CancelRequest needs a live grant for the binding; a protocol 3.2 CancelRequest
+  (a key longer than 4 bytes) is dropped before any upstream contact.
+- MySQL and MongoDB materialize the credential only after the client has spoken; a MySQL
+  binding reads the server greeting first.
 
 ## 0.1.0
 

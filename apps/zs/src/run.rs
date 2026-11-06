@@ -1331,11 +1331,26 @@ fn install_bun_preload(dir: &BunPreloadDir) -> std::io::Result<std::path::PathBu
                     "the bun preload is not a regular file owned by this user",
                 ));
             }
-            std::fs::remove_file(&preload)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = dir.path().join(format!(
+        ".bun-preload-{}-{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let installed = write_private_file(&staged, zs::BUN_PRELOAD_SOURCE.as_bytes())
+        .and_then(|()| std::fs::rename(&staged, &preload));
+    if let Err(error) = installed {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(preload)
+}
+
+fn write_private_file(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1343,14 +1358,13 @@ fn install_bun_preload(dir: &BunPreloadDir) -> std::io::Result<std::path::PathBu
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&preload)?;
+    let mut file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(zs::BUN_PRELOAD_SOURCE.as_bytes())?;
-    Ok(preload)
+    file.write_all(content)
 }
 
 fn no_proxy() -> String {
@@ -2243,5 +2257,34 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn concurrent_runs_sharing_a_ca_dir_all_install_the_bun_preload() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("ca");
+        let installs: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    (0..200)
+                        .map(|_| install_bun_preload(&BunPreloadDir::CaDir(dir.clone())))
+                        .filter(Result::is_err)
+                        .count()
+                })
+            })
+            .collect();
+        let failed: usize = installs.into_iter().map(|t| t.join().unwrap()).sum();
+
+        assert_eq!(failed, 0, "every concurrent install must succeed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bun-preload.js")).unwrap(),
+            zs::BUN_PRELOAD_SOURCE
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["bun-preload.js"], "no staging file is left behind");
     }
 }
