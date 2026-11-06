@@ -211,7 +211,7 @@ jobs:
         with:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config postgresql-client
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config postgresql-client dbus-daemon dbus-bin gnome-keyring
       - run: tools/db-test-certs.sh target/db-test-certs
       - run: docker compose up -d --wait postgres mysql mysql-plain postgres-tls mongo
       - run: tools/mongo-test-setup.sh
@@ -222,7 +222,13 @@ jobs:
       - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
         env:
           ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
-      - run: cargo test --locked -p zs --test postgres_real -- --test-threads=1 --nocapture
+      - name: PostgreSQL real tests on a private Secret Service
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            cargo test --locked -p zs --test postgres_real -- --test-threads=1 --nocapture
+          '
       - if: failure()
         run: docker compose --profile mysql --profile pgtls --profile mongo logs postgres mysql mysql-plain postgres-tls mongo
 

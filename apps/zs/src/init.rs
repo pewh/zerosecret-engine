@@ -990,8 +990,8 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
     #[test]
     fn test_backup_dir_is_home_zs_backups_project() {
         assert_eq!(
-            backup_dir(Path::new("/home/u"), Path::new("/work/lion")),
-            Path::new("/home/u/.zs-backups/lion")
+            backup_dir(Path::new("/home/u"), Path::new("/work/project")),
+            Path::new("/home/u/.zs-backups/project")
         );
     }
 
