@@ -169,8 +169,9 @@ fn addr32(ip: IpAddr) -> [u32; 4] {
         }
         IpAddr::V6(v6) => {
             let bytes = v6.octets();
-            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-                words[index] = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let (chunks, _) = bytes.as_chunks::<4>();
+            for (word, chunk) in words.iter_mut().zip(chunks) {
+                *word = u32::from_ne_bytes(*chunk);
             }
         }
     }
