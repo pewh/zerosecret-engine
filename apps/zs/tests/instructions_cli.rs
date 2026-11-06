@@ -19,6 +19,7 @@ fn test_zs_agent_instructions_output() {
     assert!(stdout.contains("zs schema"));
     assert!(stdout.contains("zs init --dry-run"));
     assert!(stdout.contains("not brokered"));
+    assert!(stdout.contains("back up `.env` to `~/.zs-backups/<project>/` with 0600 permissions"));
     assert!(stdout.contains("zs run -- <command>"));
     assert!(stdout.contains("zs doctor --json"));
 }

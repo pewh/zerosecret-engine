@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::Command;
 
+use super::audit_ship::{ShipCursor, ship_audit};
 use super::{current_session, default_subject};
 use zs::wire_client::WireError;
 use zs::{AgentFile, AgentHandler, GrantCache};
@@ -142,6 +143,17 @@ pub(crate) fn control_policy(args: &super::Args) -> Option<zs_policy::Policy> {
 const REFRESH_SECONDS: u64 = 60;
 const RENEW_WITHIN_MS: u64 = 150_000;
 
+// A shorter interval is for tests and for an operator who wants a tighter revocation bound;
+// it can never be longer than the bound the agent claims.
+fn refresh_interval() -> std::time::Duration {
+    let seconds = std::env::var("ZS_REFRESH_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(REFRESH_SECONDS)
+        .clamp(1, REFRESH_SECONDS);
+    std::time::Duration::from_secs(seconds)
+}
+
 #[derive(Clone)]
 struct L3Audit {
     journal: std::sync::Arc<Journal>,
@@ -219,6 +231,26 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
             );
         }
         outcome
+    })
+}
+
+fn l3_cancel_authorize(audit: L3Audit) -> zs_proto_postgres::CancelAuthorize {
+    std::sync::Arc::new(move || audit.handler.authorize_message(&audit.resource, "connect"))
+}
+
+fn l3_refusal_audit(audit: L3Audit) -> zs_proto_postgres::AuditRefusal {
+    std::sync::Arc::new(move |operation: &'static str, reason: &'static str| {
+        match audit.record(operation, Some(reason), zs_audit::Decision::Deny) {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                stderr_line!(
+                    "zs: {} {operation} on {} was refused but not recorded: {e}",
+                    audit.protocol,
+                    audit.resource
+                );
+                None
+            }
+        }
     })
 }
 
@@ -438,14 +470,16 @@ async fn connect(
             "--enrollment-token is required with --control (ask an operator for one)".to_string(),
         )
     })?;
-    let ca_pem = zs::control_ca_pem(args.control_ca.as_deref(), &args.ca_dir)
-        .map_err(RunRefusal::Control)?;
-
     let enroll_url = args
         .enroll_url
         .as_deref()
         .map(|u| u.trim_end_matches('/'))
         .unwrap_or(control);
+    zs::control_url_allowed(control).map_err(RunRefusal::Control)?;
+    zs::control_url_allowed(enroll_url).map_err(RunRefusal::Control)?;
+    let ca_pem = zs::control_ca_pem(args.control_ca.as_deref(), &args.ca_dir)
+        .map_err(RunRefusal::Control)?;
+
     zs::wire_client::WireClient::enroll(enroll_url, &ca_pem, token, &args.device_name)
         .await
         .map_err(|e| RunRefusal::Control(format!("enrolment failed: {e}")))
@@ -595,19 +629,25 @@ fn run_with(args: &super::Args, diag: &DiagLog) -> i32 {
         Ok(prepared) => prepared,
         Err(code) => return code,
     };
-    let ca_path = args.ca_dir.join("ca.crt");
+    let ca_path = absolute_path(&args.ca_dir.join("ca.crt"));
     prepared.runtime.block_on(async {
         let services = match start_services(&prepared, args).await {
             Ok(services) => services,
             Err(code) => return code,
         };
         let child = build_child(args, &services, &ca_path);
-        let code = match wait_for_child(child, &services, &ca_path, diag, &args.rest[0]) {
+        let code = match wait_for_child(child, &services, &ca_path, diag, &args.rest[0]).await {
             Ok(code) => code,
             Err(code) => return code,
         };
         if let Some(wire) = prepared.wire.as_deref() {
-            ship_audit(wire, &args.audit, &mut *prepared.shipped.lock().await).await;
+            ship_audit(
+                wire,
+                &args.audit,
+                &ShipCursor::beside(&args.audit),
+                &mut *prepared.shipped.lock().await,
+            )
+            .await;
         }
         drop(services);
         code
@@ -704,8 +744,8 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
             return Err(refuse_run(diag, "audit", 1));
         }
     };
-    let shipped = match journal.last_seq() {
-        Ok(seq) => std::sync::Arc::new(tokio::sync::Mutex::new(seq)),
+    let last_seq = match journal.last_seq() {
+        Ok(seq) => seq,
         Err(e) => {
             stderr_line!("zs: audit sink unavailable: {e}");
             return Err(refuse_run(diag, "audit", 1));
@@ -796,11 +836,22 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
             }
         }
     }
+    let shipped = match wire.as_ref() {
+        None => last_seq,
+        Some(_) => match ShipCursor::beside(&args.audit).load_or_init(last_seq) {
+            Ok(seq) if seq > last_seq => 0,
+            Ok(seq) => seq,
+            Err(e) => {
+                stderr_line!("zs: audit ship cursor unavailable: {e}");
+                return Err(refuse_run(diag, "audit", 1));
+            }
+        },
+    };
 
     Ok(PreparedRun {
         file,
         journal,
-        shipped,
+        shipped: std::sync::Arc::new(tokio::sync::Mutex::new(shipped)),
         ca: std::sync::Arc::new(ca),
         wire,
         stored: uses_stored,
@@ -823,6 +874,10 @@ async fn start_services(
             return Err(refuse_run(&prepared.diag, "listen", 2));
         }
     };
+    if !listen.ip().is_loopback() {
+        stderr_line!("zs: --listen must be a loopback address");
+        return Err(refuse_run(&prepared.diag, "listen", 2));
+    }
     let mut tasks = BackgroundTasks::new();
     let handler: std::sync::Arc<dyn zs_mitm::FlowHandler> = prepared.agent.clone();
     let l3_handler = handler.clone();
@@ -879,22 +934,23 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "postgres_tls", 1));
             }
         };
-        let materialize = l3_materialize(L3Audit::new(
-            prepared,
-            &binding.resource,
-            "postgres",
-            l3_handler.clone(),
-        ));
+        let audit = L3Audit::new(prepared, &binding.resource, "postgres", l3_handler.clone());
+        let refusal_audit = l3_refusal_audit(audit.clone());
+        let cancel_authorize = l3_cancel_authorize(audit.clone());
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
             &binding.listen_addr(),
             endpoint,
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
-            materialize,
+            l3_materialize(audit),
         )
         .await
         {
-            Ok(listener) => listener.with_diag(prepared.diag.clone(), &binding.resource),
+            Ok(listener) => listener
+                .with_diag(prepared.diag.clone(), &binding.resource)
+                .with_refusal_audit(refusal_audit)
+                .with_cancel_authorize(cancel_authorize)
+                .with_expected_user(binding.user.clone()),
             Err(e) => {
                 stderr_line!("zs: postgres listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
@@ -938,23 +994,7 @@ async fn start_services(
             }
         };
         let audit = L3Audit::new(prepared, &binding.resource, "mysql", l3_handler.clone());
-        let refusals = audit.clone();
-        let refusal_audit: zs_proto_mysql::AuditRefusal = std::sync::Arc::new(
-            move |operation: &'static str, reason: &'static str| match refusals.record(
-                operation,
-                Some(reason),
-                zs_audit::Decision::Deny,
-            ) {
-                Ok(seq) => Some(seq),
-                Err(e) => {
-                    stderr_line!(
-                        "zs: mysql {operation} on {} was refused but not recorded: {e}",
-                        refusals.resource
-                    );
-                    None
-                }
-            },
-        );
+        let refusal_audit = l3_refusal_audit(audit.clone());
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
             &binding.listen_addr(),
             endpoint,
@@ -966,6 +1006,7 @@ async fn start_services(
             Ok(listener) => listener
                 .with_diag(prepared.diag.clone(), &binding.resource)
                 .with_refusal_audit(refusal_audit)
+                .with_expected_user(binding.user.clone())
                 .with_client_auth(client_auth),
             Err(e) => {
                 stderr_line!("zs: mysql listener for {}: {e}", binding.resource);
@@ -1078,36 +1119,61 @@ async fn start_services(
     if let Some(wire) = prepared.wire.clone() {
         let agent = prepared.agent.clone();
         let audit_path = args.audit.clone();
+        let cursor = ShipCursor::beside(&audit_path);
         let shipped = prepared.shipped.clone();
         let bindings = prepared.file.bindings.clone();
         let stored = prepared.stored;
         let diag = prepared.diag.clone();
+        let every = refresh_interval();
+
+        let (revocation_wire, revocation_agent, revocation_diag) =
+            (wire.clone(), agent.clone(), diag.clone());
         tasks.push(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(REFRESH_SECONDS)).await;
-                match wire.fetch_revocations().await {
+                tokio::time::sleep(every).await;
+                match revocation_wire.fetch_revocations().await {
                     Ok(response) => {
                         let learned = response.revoked_grant_ids.len();
-                        agent.apply_revocations(&response.revoked_grant_ids);
+                        revocation_agent.apply_revocations(&response.revoked_grant_ids);
                         if learned > 0 {
                             stdout_line!("zs: applied {learned} revoked grant(s)");
-                            diag.emit(
+                            revocation_diag.emit(
                                 Event::new(Component::Grant, "revocations_applied")
                                     .num("count", learned as u64),
                             );
                         }
-                        renew_grants(&wire, &agent, &bindings, stored, &diag).await;
                     }
                     Err(e) => {
                         stderr_line!("zs: revocation refresh failed: {e}");
-                        diag.emit(
+                        revocation_diag.emit(
                             Event::new(Component::Grant, "refresh_failed")
                                 .warn()
                                 .failure("wire"),
                         );
                     }
                 }
-                ship_audit(&wire, &audit_path, &mut *shipped.lock().await).await;
+            }
+        }));
+
+        let (renewal_wire, renewal_agent, renewal_diag) = (wire.clone(), agent.clone(), diag);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                renew_grants(
+                    &renewal_wire,
+                    &renewal_agent,
+                    &bindings,
+                    stored,
+                    &renewal_diag,
+                )
+                .await;
+            }
+        }));
+
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                ship_audit(&wire, &audit_path, &cursor, &mut *shipped.lock().await).await;
             }
         }));
     }
@@ -1147,6 +1213,144 @@ fn write_ca_bundle(ca_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let path = ca_path.with_file_name("ca-bundle.crt");
     std::fs::write(&path, bundle).ok()?;
     Some(path)
+}
+
+fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+// Bun splits BUN_OPTIONS on whitespace and keeps any quote as part of the name, so a
+// preload under a directory with a space cannot be named there. The file is a constant, so
+// it is written to a space-free directory keyed by that directory instead.
+enum BunPreloadDir {
+    CaDir(std::path::PathBuf),
+    PerUserTemp(std::path::PathBuf),
+}
+
+impl BunPreloadDir {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::CaDir(path) | Self::PerUserTemp(path) => path,
+        }
+    }
+}
+
+const BUN_PRELOAD_REFUSED: &str =
+    "zs: the bun preload could not be installed privately; Bun's WebSocket will not be intercepted";
+
+fn bun_preload_dir(ca_dir: &std::path::Path) -> Option<BunPreloadDir> {
+    if !ca_dir.to_string_lossy().chars().any(char::is_whitespace) {
+        return Some(BunPreloadDir::CaDir(ca_dir.to_path_buf()));
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ca_dir.hash(&mut hasher);
+    let dir = std::env::temp_dir().join(preload_dir_name(hasher.finish()));
+    (!dir.to_string_lossy().chars().any(char::is_whitespace))
+        .then_some(BunPreloadDir::PerUserTemp(dir))
+}
+
+#[cfg(unix)]
+fn preload_dir_name(hash: u64) -> String {
+    format!("zs-preload-{}-{hash:016x}", effective_uid())
+}
+
+#[cfg(not(unix))]
+fn preload_dir_name(hash: u64) -> String {
+    format!("zs-preload-{hash:016x}")
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(dir)?;
+            let private = meta.is_dir()
+                && meta.uid() == effective_uid()
+                && meta.permissions().mode() & 0o777 == 0o700;
+            if private {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the preload directory is not private to this user",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(dir)?.is_dir() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the preload path is not a directory",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn owned_by_effective_user(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == effective_uid()
+}
+
+#[cfg(not(unix))]
+fn owned_by_effective_user(_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
+fn install_bun_preload(dir: &BunPreloadDir) -> std::io::Result<std::path::PathBuf> {
+    match dir {
+        BunPreloadDir::CaDir(path) => std::fs::create_dir_all(path)?,
+        BunPreloadDir::PerUserTemp(path) => create_private_dir(path)?,
+    }
+    let preload = dir.path().join("bun-preload.js");
+    match std::fs::symlink_metadata(&preload) {
+        Ok(meta) => {
+            if !meta.is_file() || !owned_by_effective_user(&meta) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the bun preload is not a regular file owned by this user",
+                ));
+            }
+            std::fs::remove_file(&preload)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&preload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(zs::BUN_PRELOAD_SOURCE.as_bytes())?;
+    Ok(preload)
 }
 
 fn no_proxy() -> String {
@@ -1189,22 +1393,22 @@ fn build_child(
             .env("http_proxy", format!("http://{addr}"));
     }
     let ca_dir = std::fs::canonicalize(&args.ca_dir).unwrap_or_else(|_| args.ca_dir.clone());
-    let bun_preload = ca_dir.join("bun-preload.js");
-    match std::fs::write(&bun_preload, zs::BUN_PRELOAD_SOURCE) {
-        Ok(()) => {
-            cmd.env(
-                "BUN_OPTIONS",
-                zs::bun_options_with_preload(
-                    std::env::var("BUN_OPTIONS").ok().as_deref(),
-                    &bun_preload,
-                ),
-            );
-        }
-        Err(e) => {
-            stderr_line!(
-                "zs: could not write the bun preload ({e}); Bun's WebSocket will not be intercepted"
-            );
-        }
+    match bun_preload_dir(&ca_dir) {
+        None => stderr_line!(
+            "zs: no directory without a space for the bun preload; Bun's WebSocket will not be intercepted"
+        ),
+        Some(dir) => match install_bun_preload(&dir) {
+            Ok(bun_preload) => {
+                cmd.env(
+                    "BUN_OPTIONS",
+                    zs::bun_options_with_preload(
+                        std::env::var("BUN_OPTIONS").ok().as_deref(),
+                        &bun_preload,
+                    ),
+                );
+            }
+            Err(_) => stderr_line!("{}", BUN_PRELOAD_REFUSED),
+        },
     }
     let preload_path = ca_dir.join("node-preload.cjs");
     match std::fs::write(&preload_path, zs::NODE_PRELOAD_SOURCE) {
@@ -1241,13 +1445,23 @@ fn build_child(
     cmd
 }
 
-fn wait_for_child(
-    mut cmd: Command,
+async fn wait_for_child(
+    cmd: Command,
     services: &RunningServices,
     ca_path: &std::path::Path,
     diag: &DiagLog,
     program: &str,
 ) -> Result<i32, i32> {
+    let mut cmd = tokio::process::Command::from(cmd);
+    let mut signals = match ChildSignals::install() {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            stderr_line!(
+                "zs: cannot install the child signal handlers; a signal may skip the final audit ship: {e}"
+            );
+            None
+        }
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1255,9 +1469,10 @@ fn wait_for_child(
             return Err(refuse_run(diag, "child_spawn", 1));
         }
     };
+    let pid = child.id().unwrap_or_default();
     stdout_line!("zs: proxy {}", services.proxy_addr);
     stdout_line!("zs: ca-cert {}", ca_path.display());
-    stdout_line!("zs: child-pid {}", child.id());
+    stdout_line!("zs: child-pid {pid}");
     let _ = std::io::stdout().flush();
     let name = std::path::Path::new(program)
         .file_name()
@@ -1266,9 +1481,13 @@ fn wait_for_child(
     diag.emit(
         Event::new(Component::Agent, "child_spawned")
             .token("program", name)
-            .num("pid", u64::from(child.id())),
+            .num("pid", u64::from(pid)),
     );
-    let (code, exit_event) = match child.wait() {
+    let status = match signals.as_mut() {
+        Some(signals) => signals.wait_for(&mut child).await,
+        None => child.wait().await,
+    };
+    let (code, exit_event) = match status {
         Ok(status) => {
             let code = status.code().unwrap_or(1);
             (code, exit_event(&status, code))
@@ -1286,6 +1505,73 @@ fn wait_for_child(
 }
 
 #[cfg(unix)]
+struct ChildSignals {
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ChildSignals {
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn wait_for(
+        &mut self,
+        child: &mut tokio::process::Child,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            tokio::select! {
+                status = child.wait() => return status,
+                _ = self.terminate.recv() => forward_signal(child.id(), libc::SIGTERM),
+                _ = self.hangup.recv() => forward_signal(child.id(), libc::SIGHUP),
+                _ = self.interrupt.recv() => {}
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_signal(pid: Option<u32>, signal: i32) {
+    // SAFETY: `pid` comes from `tokio::process::Child::id` for a child this process spawned
+    // and has not reaped, so the kernel still reserves the identifier.
+    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+    unsafe {
+        libc::kill(pid, signal);
+    }
+}
+
+#[cfg(not(unix))]
+struct ChildSignals;
+
+#[cfg(not(unix))]
+impl ChildSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait_for(
+        &mut self,
+        child: &mut tokio::process::Child,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            tokio::select! {
+                status = child.wait() => return status,
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn exit_event(status: &std::process::ExitStatus, code: i32) -> Event {
     use std::os::unix::process::ExitStatusExt;
     let event = Event::new(Component::Agent, "child_exited");
@@ -1298,76 +1584,6 @@ fn exit_event(status: &std::process::ExitStatus, code: i32) -> Event {
 #[cfg(not(unix))]
 fn exit_event(_status: &std::process::ExitStatus, code: i32) -> Event {
     Event::new(Component::Agent, "child_exited").num("code", u64::from(code.unsigned_abs()))
-}
-
-async fn ship_audit(
-    wire: &zs::wire_client::WireClient,
-    journal: &std::path::Path,
-    shipped: &mut u64,
-) {
-    let records = match unshipped_records(journal, *shipped, wire.device_id()) {
-        Ok(records) => records,
-        Err(e) => {
-            stderr_line!("zs: cannot read the audit journal to ship it: {e}");
-            return;
-        }
-    };
-    if records.is_empty() {
-        return;
-    }
-    let highest = records
-        .iter()
-        .map(|(seq, _)| *seq)
-        .max()
-        .unwrap_or(*shipped);
-    let batch: Vec<zs_wire::AuditIngestRecord> =
-        records.into_iter().map(|(_, record)| record).collect();
-    match wire.submit_audit(&batch).await {
-        Ok(()) => *shipped = highest,
-        Err(e) => stderr_line!("zs: cannot ship {} audit record(s): {e}", batch.len()),
-    }
-}
-
-fn unshipped_records(
-    journal: &std::path::Path,
-    after_seq: u64,
-    device_id: &str,
-) -> std::io::Result<Vec<(u64, zs_wire::AuditIngestRecord)>> {
-    let content = match std::fs::read_to_string(journal) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut records = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<zs_audit::AuditRecord>(line) else {
-            continue;
-        };
-        if record.seq <= after_seq {
-            continue;
-        }
-        records.push((
-            record.seq,
-            zs_wire::AuditIngestRecord {
-                subject: record.subject,
-                workload: record.workload,
-                resource: record.resource,
-                protocol: record.protocol,
-                operation: record.operation,
-                decision: match record.decision {
-                    zs_audit::Decision::Allow => "allow",
-                    zs_audit::Decision::Deny => "deny",
-                    zs_audit::Decision::Passthrough => "passthrough",
-                }
-                .to_string(),
-                reason: record.reason,
-                credential_ref: record.credential_ref,
-                timestamp_ms: record.timestamp_ms,
-                device_id: device_id.to_string(),
-            },
-        ));
-    }
-    Ok(records)
 }
 
 #[cfg(test)]
@@ -1917,36 +2133,115 @@ mod tests {
     }
 
     #[test]
-    fn unshipped_records_carry_the_reason() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let journal = Journal::open(&path).unwrap();
-        for (decision, reason) in [
-            (zs_audit::Decision::Allow, None),
-            (
-                zs_audit::Decision::Deny,
-                Some("grant g-1 is revoked".to_string()),
-            ),
-        ] {
-            journal
-                .append(
-                    &zs_audit::AuditRequest {
-                        subject: "alice@example.test".into(),
-                        workload: "claude-code".into(),
-                        resource: "api.example.test:443".into(),
-                        protocol: "https".into(),
-                        operation: "connect".into(),
-                        decision,
-                        reason,
-                        credential_ref: None,
-                    },
-                    5000,
-                )
-                .unwrap();
+    fn the_ca_path_given_to_the_child_is_absolute() {
+        let path = absolute_path(std::path::Path::new(".zs-ca/ca.crt"));
+        assert!(
+            path.is_absolute(),
+            "the child would resolve a relative CA path against its own cwd: {}",
+            path.display()
+        );
+        assert!(path.ends_with(".zs-ca/ca.crt"), "{}", path.display());
+    }
+
+    #[test]
+    fn a_bun_preload_path_never_contains_a_space() {
+        let plain = std::path::Path::new("/tmp/zs-ca");
+        match bun_preload_dir(plain) {
+            Some(BunPreloadDir::CaDir(dir)) => assert_eq!(dir.as_path(), plain),
+            _ => panic!("a CA directory without a space must be used in place"),
         }
-        let records = unshipped_records(&path, 0, "dev-1").unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].1.reason, None);
-        assert_eq!(records[1].1.reason.as_deref(), Some("grant g-1 is revoked"));
+        let spaced = std::path::Path::new("/tmp/my project/.zs-ca");
+        let Some(BunPreloadDir::PerUserTemp(dir)) = bun_preload_dir(spaced) else {
+            panic!("a CA directory with a space must use the fallback");
+        };
+        assert!(
+            !dir.to_string_lossy().chars().any(char::is_whitespace),
+            "Bun cannot name a preload under a path with a space: {}",
+            dir.display()
+        );
+        #[cfg(unix)]
+        assert!(
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("zs-preload-{}-", effective_uid()))),
+            "the fallback must be keyed per user: {}",
+            dir.display()
+        );
+        match bun_preload_dir(spaced) {
+            Some(BunPreloadDir::PerUserTemp(again)) => {
+                assert_eq!(dir, again, "the fallback must be stable")
+            }
+            _ => panic!("the fallback must be stable"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_bun_preload_directory_is_refused_and_nothing_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for mode in [0o777, 0o755, 0o750] {
+            let dir = root
+                .path()
+                .join(format!("zs-preload-{}-{mode:o}", effective_uid()));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = install_bun_preload(&BunPreloadDir::PerUserTemp(dir.clone())).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{mode:o}"
+            );
+            assert!(!dir.join("bun-preload.js").exists(), "{mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bun_preload_directory_is_private_and_the_file_is_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("zs-preload-501-abc");
+        let preload = install_bun_preload(&BunPreloadDir::PerUserTemp(dir.clone())).unwrap();
+        assert_eq!(preload, dir.join("bun-preload.js"));
+        let dir_mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "{dir_mode:o}");
+        let file_mode = std::fs::symlink_metadata(&preload)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "{file_mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&preload).unwrap(),
+            zs::BUN_PRELOAD_SOURCE
+        );
+        let again = install_bun_preload(&BunPreloadDir::PerUserTemp(dir)).unwrap();
+        assert_eq!(
+            again, preload,
+            "a stale preload owned by this user is replaced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bun_preload_symlink_is_refused_without_touching_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("zs-preload-501-abc");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("bun-preload.js")).unwrap();
+
+        let error = install_bun_preload(&BunPreloadDir::PerUserTemp(dir)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     }
 }

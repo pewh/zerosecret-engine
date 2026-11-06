@@ -22,10 +22,21 @@ struct Upstream {
 }
 
 fn upstream() -> Option<Upstream> {
-    let url = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|u| !u.is_empty())?;
-    parse_upstream(&url)
+    let required = std::env::var_os("ZS_REQUIRE_PG").is_some();
+    let Some(url) = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty()) else {
+        assert!(!required, "ZS_REQUIRE_PG is set and DATABASE_URL is not");
+        return None;
+    };
+    if !psql_available() {
+        assert!(!required, "ZS_REQUIRE_PG is set and psql is not on PATH");
+        return None;
+    }
+    let parsed = parse_upstream(&url);
+    assert!(
+        parsed.is_some() || !required,
+        "ZS_REQUIRE_PG is set and DATABASE_URL is not postgres://user:pass@host:port/db"
+    );
+    parsed
 }
 
 fn parse_upstream(url: &str) -> Option<Upstream> {
@@ -282,9 +293,6 @@ fn wait_for_file(path: &std::path::Path, limit: std::time::Duration) -> bool {
 #[test]
 fn a_real_client_reaches_a_real_password_protected_database_with_no_password() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let home = workspace(&up);
 
@@ -303,9 +311,6 @@ fn a_real_client_reaches_a_real_password_protected_database_with_no_password() {
 #[test]
 fn the_upstream_password_is_absent_from_the_workload_environment() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let home = workspace(&up);
 
@@ -335,9 +340,6 @@ fn the_upstream_password_is_absent_from_the_workload_environment() {
 #[test]
 fn the_child_is_pointed_at_the_local_listener_not_the_upstream() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let home = workspace(&up);
 
@@ -365,9 +367,6 @@ fn the_child_is_pointed_at_the_local_listener_not_the_upstream() {
 #[test]
 fn a_wrong_credential_is_rejected_by_the_real_server() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let home = workspace(&up);
     std::fs::write(
@@ -392,9 +391,6 @@ fn a_wrong_credential_is_rejected_by_the_real_server() {
 #[test]
 fn the_connection_is_audited() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let home = workspace(&up);
 
@@ -422,9 +418,6 @@ fn the_connection_is_audited() {
 #[test]
 fn a_hostname_upstream_is_not_contacted_until_a_client_connects() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let rt = runtime();
     let listener = rt
@@ -486,9 +479,6 @@ fn a_hostname_upstream_is_not_contacted_until_a_client_connects() {
 #[test]
 fn a_second_client_connection_reaches_a_moved_target() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     ensure_role(&up);
     let rt = runtime();
     let target = (up.host.clone(), up.port);
@@ -578,9 +568,6 @@ fn a_second_client_connection_reaches_a_moved_target() {
 #[test]
 fn an_unavailable_hostname_denies_the_client() {
     let Some(up) = upstream() else { return };
-    if !psql_available() {
-        return;
-    }
     let home = workspace_for("zs-d3-unavailable.invalid", 5432);
     let url = format!("postgresql://{ROLE}@/{}", up.database);
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
@@ -8,11 +9,16 @@ use zs_protocol::{InjectedRequest, Protocol};
 use crate::echo::{HOLD_PREFIX, started_prefix};
 
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+// A frame's buffer grows as its bytes arrive; the header's length is not reserved up front.
+const INITIAL_RESERVE: u64 = 16 * 1024;
 const HOLD_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+const POLICY_VIOLATION: u16 = 1008;
 
 const CONTINUATION: u8 = 0x0;
 const TEXT: u8 = 0x1;
 const BINARY: u8 = 0x2;
+const CLOSE: u8 = 0x8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ended {
@@ -20,6 +26,7 @@ pub(crate) enum Ended {
     Echoed,
     Withheld,
     Refused,
+    Revoked,
     Violation(&'static str),
 }
 
@@ -89,9 +96,8 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame
     } else {
         None
     };
-    let mut payload = vec![0u8; length as usize];
-    reader
-        .read_exact(&mut payload)
+    let mut payload = Vec::new();
+    read_payload(reader, length, &mut payload)
         .await
         .map_err(|_| Ended::Violation("truncated frame"))?;
     if let Some(m) = mask {
@@ -104,6 +110,19 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame
         mask,
         payload,
     }))
+}
+
+async fn read_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    length: u64,
+    payload: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    payload.reserve(length.min(INITIAL_RESERVE) as usize);
+    let read = reader.take(length).read_to_end(payload).await?;
+    if read as u64 != length {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
 }
 
 fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
@@ -235,19 +254,62 @@ where
     }
 }
 
-// Upstream to client. A data message is held until its last fragment and a control frame is
-// checked whole; either one that carries the credential ends the session before it is written.
-// The tail of the previous messages catches a credential split across messages. While the
-// stream ends with at least `HOLD_PREFIX` bytes of the credential's start, whole messages are
-// held: the next message either completes the credential (the session ends, nothing held is
-// written) or breaks the match (held messages are written in order). A held message is never
-// written if the upstream ends or sends nothing for `hold_for`. At most `HOLD_PREFIX - 1` bytes
-// of the credential reach the client.
+// The client-visible stream must never contain an 8-byte window of the credential, or the whole
+// credential when it is shorter. `visible` is the tail of what has been written, so a window
+// that crosses the boundary is checked with the bytes about to be written.
+fn exposes(visible: &[u8], bytes: &[u8], secret: &[u8]) -> bool {
+    let width = secret.len().min(HOLD_PREFIX);
+    if width == 0 {
+        return false;
+    }
+    let is_part = |window: &[u8]| secret.windows(width).any(|part| part == window);
+    if bytes.windows(width).any(&is_part) {
+        return true;
+    }
+    for taken in 1..width.min(visible.len() + 1) {
+        let end = width - taken;
+        if end > bytes.len() {
+            continue;
+        }
+        let mut window = Vec::with_capacity(width);
+        window.extend_from_slice(&visible[visible.len() - taken..]);
+        window.extend_from_slice(&bytes[..end]);
+        if is_part(&window) {
+            return true;
+        }
+    }
+    false
+}
+
+fn remember(visible: &mut Vec<u8>, bytes: &[u8]) {
+    let keep = HOLD_PREFIX - 1;
+    let from_bytes = bytes.len().min(keep);
+    let from_visible = keep - from_bytes;
+    let start = visible.len().saturating_sub(from_visible);
+    let mut next = Vec::with_capacity(keep);
+    next.extend_from_slice(&visible[start..]);
+    next.extend_from_slice(&bytes[bytes.len() - from_bytes..]);
+    *visible = next;
+}
+
+// Upstream to client. A data message is assembled until its last fragment and checked before
+// it is written; so is every control frame. Before every write, the bytes about to go out are
+// checked together with the last 7 bytes already written: an 8-byte window of the credential
+// (the whole credential when it is shorter) ends the session with nothing written. The data tail
+// holds the trailing bytes of the data messages in order and a control payload never enters it,
+// so a control frame cannot release a held message. While the tail ends with at least `hold_at`
+// bytes of the credential's start, whole data messages are held: a later data message either
+// completes the credential (the session ends, nothing held is written) or breaks the match, and
+// a held message is written only if it exposes no 8-byte window. A held message is never written
+// if the upstream ends or is quiet for `hold_for`. An upstream Close ends the session after it is
+// written: no later frame is read, held messages are dropped and the session reports `Withheld`.
+// `mid_frame` is set while a frame is partly written.
 async fn upstream_to_client<R, W>(
     mut upstream: R,
     mut client: W,
     credential: Option<Arc<Credential>>,
     hold_for: std::time::Duration,
+    mid_frame: &AtomicBool,
 ) -> Ended
 where
     R: AsyncRead + Unpin,
@@ -259,6 +321,7 @@ where
     let keep = secret.len().saturating_sub(1);
     let hold_at = HOLD_PREFIX.min(secret.len().div_ceil(2)).max(1);
     let mut tail: Vec<u8> = Vec::new();
+    let mut visible: Vec<u8> = Vec::new();
     let mut message: Option<(u8, Vec<u8>)> = None;
     let mut streamed: u64 = 0;
     let mut held: std::collections::VecDeque<(u64, u8, Vec<u8>)> =
@@ -287,54 +350,75 @@ where
         if frame.rsv != 0 {
             return Ended::Violation("reserved bits set");
         }
-        if is_control(frame.opcode) {
-            if carries(&frame.payload) {
+        let (control, opcode, payload) = if is_control(frame.opcode) {
+            (Some(frame.fin), frame.opcode, frame.payload)
+        } else {
+            match (frame.opcode, message.as_mut()) {
+                (TEXT | BINARY, None) => message = Some((frame.opcode, frame.payload)),
+                (CONTINUATION, Some((_, buffer))) => {
+                    if buffer.len() + frame.payload.len() > MAX_MESSAGE {
+                        return Ended::Violation("message too large");
+                    }
+                    buffer.extend_from_slice(&frame.payload);
+                }
+                _ => return Ended::Violation("unexpected opcode"),
+            }
+            if !frame.fin {
+                continue;
+            }
+            let Some((opcode, payload)) = message.take() else {
+                return Ended::Violation("unexpected opcode");
+            };
+            (None, opcode, payload)
+        };
+        if let Some(fin) = control {
+            if exposes(&visible, &payload, secret) {
                 return Ended::Echoed;
             }
-            let encoded = encode_frame(frame.fin, frame.opcode, None, &frame.payload);
+            let encoded = encode_frame(fin, opcode, None, &payload);
+            mid_frame.store(true, Ordering::SeqCst);
             if client.write_all(&encoded).await.is_err() {
                 return Ended::Closed;
             }
-            continue;
-        }
-        match (frame.opcode, message.as_mut()) {
-            (TEXT | BINARY, None) => message = Some((frame.opcode, frame.payload)),
-            (CONTINUATION, Some((_, buffer))) => {
-                if buffer.len() + frame.payload.len() > MAX_MESSAGE {
-                    return Ended::Violation("message too large");
-                }
-                buffer.extend_from_slice(&frame.payload);
+            mid_frame.store(false, Ordering::SeqCst);
+            remember(&mut visible, &payload);
+            if opcode == CLOSE {
+                return if held.is_empty() {
+                    Ended::Closed
+                } else {
+                    Ended::Withheld
+                };
             }
-            _ => return Ended::Violation("unexpected opcode"),
-        }
-        if !frame.fin {
             continue;
         }
-        let Some((opcode, payload)) = message.take() else {
-            return Ended::Violation("unexpected opcode");
-        };
         let mut window = std::mem::take(&mut tail);
         window.extend_from_slice(&payload);
         if carries(&window) {
             return Ended::Echoed;
         }
-        streamed += payload.len() as u64;
-        held.push_back((streamed, opcode, payload));
         let started = started_prefix(&window, secret);
+        streamed += payload.len() as u64;
         let release_to = if started >= hold_at {
             streamed - started as u64
         } else {
             streamed
         };
         tail = window[window.len().saturating_sub(keep)..].to_vec();
+        held.push_back((streamed, opcode, payload));
         while held.front().is_some_and(|(end, _, _)| *end <= release_to) {
             let Some((_, opcode, payload)) = held.pop_front() else {
                 break;
             };
+            if exposes(&visible, &payload, secret) {
+                return Ended::Echoed;
+            }
             let encoded = encode_frame(true, opcode, None, &payload);
+            mid_frame.store(true, Ordering::SeqCst);
             if client.write_all(&encoded).await.is_err() {
                 return Ended::Closed;
             }
+            mid_frame.store(false, Ordering::SeqCst);
+            remember(&mut visible, &payload);
         }
     }
 }
@@ -344,6 +428,7 @@ pub(crate) async fn relay<C, U>(
     upstream: U,
     injection: Option<(Arc<dyn Protocol>, Credential)>,
     on_inject: &(dyn Fn() -> bool + Send + Sync),
+    revalidate: &(dyn Fn() -> bool + Send + Sync),
 ) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -351,12 +436,36 @@ where
 {
     let injection = injection.map(|(p, c)| (p, Arc::new(c)));
     let guard = injection.as_ref().map(|(_, c)| c.clone());
-    let (client_r, client_w) = tokio::io::split(client);
+    let injecting = injection.is_some();
+    let (client_r, mut client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
-    tokio::select! {
+    let mid_frame = AtomicBool::new(false);
+    let refused = async {
+        if !injecting {
+            return std::future::pending().await;
+        }
+        let mut every = tokio::time::interval(REVALIDATE_EVERY);
+        loop {
+            every.tick().await;
+            if !revalidate() {
+                return;
+            }
+        }
+    };
+    let ended = tokio::select! {
         ended = client_to_upstream(client_r, upstream_w, injection, on_inject) => ended,
-        ended = upstream_to_client(upstream_r, client_w, guard, HOLD_FOR) => ended,
+        ended = upstream_to_client(upstream_r, &mut client_w, guard, HOLD_FOR, &mid_frame) => ended,
+        () = refused => Ended::Revoked,
+    };
+    if ended == Ended::Revoked && !mid_frame.load(Ordering::SeqCst) {
+        let close = encode_frame(true, CLOSE, None, &POLICY_VIOLATION.to_be_bytes());
+        let _ = tokio::time::timeout(HOLD_FOR, async {
+            let _ = client_w.write_all(&close).await;
+            let _ = client_w.shutdown().await;
+        })
+        .await;
     }
+    ended
 }
 
 #[cfg(test)]
@@ -388,6 +497,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_large_declared_length_is_not_reserved_before_its_bytes_arrive() {
+        let mut payload = Vec::new();
+        let sent = [b'a'; 10];
+        let read = read_payload(&mut sent.as_slice(), MAX_MESSAGE as u64, &mut payload).await;
+        assert!(read.is_err(), "ten bytes cannot fill the declared length");
+        assert!(
+            payload.capacity() <= 64 * 1024,
+            "reserved {} bytes for 10 received",
+            payload.capacity()
+        );
+
+        let mut whole = Vec::new();
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        read_payload(&mut body.as_slice(), body.len() as u64, &mut whole)
+            .await
+            .unwrap();
+        assert_eq!(whole, body);
+    }
+
     const SECRET: &[u8] = b"sk_test_ws_guard_value_7c2d";
 
     fn secret() -> Arc<Credential> {
@@ -395,9 +524,23 @@ mod tests {
     }
 
     async fn from_upstream(frames: &[Vec<u8>]) -> (Ended, Vec<u8>) {
+        from_upstream_with(secret(), frames).await
+    }
+
+    async fn from_upstream_with(
+        credential: Arc<Credential>,
+        frames: &[Vec<u8>],
+    ) -> (Ended, Vec<u8>) {
         let input = frames.concat();
         let (client, mut seen) = tokio::io::duplex(1 << 20);
-        let ended = upstream_to_client(input.as_slice(), client, Some(secret()), HOLD_FOR).await;
+        let ended = upstream_to_client(
+            input.as_slice(),
+            client,
+            Some(credential),
+            HOLD_FOR,
+            &AtomicBool::new(false),
+        )
+        .await;
         let mut out = Vec::new();
         seen.read_to_end(&mut out).await.unwrap();
         (ended, out)
@@ -409,7 +552,134 @@ mod tests {
         reason.extend_from_slice(SECRET);
         let (ended, out) = from_upstream(&[encode_frame(true, 0x8, None, &reason)]).await;
         assert_eq!(ended, Ended::Echoed);
-        assert!(out.is_empty(), "{out:?}");
+        assert!(out.is_empty(), "unexpected client output");
+    }
+
+    #[tokio::test]
+    async fn a_credential_split_between_a_ping_and_a_message_is_caught() {
+        let (head, rest) = SECRET.split_at(HOLD_PREFIX + 2);
+        let (ended, out) = from_upstream(&[
+            text(&[b"{\"apiKey\":\"", head]),
+            encode_frame(true, 0x9, None, rest),
+        ])
+        .await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "unexpected client output");
+
+        let (ended, out) = from_upstream(&[
+            encode_frame(true, 0x9, None, &[b"k=", head].concat()),
+            text(&[rest, b"\"}"]),
+        ])
+        .await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "unexpected client output");
+    }
+
+    #[tokio::test]
+    async fn a_close_reason_that_ends_in_a_credential_prefix_never_reaches_the_client() {
+        let mut reason = b"\x03\xe8invalid apiKey ".to_vec();
+        reason.extend_from_slice(&SECRET[..SECRET.len() - 3]);
+        let (ended, out) = from_upstream(&[encode_frame(true, CLOSE, None, &reason)]).await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "unexpected client output");
+
+        let mut short = b"\x03\xe8bye ".to_vec();
+        short.extend_from_slice(&SECRET[..HOLD_PREFIX - 1]);
+        let close = encode_frame(true, CLOSE, None, &short);
+        let (ended, out) = from_upstream(std::slice::from_ref(&close)).await;
+        assert_eq!(ended, Ended::Closed);
+        assert!(out == close, "the under-prefix close is relayed");
+    }
+
+    #[tokio::test]
+    async fn a_ping_between_two_halves_of_the_credential_is_caught() {
+        let (head, rest) = SECRET.split_at(HOLD_PREFIX);
+        let ping = encode_frame(true, 0x9, None, b"p");
+        let (ended, out) = from_upstream(&[
+            text(&[b"{\"apiKey\":\"", head]),
+            ping.clone(),
+            text(&[rest, b"\"}"]),
+        ])
+        .await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out == ping, "only the harmless ping goes out");
+    }
+
+    #[tokio::test]
+    async fn a_breaking_close_does_not_release_a_held_prefix() {
+        let mut prefix = b"{\"apiKey\":\"".to_vec();
+        prefix.extend_from_slice(&SECRET[..SECRET.len() - 2]);
+        let close = encode_frame(true, CLOSE, None, &1000u16.to_be_bytes());
+        let (ended, out) = from_upstream(&[text(&[&prefix]), close.clone()]).await;
+        assert_eq!(ended, Ended::Withheld);
+        assert!(out == close, "the held text must stay held");
+    }
+
+    #[tokio::test]
+    async fn a_close_reason_carrying_a_middle_fragment_is_caught() {
+        let mut reason = 1000u16.to_be_bytes().to_vec();
+        reason.extend_from_slice(&SECRET[8..20]);
+        let (ended, out) = from_upstream(&[
+            text(&[&SECRET[..8]]),
+            encode_frame(true, CLOSE, None, &reason),
+        ])
+        .await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "unexpected client output");
+    }
+
+    #[tokio::test]
+    async fn no_data_frame_follows_an_upstream_close() {
+        let close = encode_frame(true, CLOSE, None, &1000u16.to_be_bytes());
+        let (ended, out) =
+            from_upstream(&[text(&[&SECRET[..8]]), close.clone(), text(&[&SECRET[8..]])]).await;
+        assert_eq!(ended, Ended::Withheld);
+        assert!(out == close, "held and post-Close data are dropped");
+    }
+
+    #[tokio::test]
+    async fn a_close_reason_that_carries_the_rest_of_a_held_start_ends_the_session() {
+        let (head, rest) = SECRET.split_at(HOLD_PREFIX);
+        let mut reason = 1000u16.to_be_bytes().to_vec();
+        reason.extend_from_slice(rest);
+        let (ended, out) = from_upstream(&[
+            text(&[b"{\"apiKey\":\"", head]),
+            encode_frame(true, CLOSE, None, &reason),
+        ])
+        .await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "unexpected client output");
+    }
+
+    #[tokio::test]
+    async fn a_ping_between_two_harmless_messages_is_relayed() {
+        let first = text(&[b"hello"]);
+        let ping = encode_frame(true, 0x9, None, b"p");
+        let second = text(&[b"world"]);
+        let (ended, out) = from_upstream(&[first.clone(), ping.clone(), second.clone()]).await;
+        assert_eq!(ended, Ended::Closed);
+        assert!(
+            out == [first, ping, second].concat(),
+            "the ping is relayed in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_split_between_a_control_payload_and_a_message_is_caught() {
+        let (head, rest) = SECRET.split_at(4);
+        let ping = encode_frame(true, 0x9, None, &[b"k=", head].concat());
+        let (ended, out) = from_upstream(&[ping.clone(), text(&[rest, b"\"}"])]).await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out == ping, "only the under-prefix ping goes out");
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_short_control_payloads_is_caught_at_the_second() {
+        let first = encode_frame(true, 0x9, None, &SECRET[..7]);
+        let second = encode_frame(true, 0x9, None, &SECRET[7..14]);
+        let (ended, out) = from_upstream(&[first.clone(), second]).await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out == first, "only seven bytes of the start go out");
     }
 
     #[tokio::test]
@@ -425,10 +695,7 @@ mod tests {
         ])
         .await;
         assert_eq!(ended, Ended::Echoed);
-        assert!(
-            out.is_empty(),
-            "no fragment may go out before the check: {out:?}"
-        );
+        assert!(out.is_empty(), "no fragment may go out before the check");
     }
 
     fn text(parts: &[&[u8]]) -> Vec<u8> {
@@ -441,7 +708,7 @@ mod tests {
         let (ended, out) =
             from_upstream(&[text(&[b"{\"apiKey\":\"", head]), text(&[rest, b"\"}"])]).await;
         assert_eq!(ended, Ended::Echoed);
-        assert!(out.is_empty(), "the first half went out: {out:?}");
+        assert!(out.is_empty(), "the first half went out");
     }
 
     #[tokio::test]
@@ -456,19 +723,33 @@ mod tests {
             .collect();
         let (ended, out) = from_upstream(&pieces).await;
         assert_eq!(ended, Ended::Echoed);
-        assert_eq!(
-            out, pieces[0],
+        assert!(
+            out == pieces[0],
             "only the first message, under the prefix, goes out"
         );
     }
 
     #[tokio::test]
-    async fn a_held_message_is_released_in_order_when_the_match_breaks() {
-        let first = text(&[b"x", &SECRET[..HOLD_PREFIX + 2]]);
-        let second = text(&[b"not the rest"]);
-        let (ended, out) = from_upstream(&[first.clone(), second.clone()]).await;
+    async fn a_held_prefix_is_never_released_when_it_would_expose_the_credential() {
+        let held = text(&[b"x", &SECRET[..HOLD_PREFIX + 2]]);
+        let breaking = text(&[b"not the rest"]);
+        let (ended, out) = from_upstream(&[held, breaking]).await;
+        assert_eq!(ended, Ended::Echoed);
+        assert!(out.is_empty(), "a held prefix must never be released");
+    }
+
+    #[tokio::test]
+    async fn a_held_message_that_exposes_no_8_byte_window_is_released() {
+        let short = b"abcd-efghi";
+        let credential = Arc::new(Credential::from_bytes(short.to_vec()).unwrap());
+        let held = text(&[b"x", &short[..6]]);
+        let breaking = text(&[b"not the rest"]);
+        let (ended, out) = from_upstream_with(credential, &[held.clone(), breaking.clone()]).await;
         assert_eq!(ended, Ended::Closed);
-        assert_eq!(out, [first, second].concat());
+        assert!(
+            out == [held, breaking].concat(),
+            "the benign release writes"
+        );
     }
 
     #[tokio::test]
@@ -476,7 +757,7 @@ mod tests {
         let held = text(&[b"x", &SECRET[..HOLD_PREFIX]]);
         let (ended, out) = from_upstream(std::slice::from_ref(&held)).await;
         assert_eq!(ended, Ended::Withheld);
-        assert!(out.is_empty(), "{out:?}");
+        assert!(out.is_empty(), "unexpected client output");
 
         let (mut upstream, upstream_r) = tokio::io::duplex(1 << 16);
         upstream.write_all(&held).await.unwrap();
@@ -486,12 +767,13 @@ mod tests {
             client,
             Some(secret()),
             std::time::Duration::from_millis(50),
+            &AtomicBool::new(false),
         )
         .await;
         assert_eq!(ended, Ended::Withheld);
         let mut out = Vec::new();
         seen.read_to_end(&mut out).await.unwrap();
-        assert!(out.is_empty(), "{out:?}");
+        assert!(out.is_empty(), "unexpected client output");
         drop(upstream);
     }
 
@@ -572,7 +854,75 @@ mod tests {
         assert_eq!(ended, Ended::Refused);
         let mut out = Vec::new();
         seen.read_to_end(&mut out).await.unwrap();
-        assert!(out.is_empty(), "{out:?}");
+        assert!(out.is_empty(), "unexpected client output");
+    }
+
+    fn injection() -> Option<(Arc<dyn Protocol>, Credential)> {
+        Some((
+            Arc::new(AppendCredential),
+            Credential::from_bytes(SECRET.to_vec()).unwrap(),
+        ))
+    }
+
+    fn allows_once() -> impl Fn() -> bool + Send + Sync {
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        move || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    #[tokio::test]
+    async fn a_session_ends_when_revalidation_refuses() {
+        tokio::time::pause();
+        let (client, mut workload) = tokio::io::duplex(1 << 16);
+        let (upstream, _server) = tokio::io::duplex(1 << 16);
+        let started = tokio::time::Instant::now();
+        let ended = relay(client, upstream, injection(), &|| true, &allows_once()).await;
+        assert_eq!(ended, Ended::Revoked);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= REVALIDATE_EVERY && elapsed < REVALIDATE_EVERY * 2,
+            "{elapsed:?}"
+        );
+        let close = read_frame(&mut workload).await.unwrap().unwrap();
+        assert_eq!(
+            (close.opcode, close.payload.as_slice()),
+            (0x8, &1008u16.to_be_bytes()[..])
+        );
+        assert!(read_frame(&mut workload).await.unwrap().is_none());
+
+        let (client, _workload) = tokio::io::duplex(1 << 16);
+        let (upstream, _server) = tokio::io::duplex(1 << 16);
+        let uninjected = tokio::time::timeout(
+            REVALIDATE_EVERY * 3,
+            relay(client, upstream, None, &|| true, &|| false),
+        )
+        .await;
+        assert!(
+            uninjected.is_err(),
+            "a session without a credential is not revalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_during_a_half_written_frame_adds_no_close_frame() {
+        tokio::time::pause();
+        let (client, mut workload) = tokio::io::duplex(64);
+        let (upstream, mut server) = tokio::io::duplex(1 << 16);
+        let message = encode_frame(true, BINARY, None, &[b'm'; 1000]);
+        server.write_all(&message).await.unwrap();
+        let relayed = tokio::spawn(async move {
+            let revalidate = allows_once();
+            relay(client, upstream, injection(), &|| true, &revalidate).await
+        });
+        tokio::time::sleep(REVALIDATE_EVERY + std::time::Duration::from_millis(1)).await;
+        let mut out = Vec::new();
+        workload.read_to_end(&mut out).await.unwrap();
+        assert_eq!(relayed.await.unwrap(), Ended::Revoked);
+        assert!(
+            !out.is_empty() && out.len() < message.len(),
+            "{}",
+            out.len()
+        );
+        assert_eq!(out, message[..out.len()]);
     }
 
     #[test]

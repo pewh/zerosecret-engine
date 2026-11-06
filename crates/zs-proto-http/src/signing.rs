@@ -409,22 +409,29 @@ impl Protocol for AwsSigV4 {
             .split_once('?')
             .map(|(_, query)| query)
             .unwrap_or("");
-        let expires = query_pairs(query)
-            .into_iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("X-Amz-Expires"))
-            .and_then(|(_, value)| {
-                presign_expiry(&String::from_utf8_lossy(&percent_decode(&value)))
-            });
-        if !expires.is_some_and(|expires| expires <= MAX_PRESIGN_ENDPOINT_SECONDS) {
+        let pairs = query_pairs(query);
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| String::from_utf8_lossy(&percent_decode(value)).into_owned())
+        };
+        let expires = get("X-Amz-Expires").and_then(|value| presign_expiry(&value));
+        let Some(expires) = expires.filter(|expires| *expires <= MAX_PRESIGN_ENDPOINT_SECONDS)
+        else {
+            return Err(Denied::new("a presigned URL is capped at fifteen minutes"));
+        };
+        let now = std::time::SystemTime::now();
+        let now_seconds = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Some(dated) = get("X-Amz-Date").and_then(|date| amz_epoch(&date))
+            && dated.saturating_add(expires)
+                > now_seconds.saturating_add(MAX_PRESIGN_ENDPOINT_SECONDS)
+        {
             return Err(Denied::new("a presigned URL is capped at fifteen minutes"));
         }
-        self.resign_url_at(
-            authority,
-            path_and_query,
-            method,
-            credential,
-            std::time::SystemTime::now(),
-        )
+        self.resign_url_at(authority, path_and_query, method, credential, now)
     }
 }
 
@@ -1022,6 +1029,91 @@ mod tests {
             "{}",
             error.reason
         );
+    }
+
+    fn amz_date_of(epoch: u64) -> String {
+        let days = i64::try_from(epoch / 86_400).unwrap();
+        let rest = epoch % 86_400;
+        let shifted = days + 719_468;
+        let era = shifted.div_euclid(146_097);
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+            rest / 3_600,
+            rest % 3_600 / 60,
+            rest % 60
+        )
+    }
+
+    #[test]
+    fn an_endpoint_presign_dated_ahead_cannot_outlive_fifteen_minutes() {
+        let signer = AwsSigV4::new("s3.example.com", "AKID", "r", "s3", vec![]);
+        let cred = credential("presign-secret");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(amz_epoch(&amz_date_of(now)), Some(now));
+        let url = |dated: u64| {
+            format!(
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date={}&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=0",
+                amz_date_of(dated)
+            )
+        };
+        let error = signer
+            .resign_url("s3.example.com", &url(now + 600), "GET", &cred)
+            .unwrap_err();
+        assert_eq!(error.reason, "a presigned URL is capped at fifteen minutes");
+        assert!(
+            signer
+                .resign_url("s3.example.com", &url(now), "GET", &cred)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_presigned_url_needs_a_valid_amz_date() {
+        let signer = AwsSigV4::new("s3.example.com", "AKID", "r", "s3", vec![]);
+        let cred = credential("presign-secret");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let url = |date: &str| {
+            format!(
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256{date}&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=0"
+            )
+        };
+        let signed = signer
+            .resign_url_at(
+                "s3.example.com",
+                &url("&X-Amz-Date=20231114T221320Z"),
+                "GET",
+                &cred,
+                now,
+            )
+            .unwrap();
+        assert!(signed.contains("X-Amz-Date=20231114T221320Z"), "{signed}");
+        for date in [
+            "",
+            "&X-Amz-Date=",
+            "&X-Amz-Date=2023-11-14T22:13:20Z",
+            "&X-Amz-Date=20231114T221320",
+            "&X-Amz-Date=20231114T22132oZ",
+        ] {
+            let error = signer
+                .resign_url_at("s3.example.com", &url(date), "GET", &cred, now)
+                .unwrap_err();
+            assert_eq!(error.reason, "a presigned URL needs X-Amz-Date", "{date}");
+        }
     }
 
     #[test]

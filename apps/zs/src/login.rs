@@ -14,7 +14,7 @@ use zs_wire::{LoginClaim, WireRefusal};
 use super::Args;
 
 const LOGIN_TIMEOUT_SECONDS: u64 = 300;
-const LOGIN_POLL: Duration = Duration::from_secs(1);
+const LOGIN_POLL: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
@@ -231,6 +231,7 @@ async fn await_claim(
                 ))
             })?;
         let status = response.status().as_u16();
+        let mut wait = LOGIN_POLL;
         match status {
             200 => {
                 let claim: LoginClaim = response
@@ -249,6 +250,9 @@ async fn await_claim(
                 ));
             }
             404 => {}
+            429 => {
+                wait = retry_after(&response).unwrap_or(LOGIN_POLL);
+            }
             405 => {
                 return Err(zs_line(
                     "the control plane and this zs use different sign-in protocols; upgrade zs and control together",
@@ -266,8 +270,17 @@ async fn await_claim(
                 "timed out waiting for the browser sign-in to complete",
             ));
         }
-        tokio::time::sleep(LOGIN_POLL.min(deadline.saturating_duration_since(now))).await;
+        tokio::time::sleep(wait.min(deadline.saturating_duration_since(now))).await;
     }
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn refusal_line(status: u16, refusal: Option<WireRefusal>) -> String {
@@ -496,6 +509,100 @@ mod tests {
             "zs: the control plane and this zs use different sign-in protocols; upgrade zs and control together"
         );
         assert!(!error.contains("secret-body"));
+    }
+
+    #[tokio::test]
+    async fn a_429_on_the_claim_is_retried_and_the_claim_is_obtained() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::response::IntoResponse;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/login/claim",
+            axum::routing::post({
+                let calls = Arc::clone(&calls);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        match calls.fetch_add(1, Ordering::SeqCst) {
+                            0 | 1 => (axum::http::StatusCode::NOT_FOUND, "not yet").into_response(),
+                            2 => (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "1")],
+                                "slow down",
+                            )
+                                .into_response(),
+                            _ => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "subject": "alice",
+                                    "enrollment_token": "enrolment-token"
+                                })),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let claim = await_claim(
+            &reqwest::Client::new(),
+            &control,
+            "state",
+            "verifier",
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claim.subject, "alice");
+        assert_eq!(claim.enrollment_token.as_deref(), Some("enrolment-token"));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn the_login_deadline_still_ends_a_stream_of_429s() {
+        let app = axum::Router::new().route(
+            "/login/claim",
+            axum::routing::any(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, "60")],
+                    "slow down",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let started = Instant::now();
+        let error = await_claim(
+            &reqwest::Client::new(),
+            &control,
+            "state",
+            "verifier",
+            started + Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            "zs: timed out waiting for the browser sign-in to complete"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline must end the stream: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

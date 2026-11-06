@@ -164,6 +164,58 @@ fn the_preload_never_breaks_a_workload_without_undici() {
 }
 
 #[test]
+fn a_project_path_with_a_space_starts_node() {
+    if !have_node() {
+        eprintln!("skipping: no node");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("my project");
+    std::fs::create_dir_all(&project).unwrap();
+    plant_stub_undici(&project);
+    let preload = project.join("preload.cjs");
+    std::fs::write(&preload, NODE_PRELOAD_SOURCE).unwrap();
+    let options = node_options_with_preload(None, &preload);
+    let probe = project.join("probe.cjs");
+    std::fs::write(
+        &probe,
+        "const {getGlobalDispatcher}=require('undici');console.log(getGlobalDispatcher().constructor.name);",
+    )
+    .unwrap();
+
+    let version = std::process::Command::new("node")
+        .arg("--version")
+        .env("NODE_OPTIONS", &options)
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        version.status.success(),
+        "node --version failed under NODE_OPTIONS={options:?}: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+
+    let loaded = std::process::Command::new("node")
+        .arg(&probe)
+        .env("NODE_OPTIONS", &options)
+        .env_remove("https_proxy")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "the preload did not load under NODE_OPTIONS={options:?}: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "ProxyAgent",
+        "the preload must load from a project path with a space"
+    );
+}
+
+#[test]
 fn the_preload_resolves_undici_from_the_workload_not_the_cwd() {
     if !have_node() {
         eprintln!("skipping: no node");

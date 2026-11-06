@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PLACEHOLDER: &str = "placeholder_managed_by_zerosecret";
-pub const SANITIZED_MARKER: &str = "# zs init: brokered secrets in this file were replaced; the original is in a .zerosecret_backup_* file";
+pub const SANITIZED_MARKER: &str =
+    "# zs init: brokered secrets in this file were replaced; the original is at";
+const BACKUP_PATH_PENDING: &str = "<backup path>";
+const WITHHELD: &str = "<withheld>";
+const BACKUP_DIR_NOT_PRIVATE: &str = "the .env backup directory is not private";
+const NO_HOME: &str = "cannot find the home directory for the .env backup";
 
 const SECRET_QUERY_WORDS: &[&str] = &["password", "passwd", "pwd", "secret", "token"];
 const SECRET_KEY_WORDS: &[&str] = &[
@@ -58,6 +63,7 @@ pub struct Unbrokered {
 pub struct ScanReport {
     pub bindings: Vec<ScannedBinding>,
     pub sanitized: String,
+    pub masked: String,
     pub replaced: Vec<String>,
     pub unbrokered: Vec<Unbrokered>,
 }
@@ -282,7 +288,10 @@ fn take_port(next: &mut Option<u16>) -> Result<u16, String> {
 }
 
 pub fn already_sanitized(content: &str) -> bool {
-    content.contains(PLACEHOLDER) || content.lines().any(|l| l.trim() == SANITIZED_MARKER)
+    content.contains(PLACEHOLDER)
+        || content
+            .lines()
+            .any(|l| l.trim().starts_with(SANITIZED_MARKER))
 }
 
 fn classify(
@@ -381,11 +390,17 @@ pub fn scan_and_sanitize(content: &str, listen_port_start: u16) -> Result<ScanRe
     let mut report = ScanReport::default();
     let mut next_port = Some(listen_port_start);
     let mut lines = Vec::new();
+    let mut masked = Vec::new();
     for (index, line) in content.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             lines.push(line.to_string());
+            masked.push(if trimmed.is_empty() {
+                line.to_string()
+            } else {
+                format!("# {WITHHELD}")
+            });
             continue;
         }
         let Some((raw_key, raw_value)) = line.split_once('=') else {
@@ -401,20 +416,52 @@ pub fn scan_and_sanitize(content: &str, listen_port_start: u16) -> Result<ScanRe
         })?;
         match classify(name, value, &mut report, &mut next_port)? {
             Some(new_value) => {
-                lines.push(format!("{key}={new_value}"));
+                let rewritten = format!("{key}={new_value}");
+                masked.push(rewritten.clone());
+                lines.push(rewritten);
                 report.replaced.push(name.to_string());
             }
-            None => lines.push(line.to_string()),
+            None => {
+                lines.push(line.to_string());
+                masked.push(format!("{key}={WITHHELD}"));
+            }
         }
     }
     if !report.replaced.is_empty() {
-        lines.insert(0, SANITIZED_MARKER.to_string());
+        let marker = format!("{SANITIZED_MARKER} {BACKUP_PATH_PENDING}");
+        lines.insert(0, marker.clone());
+        masked.insert(0, marker);
     }
     report.sanitized = lines.join("\n");
+    report.masked = masked.join("\n");
     if content.ends_with('\n') {
         report.sanitized.push('\n');
+        report.masked.push('\n');
     }
     Ok(report)
+}
+
+fn with_backup_path(sanitized: &str, backup: &Path) -> String {
+    match sanitized.split_once('\n') {
+        Some((first, rest)) if first.ends_with(BACKUP_PATH_PENDING) => {
+            format!("{SANITIZED_MARKER} {}\n{rest}", backup.display())
+        }
+        _ => sanitized.to_string(),
+    }
+}
+
+fn backup_dir(home: &Path, workspace: &Path) -> PathBuf {
+    let project = workspace
+        .file_name()
+        .map_or_else(|| "workspace".into(), |name| name.to_os_string());
+    home.join(".zs-backups").join(project)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn format_backup_timestamp(secs: u64) -> String {
@@ -448,15 +495,48 @@ fn open_new_private(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-fn create_backup(env_path: &Path, content: &str, timestamp: &str) -> Result<PathBuf, String> {
-    let mut base = env_path.as_os_str().to_owned();
-    base.push(format!(".zerosecret_backup_{timestamp}"));
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|e| format!("cannot create backup directory {}: {e}", dir.display()))?;
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|e| format!("cannot inspect backup directory {}: {e}", dir.display()))?;
+    let private = meta.is_dir() && !meta.file_type().is_symlink();
+    #[cfg(unix)]
+    let private = {
+        use std::os::unix::fs::PermissionsExt;
+        private && meta.permissions().mode() & 0o077 == 0
+    };
+    if private {
+        Ok(())
+    } else {
+        Err(BACKUP_DIR_NOT_PRIVATE.to_string())
+    }
+}
+
+fn create_backup(
+    env_path: &Path,
+    content: &str,
+    timestamp: &str,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    ensure_private_dir(dir)?;
+    let file_name = env_path.file_name().ok_or("cannot name the backup file")?;
+    let mut base = file_name.to_owned();
+    base.push(format!(".{timestamp}"));
     for attempt in 0..100u32 {
         let mut name = base.clone();
         if attempt > 0 {
             name.push(format!("_{attempt}"));
         }
-        let path = PathBuf::from(name);
+        let path = dir.join(name);
         match open_new_private(&path) {
             Ok(mut file) => {
                 return file
@@ -471,7 +551,7 @@ fn create_backup(env_path: &Path, content: &str, timestamp: &str) -> Result<Path
     }
     Err(format!(
         "cannot create backup: {} and 99 numbered variants already exist",
-        PathBuf::from(base).display()
+        dir.join(base).display()
     ))
 }
 
@@ -541,7 +621,7 @@ pub fn run_init(opts: &InitOptions) -> i32 {
 
     if already_sanitized(&env_content) {
         stderr_line!(
-            "zs: {} was already sanitized by zs init; restore it from its .zerosecret_backup_* file before running zs init again",
+            "zs: {} was already sanitized by zs init; restore it from its backup under ~/.zs-backups/ before running zs init again",
             env_path.display()
         );
         return 1;
@@ -574,7 +654,7 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         stdout_line!("--- zs-policy.json (dry-run) ---");
         stdout_line!("{policy_str}");
         stdout_line!("--- {} (dry-run) ---", env_path.display());
-        stdout_line!("{}", report.sanitized);
+        stdout_line!("{}", report.masked);
         print_report(&report, &env_path);
         return 0;
     }
@@ -582,11 +662,27 @@ pub fn run_init(opts: &InitOptions) -> i32 {
     let backup_path = if report.replaced.is_empty() {
         None
     } else {
+        let Some(home) = home_dir() else {
+            stderr_line!("zs: {NO_HOME}");
+            return 2;
+        };
+        let workspace = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                stderr_line!("zs: cannot read the working directory: {e}");
+                return 2;
+            }
+        };
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let backup = match create_backup(&env_path, &env_content, &format_backup_timestamp(secs)) {
+        let backup = match create_backup(
+            &env_path,
+            &env_content,
+            &format_backup_timestamp(secs),
+            &backup_dir(&home, &workspace),
+        ) {
             Ok(path) => path,
             Err(e) => {
                 stderr_line!("zs: {e}");
@@ -605,8 +701,8 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         return 2;
     }
 
-    if backup_path.is_some()
-        && let Err(e) = fs::write(&env_path, &report.sanitized)
+    if let Some(backup) = &backup_path
+        && let Err(e) = fs::write(&env_path, with_backup_path(&report.sanitized, backup))
     {
         stderr_line!("zs: cannot rewrite {}: {e}", env_path.display());
         return 2;
@@ -861,7 +957,9 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
 
     #[test]
     fn test_already_sanitized_detection() {
-        assert!(already_sanitized(&format!("{SANITIZED_MARKER}\nA=1\n")));
+        assert!(already_sanitized(&format!(
+            "{SANITIZED_MARKER} /h/.zs-backups/p/.env.1\nA=1\n"
+        )));
         assert!(already_sanitized(
             "STRIPE_KEY=placeholder_managed_by_zerosecret\n"
         ));
@@ -872,8 +970,10 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
     fn test_backup_never_overwrites_an_existing_backup() {
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join(".env");
-        let first = create_backup(&env_path, "ORIGINAL=1\n", "20261023_000000").unwrap();
-        let second = create_backup(&env_path, "SANITIZED=1\n", "20261023_000000").unwrap();
+        let backups = dir.path().join("backups/proj");
+        let first = create_backup(&env_path, "ORIGINAL=1\n", "20261023_000000", &backups).unwrap();
+        let second =
+            create_backup(&env_path, "SANITIZED=1\n", "20261023_000000", &backups).unwrap();
         assert_ne!(first, second);
         assert_eq!(fs::read_to_string(&first).unwrap(), "ORIGINAL=1\n");
         assert_eq!(fs::read_to_string(&second).unwrap(), "SANITIZED=1\n");
@@ -885,5 +985,60 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
                 assert_eq!(mode & 0o777, 0o600);
             }
         }
+    }
+
+    #[test]
+    fn test_backup_dir_is_home_zs_backups_project() {
+        assert_eq!(
+            backup_dir(Path::new("/home/u"), Path::new("/work/lion")),
+            Path::new("/home/u/.zs-backups/lion")
+        );
+    }
+
+    #[test]
+    fn test_masked_withholds_every_unbrokered_value() {
+        let report = scan(
+            "STRIPE_SECRET_KEY=sk_live_x\nAPP_NAME=plain_value\n# note\nexport JWT_SECRET='abc'\n",
+        );
+        assert!(report.masked.contains("APP_NAME=<withheld>"));
+        assert!(report.masked.contains("export JWT_SECRET=<withheld>"));
+        assert!(report.masked.contains("# <withheld>"));
+        assert!(!report.masked.contains("# note"));
+        assert!(report.sanitized.contains("# note"));
+        assert!(
+            report
+                .masked
+                .contains("STRIPE_SECRET_KEY=placeholder_managed_by_zerosecret")
+        );
+        for value in ["plain_value", "abc", "sk_live_x"] {
+            assert!(!report.masked.contains(value), "{value} leaked");
+        }
+        assert!(report.sanitized.contains("APP_NAME=plain_value"));
+    }
+
+    #[test]
+    fn test_marker_names_the_backup_path() {
+        let report = scan("STRIPE_SECRET_KEY=sk_live_x\n");
+        let written = with_backup_path(&report.sanitized, Path::new("/h/.zs-backups/p/.env.1"));
+        assert!(
+            written.starts_with(&format!("{SANITIZED_MARKER} /h/.zs-backups/p/.env.1\n")),
+            "{written}"
+        );
+        assert!(already_sanitized(&written));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_refuses_a_symlink_at_the_backup_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        let backups = dir.path().join("backups");
+        let target = dir.path().join("victim");
+        fs::write(&target, "KEEP\n").unwrap();
+        ensure_private_dir(&backups).unwrap();
+        std::os::unix::fs::symlink(&target, backups.join(".env.20261023_000000")).unwrap();
+        let written = create_backup(&env_path, "SECRET=1\n", "20261023_000000", &backups).unwrap();
+        assert_ne!(written, backups.join(".env.20261023_000000"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "KEEP\n");
     }
 }

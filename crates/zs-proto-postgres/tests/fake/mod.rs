@@ -44,6 +44,7 @@ pub struct Script {
     pub answer: Answer,
     pub auth: Auth,
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub close_after_auth: bool,
 }
 
 impl Script {
@@ -52,11 +53,17 @@ impl Script {
             answer,
             auth: Auth::Scram,
             tls: None,
+            close_after_auth: false,
         }
     }
 
     pub fn with_tls(mut self, server: Arc<rustls::ServerConfig>) -> Self {
         self.tls = Some(server);
+        self
+    }
+
+    pub fn with_close_after_auth(mut self) -> Self {
+        self.close_after_auth = true;
         self
     }
 
@@ -68,6 +75,7 @@ impl Script {
 
 #[derive(Default)]
 pub struct Seen {
+    pub accepts: usize,
     pub ssl_requests: usize,
     pub tls: bool,
     pub startups: usize,
@@ -76,6 +84,7 @@ pub struct Seen {
     pub method_settled: bool,
     pub queries: Vec<String>,
     pub cancels: Vec<Vec<u8>>,
+    pub terminated: bool,
 }
 
 pub struct Fake {
@@ -107,6 +116,7 @@ pub async fn start(script: Script) -> Fake {
     let record = seen.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
+            record.lock().unwrap().accepts += 1;
             let (script, record) = (script.clone(), record.clone());
             tokio::spawn(async move {
                 let _ = serve(tcp, script, record).await;
@@ -192,7 +202,13 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
     write_tagged(&mut stream, b'S', b"server_version\x0016.4\0").await?;
     write_tagged(&mut stream, b'K', &[0, 0, 0, 7, 0, 0, 0, 9]).await?;
     write_tagged(&mut stream, b'Z', b"I").await?;
+    if script.close_after_auth {
+        return Ok(());
+    }
     while let Ok((tag, body)) = read_tagged(&mut stream).await {
+        if tag == b'X' {
+            seen.lock().unwrap().terminated = true;
+        }
         if tag != b'Q' {
             break;
         }
@@ -348,7 +364,8 @@ pub async fn listen(
     )
     .await
     .unwrap()
-    .with_diag(diag, RESOURCE);
+    .with_diag(diag, RESOURCE)
+    .with_cancel_authorize(Arc::new(|| Ok(())));
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     local
@@ -369,11 +386,26 @@ pub fn counted(password: &'static str) -> (Materialize, Arc<AtomicUsize>) {
 }
 
 pub async fn login(local: SocketAddr) -> Result<TcpStream, Vec<u8>> {
+    login_with(local, &zs_proto_postgres::startup_packet("alice", "appdb")).await
+}
+
+pub fn startup(params: &[(&str, &str)]) -> Vec<u8> {
+    let mut body = 196_608u32.to_be_bytes().to_vec();
+    for (key, value) in params {
+        body.extend_from_slice(key.as_bytes());
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut packet = ((body.len() + 4) as u32).to_be_bytes().to_vec();
+    packet.extend_from_slice(&body);
+    packet
+}
+
+pub async fn login_with(local: SocketAddr, startup: &[u8]) -> Result<TcpStream, Vec<u8>> {
     let mut client = TcpStream::connect(local).await.unwrap();
-    client
-        .write_all(&zs_proto_postgres::startup_packet("alice", "appdb"))
-        .await
-        .unwrap();
+    client.write_all(startup).await.unwrap();
     loop {
         let (tag, body) = tokio::time::timeout(Duration::from_secs(10), read_tagged(&mut client))
             .await

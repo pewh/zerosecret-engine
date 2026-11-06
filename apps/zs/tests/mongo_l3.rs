@@ -213,7 +213,8 @@ fn mongo_binding_fields_are_checked_at_config_load() {
         r#"{"resource":"a","host":"db","protocol":"mongo"}"#.to_string(),
         r#"{"resource":"a","host":"db","protocol":"mongo","user":""}"#.to_string(),
         r#"{"resource":"a","host":"db","protocol":"mongo","user":"u","auth_source":""}"#.to_string(),
-        r#"{"resource":"a","host":"db","protocol":"postgres","user":"u"}"#.to_string(),
+        r#"{"resource":"a","host":"db","protocol":"postgres","auth_source":"x"}"#.to_string(),
+        r#"{"resource":"a","host":"api.stripe.com","user":"u"}"#.to_string(),
         r#"{"resource":"a","host":"api.stripe.com","auth_source":"x"}"#.to_string(),
         format!(r#"{{"resource":"a","host":"db","protocol":"mongo","user":"u","upstream_plaintext":true,"upstream_ca":{ca}}}"#),
         format!(r#"{{"resource":"a","host":"db","protocol":"mongo","user":"u","upstream_plaintext":true,"upstream_cert_sha256":"{pin}"}}"#),
@@ -323,6 +324,47 @@ async fn a_mongo_client_reaches_the_server_through_zs_run_and_each_step_is_recor
     );
     assert!(!audit.contains(fake::PASSWORD));
     assert!(!diag.contains(fake::PASSWORD));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_scan_writes_no_allow() {
+    let upstream = fake::start(fake::Script::set(1, Some(0))).await;
+    let dir = common::TestHome::new(".zs-ca");
+    let setup = write_setup(dir.path(), upstream.seed().port(), fake::PASSWORD);
+    let agent = spawn(&setup);
+
+    for _ in 0..3 {
+        drop(
+            tokio::net::TcpStream::connect(listener(&agent))
+                .await
+                .unwrap(),
+        );
+    }
+    let mut client = fake::logged_in(listener(&agent)).await;
+    assert!(
+        client.command(fake::find()).await.unwrap().truthy("ok"),
+        "positive control"
+    );
+    drop(client);
+    for _ in 0..100 {
+        if diag_text(dir.path()).matches("\"conn_closed\"").count() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let diag = diag_text(dir.path());
+    assert_eq!(diag.matches("\"conn_closed\"").count(), 4, "{diag}");
+    stop(agent);
+
+    let audit = std::fs::read_to_string(&setup.audit).unwrap();
+    let allowed = audit
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| {
+            r["resource"] == RESOURCE && r["operation"] == "connect" && r["decision"] == "allow"
+        })
+        .count();
+    assert_eq!(allowed, 1, "{audit}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

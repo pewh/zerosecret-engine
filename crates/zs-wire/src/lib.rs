@@ -29,7 +29,7 @@ pub fn device_signature_message(request: &GrantMintRequest) -> String {
 }
 
 fn push_json_string(out: &mut String, value: &str) {
-    out.push_str(&serde_json::to_string(value).expect("a string is JSON"));
+    out.push_str(&serde_json::Value::String(value.to_owned()).to_string());
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -124,6 +124,10 @@ pub struct AuditIngestRecord {
     pub credential_ref: Option<String>,
     pub timestamp_ms: u64,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
@@ -119,8 +119,7 @@ pub(super) fn secret_string(text: &str) -> Zeroizing<String> {
 pub(super) fn new_record() -> Result<CaRecord, CaError> {
     let generation = || denied("CA generation failed");
     let key = KeyPair::generate().map_err(|_| generation())?;
-    let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|_| generation())?;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let params = crate::ca::root_params().map_err(|_| generation())?;
     let certificate = params.self_signed(&key).map_err(|_| generation())?;
     Ok(CaRecord {
         certificate_pem: certificate.pem(),

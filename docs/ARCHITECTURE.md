@@ -63,21 +63,26 @@ tag of this repository (ADR-0051). No commercial source file is tracked here.
 ```
 crates/
   zs-vectors           golden vector files: one format, one index, one meta-check
-  zs-identity          subject, issuer, device, session
+  zs-identity          `Subject` and `WorkloadLabel`: the non-empty identity strings
   zs-diag              per-run diagnostic events: typed, best-effort, never a credential
-  zs-credential        provider trait + Vault, OpenBao, AWS SM, GCP SM, 1Password
-  zs-policy            THE policy evaluator: Cedar, fixed policy set (ADR-0040); control plane and agent
+  zs-credential        the credential types: `CredentialRef`, `Credential`, `IdentityToken`.
+                       Provider adapters (Vault, OpenBao, AWS SM, GCP SM, 1Password) are roadmap
+  zs-policy            the policy reference evaluator: Cedar over a fixed policy set (ADR-0040),
+                       and `permits`, the operation check the agent runs on each request. The
+                       control plane decides with `cedar-go` (ADR-0048 D3)
   zs-grant             signed grant: control mints, agent and gateway verify
   zs-protocol          protocol trait: match, authorize, inject
-  zs-upstream          upstream connect, TLS verification and leaf pin for the L3 listeners;
+  zs-upstream          upstream connect for the L3 listeners and zs-mitm; TLS verification and
+                       leaf pin for the L3 listeners;
                        `http`: the one outbound HTTP client (rustls on ring, explicit timeouts,
                        no redirects, explicit proxy policy)
   zs-wire              control <-> agent JSON DTOs (ADR-0011)
   zs-proto-http        bearer, basic, api-key header, query param; `sigv4::sign` for AWS calls
-  zs-proto-postgres    wire protocol, SCRAM, upstream TLS negotiation, dynamic role
+  zs-proto-postgres    wire protocol, SCRAM, upstream TLS negotiation. The dynamic role is not implemented
   zs-proto-mysql       wire protocol, native and caching_sha2 auth, upstream TLS negotiation
   zs-proto-mongo       wire protocol, SCRAM-SHA-1/256, one-member replica set view, upstream TLS
-  zs-materializer      grant -> usable credential (retrieve or exchange); `StoreRegistry`
+  zs-materializer      grant -> usable credential (retrieve; exchange is not implemented: the
+                       agent wires `UnconfiguredExchange`, which refuses); `StoreRegistry`
                        routes the grant's source kind (`file`, `aws_ssm`) to one store and never
                        falls back; `SsmStore` reads AWS SSM through STS web identity;
                        `GrantBoundCache` keeps a value for its grant, at most 300 s
@@ -136,7 +141,13 @@ builders, the fixed replies, the conversion between `hyper::Request` and
 `zs_protocol::InjectedRequest`, and the guard that refuses a target with a fragment.
 `pipeline.rs` owns one request pipeline for both entry points: `Authorize` (scope and the
 identity check), `Inject` (the only caller of `materialize` on the request path; the
-`/.zs/presign` route calls it directly) and `Forward` (the upstream send and its one retry). `proxy.rs` keeps classification, the audit and diag
+`/.zs/presign` route calls it directly) and `Forward` (the upstream send and its one retry).
+An upstream connect tries every resolved address through `zs-upstream` (2 s each, 5 s in
+total). The upstream and the client TLS handshakes each have 10 s, a client request head 30 s,
+and an upstream response head 600 s, the request timeout of common LLM API clients. A late
+upstream answers 502 `upstream unreachable`; a late client is disconnected. The forwarded
+`Host`, which a signing scheme signs, names the origin host, and the upstream port when the
+binding reaches that same host on a non-default port. `proxy.rs` keeps classification, the audit and diag
 vocabulary, and the entry-point plumbing (ADR-0039). `ca.rs` owns `LocalCa`:
 certificate minting and the public load entry points. Secure CA storage is private to `ca/platform/`. One shared engine decides
 every transition; each adapter only reads, writes a new record after an absence check,
@@ -217,8 +228,8 @@ flowchart TD
     C["zs-protocol<br/>match destination → resource stripe-production"]
     S["zs-mitm<br/>path in the binding's paths? no → forward without a credential (ADR-0027)"]
     D["zs-grant<br/>verify subject, resource, protocol, expiry"]
-    E["zs-policy<br/>evaluate the operation against grant constraints"]
-    F["zs-materializer<br/>retrieve or exchange → credential value"]
+    E["zs-policy<br/>permits: is the operation in the grant's operations?"]
+    F["zs-materializer<br/>retrieve → credential value (exchange: roadmap)"]
     G["zs-proto-http<br/>inject Authorization: Bearer"]
     H["zs-audit<br/>record the decision. never the value"]
     I["api.stripe.com"]
@@ -233,7 +244,7 @@ flowchart TD
     A["psql or application<br/>connect 127.0.0.1:PORT"]
     B["zs-proto-postgres<br/>parse the startup message → resource"]
     C["zs-grant + zs-policy"]
-    D["zs-materializer<br/>static password, or a temporary role for this session"]
+    D["zs-materializer<br/>static password (a temporary role for the session is roadmap)"]
     E["zs-proto-postgres<br/>complete SCRAM upstream with the materialized credential"]
     F["postgres upstream"]
 
@@ -307,7 +318,8 @@ A binding field that is set must equal the signed value. A field that is left ou
 | `upstream_host`, `upstream_port` | yes | may be left out |
 | `upstream_plaintext`, `upstream_ca`, `upstream_cert_sha256` | yes, as one `upstream_tls` mode | may be left out, except `upstream_ca` when the mode is `ca-sha256`: the CA bundle stays a file, and only its SHA-256 is signed (`zs ca-sha256 <file>`) |
 | `local_endpoint` | yes | may be left out |
-| `auth`, `listen_port`, `paths`, `user`, `auth_source`, `client_auth_plugin` | no | local; SECURITY §3 says why |
+| `auth`, `listen_port`, `paths`, `auth_source`, `client_auth_plugin` | no | local; SECURITY §3 says why |
+| `user` | no | local. On `mongo`, the SCRAM user. On `postgres` and `mysql`, the only user a client may name; the agent refuses another before materialization (SECURITY §3) |
 
 The connection is fixed for the life of the run. A renewed grant with another connection is
 skipped, and a request whose grant differs is denied. For https and http, a CONNECT to a port
@@ -390,8 +402,9 @@ sequenceDiagram
     D->>I: sign in
     I-->>D: redirect to /login/callback
     D->>C: GET /login/callback (IdP code)
-    C-->>D: page shows the login code and the device name
-    loop until the sign-in completes
+    C-->>D: page shows the login code, the device name and a confirm button, sets zs_login_confirm
+    D->>C: POST /login/confirm (state, page confirm value, zs_login_confirm cookie)
+    loop until the sign-in completes (the pending login expires after 10 minutes)
         Z->>C: POST /login/claim (form: state, verifier)
     end
     C-->>Z: subject + self-enrolment token
@@ -453,8 +466,11 @@ untouched. ZeroSecret is not Zscaler and must never be described as though it we
 
 Known hard ground, planned for rather than promised away: certificate pinning, Java and
 custom trust stores, container networking, remote workspaces, HTTP/2, HTTP/3 and QUIC,
-WebSockets, gRPC, mTLS upstreams, SDK request signing, native clients that ignore proxy
-settings, VPNs, corporate proxies, EDR products.
+gRPC, mTLS upstreams, native clients that ignore proxy settings, VPNs, corporate proxies,
+EDR products. WebSockets and SDK request signing were on this list and are solved for the
+named schemes: a WebSocket binding writes the credential into one JSON field of client
+messages (ADR-0034), and `aws-sigv4` re-signs, `hmac-body-signature` and `api-key-header`
+inject, on the agent (ADR-0035, ADR-0046).
 
 **HTTP/1.1 only, enforced rather than assumed (2026-09-11).** `zs-mitm` pins ALPN to
 `http/1.1` on both the client-facing and upstream legs. An h2-capable client is
@@ -470,7 +486,7 @@ not exactly one `chunked` is refused, a body over 32 MiB is refused, and a head 
 | Mode | Meaning | Strength |
 |---|---|---|
 | Retrieve | Pull a stored credential from a vault | Works everywhere. Weakest |
-| Exchange | Identity to ephemeral credential: AWS STS, OAuth token exchange, temporary database role | Preferred wherever the provider supports it |
+| Exchange | Identity to ephemeral credential: AWS STS, OAuth token exchange, temporary database role. Not implemented: the agent wires `UnconfiguredExchange` (`apps/zs/src/run.rs`), which refuses | Preferred wherever the provider supports it |
 
 Mode is a property of the resource and is visible to the user. The long-term product
 story is moving resources from Retrieve to Exchange:
@@ -511,7 +527,10 @@ This converts credential possession into runtime authorization. It is the differ
 
 **v1 limit, stated honestly:** workload identity is a declared label
 (`zs run --as claude-code`) plus process lineage. It is not cryptographic and does not
-resist a hostile process running as the same user. See [SECURITY.md](SECURITY.md).
+resist a hostile local process. The agent's listener binds to loopback, which every local
+account can reach, so any local account that can reach the port gets the developer's
+access, not only processes of the same user. Caller authentication is planned. See
+[SECURITY.md](SECURITY.md).
 
 ## 8. Configuration source of truth
 
@@ -541,10 +560,17 @@ enforces.
 
 ### Persistence and migration
 
-PostgreSQL startup migration tolerates concurrent creators only for the known DDL errors
-`23505`, `42P07` and `42710`. `CREATE TABLE IF NOT EXISTS` is not atomic: concurrent
-control-plane instances can both pass the existence check, so `store.ApplyMigration` through
-`store.applySQL` treats those specific errors as success. Do not broaden the ignored set.
+PostgreSQL startup runs the numbered files in `control/migrations/` (`NNNN_name.sql`, embedded
+through `go generate ./internal/store`) with `store.ApplyMigrations`. One transaction takes
+`pg_advisory_xact_lock(7239001)`, creates `schema_migrations` if absent, runs each file whose
+version is not recorded, in ascending order, as a single argument-less `Exec`, and records the
+version. Concurrent control-plane instances queue on the lock, so each file runs once and the
+instances do not rely on `IF NOT EXISTS` being atomic. A file that fails rolls the whole run
+back: no partial schema and no recorded version. A migration that has shipped is never edited
+except to keep it re-runnable; a schema change is a new numbered file. An installation that
+ran `0001` before the runner existed runs it once more, so `0001` must stay idempotent.
+`store.createSchema` is the one place that still tolerates concurrent creators, only for
+`23505`, `42P07` and `42710`. Do not broaden that set.
 
 Schema changes use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. Required columns are
 backfilled with a default and then have that default removed. A nullable value such as
@@ -564,7 +590,6 @@ their rows with per-run identifiers.
 | Path | Budget |
 |---|---|
 | HTTP request added latency, warm grant | < 6 ms p95 |
-| PostgreSQL connection setup added latency | ≤ 25 ms p95 |
 | Agent resident memory, idle | ≤ 60 MB |
 | Agent cold start to first proxied request | ≤ 400 ms |
 

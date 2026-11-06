@@ -136,10 +136,17 @@ impl FileStore {
             .as_str()
             .trim_start_matches('/')
             .replace("..", "__");
-        let path = self.root.join(relative);
-        let value = std::fs::read(&path).map_err(|_| {
+        let unresolvable = || {
             MaterializationError::File(format!("credential reference {reference} not resolvable"))
-        })?;
+        };
+        if !std::path::Path::new(&relative)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(unresolvable());
+        }
+        let path = self.root.join(relative);
+        let value = std::fs::read(&path).map_err(|_| unresolvable())?;
         let trimmed: Vec<u8> = value
             .into_iter()
             .take_while(|b| *b != b'\n' && *b != b'\r')
@@ -308,6 +315,32 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "materialization denied: invalid credential reference",
+                "{reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_with_a_prefix_or_root_component_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a").join("b"), "nested").unwrap();
+        std::fs::write(dir.path().join("x"), "plain").unwrap();
+        let store = FileStore::new(dir.path());
+        assert_eq!(store.read("a/b").unwrap().expose(), b"nested");
+
+        let mut refused = vec!["./x", "."];
+        if cfg!(windows) {
+            refused.extend(["C:/x", "C:x"]);
+        }
+        for reference in refused {
+            let error = match store.read(reference) {
+                Ok(_) => panic!("{reference:?} must be refused"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("materialization denied: credential reference {reference} not resolvable"),
                 "{reference:?}"
             );
         }

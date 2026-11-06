@@ -57,10 +57,11 @@ either way.
 The demo in [PRODUCT.md §4](PRODUCT.md#4-the-demo), end to end.
 
 **Data plane**
-- HTTPS: bearer, basic, api-key header, query parameter, custom signing
-- PostgreSQL: wire protocol, SCRAM, static password and temporary role
+- HTTPS: bearer, basic, api-key header, query parameter, custom signing (not implemented as a
+  general scheme; two named signing schemes ship, ADR-0035 and ADR-0046)
+- PostgreSQL: wire protocol, SCRAM, static password. Temporary role: not implemented
 - Interception L1, L2, L3
-- Materialization: retrieve and exchange
+- Materialization: retrieve. Exchange: not implemented (the agent refuses it)
 
 **Control plane**
 - OIDC relying party. Federates to the customer IdP. ZeroSecret runs no user directory
@@ -134,8 +135,10 @@ The budget is a delta with ~2 ms of headroom over the proxy's ~3 ms median, so i
 needs an idle measuring host: 31 of 37 runs pass at load average under 4, 8 of 20 at load 9.
 §10 records that, and how to distinguish a loaded machine from a regression.
 
-Every scope line above is implemented **except** custom signing, which ADR-0014 defers to
-v2 with its reason recorded. "Organizations, **projects**, resources, policy" is now fully
+Every scope line above is implemented **except** three: the PostgreSQL temporary role, the
+exchange materialization mode, and custom signing as a general scheme. ADR-0014 deferred
+custom signing to v2, and ADR-0035 and ADR-0046 later shipped two named schemes
+(`aws-sigv4`, `hmac-body-signature`). "Organizations, **projects**, resources, policy" is now fully
 met: project scoping landed 2026-09-17 as step 21b, with ten tests that all run inside a
 single organization so only the project can produce the denial.
 

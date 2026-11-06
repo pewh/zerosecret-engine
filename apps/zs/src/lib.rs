@@ -330,11 +330,20 @@ impl ResourceBinding {
                 self.resource
             ));
         }
-        if !self.is_mongo() && (self.user.is_some() || self.auth_source.is_some()) {
+        if !self.is_l3() && self.user.is_some() {
             return Err(format!(
-                "{}: user and auth_source are allowed only on a mongo binding",
+                "{}: user is allowed only on a mysql, postgres or mongo binding",
                 self.resource
             ));
+        }
+        if !self.is_mongo() && self.auth_source.is_some() {
+            return Err(format!(
+                "{}: auth_source is allowed only on a mongo binding",
+                self.resource
+            ));
+        }
+        if self.user.as_deref() == Some("") {
+            return Err(format!("{}: user must not be empty", self.resource));
         }
         if !self.is_l3() {
             if self.upstream_ca.is_some()
@@ -839,8 +848,21 @@ pub fn bun_options_with_preload(existing: Option<&str>, preload: &std::path::Pat
     }
 }
 
+// NODE_OPTIONS is split on whitespace and honours double quotes; Bun splits on whitespace
+// and keeps any quote as part of the name, so a Bun preload path must contain none.
+fn quoted_option(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if !text
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
+        return text;
+    }
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 pub fn node_options_with_preload(existing: Option<&str>, preload: &std::path::Path) -> String {
-    let ours = format!("--require={}", preload.display());
+    let ours = format!("--require={}", quoted_option(preload));
     match existing.map(str::trim).filter(|e| !e.is_empty()) {
         Some(existing) => format!("{existing} {ours}"),
         None => ours,
@@ -866,6 +888,10 @@ pub struct AgentHandler {
     lineage: std::sync::Mutex<HashMap<String, Vec<String>>>,
     diag: Option<zs_diag::DiagLog>,
 }
+
+// A grant lives minutes; 32 renewals back is hours of history, and no revoked grant of that
+// age can still be valid. The chain therefore stays bounded without losing a live ancestor.
+const MAX_LINEAGE: usize = 32;
 
 fn resource_key(host: &str) -> String {
     host.to_ascii_lowercase()
@@ -928,11 +954,14 @@ pub fn network_for_stores() -> zs_upstream::http::Network {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+pub(crate) fn clock_ms(now: std::time::SystemTime) -> u64 {
+    now.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(u64::MAX)
+}
+
+fn now_ms() -> u64 {
+    clock_ms(std::time::SystemTime::now())
 }
 
 impl AgentHandler {
@@ -1018,6 +1047,10 @@ impl AgentHandler {
                 .remove(&previous.signed.grant.grant_id)
                 .unwrap_or_default();
             chain.push(previous.signed.grant.grant_id.clone());
+            if chain.len() > MAX_LINEAGE {
+                let excess = chain.len() - MAX_LINEAGE;
+                chain.drain(..excess);
+            }
             lineage.insert(minted.signed.grant.grant_id.clone(), chain);
         }
         self.grants.insert(minted);
@@ -1334,5 +1367,200 @@ mod control_url_tests {
         for url in ["ftp://127.0.0.1", "127.0.0.1:8443", "", "https://"] {
             assert!(control_url_allowed(url).is_err(), "{url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::clock_ms;
+
+    fn grant(key: &zs_grant::ControlSigningKey, expires_at_ms: u64) -> zs_grant::SignedGrant {
+        let connection = zs_policy::Connection::default()
+            .resolve("api.stripe.com", "https")
+            .unwrap();
+        key.sign(zs_grant::Grant {
+            subject: "alice@company.com".into(),
+            workload: "claude-code".into(),
+            resource: "stripe-production".into(),
+            host: "api.stripe.com".into(),
+            protocol: "https".into(),
+            source: zs_policy::CredentialSource::file("stripe-prod"),
+            operations: vec!["GET".into()],
+            environment: "development".into(),
+            expires_at_ms,
+            grant_id: "g-clock".into(),
+            materialization: zs_policy::Materialization::Retrieve,
+            upstream_host: connection.upstream_host,
+            upstream_port: connection.upstream_port,
+            upstream_tls: connection.upstream_tls,
+            local_endpoint: connection.local_endpoint,
+        })
+        .unwrap()
+    }
+
+    fn verifier(key: &zs_grant::ControlSigningKey) -> zs_grant::AgentVerifier {
+        zs_grant::AgentVerifier::new(vec![(
+            key.key_id().to_string(),
+            ed25519_dalek::VerifyingKey::from_bytes(&key.verifying_key_bytes()).unwrap(),
+        )])
+    }
+
+    #[test]
+    fn a_pre_epoch_clock_denies() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let pre_epoch = clock_ms(before_epoch);
+        assert_eq!(
+            pre_epoch,
+            u64::MAX,
+            "a clock before 1970 must read as the latest possible time, so every grant has expired"
+        );
+
+        let key = zs_grant::ControlSigningKey::generate("control-k1");
+        let context = zs_grant::VerifyContext {
+            subject: "alice@company.com",
+            workload: "claude-code",
+            resource: "stripe-production",
+            operation: "GET",
+        };
+        let signed = grant(&key, clock_ms(std::time::SystemTime::now()) + 300_000);
+        assert!(
+            verifier(&key).verify(&signed, pre_epoch, &context).is_err(),
+            "a grant must not verify under a pre-epoch clock"
+        );
+        assert!(
+            verifier(&key)
+                .verify(&signed, clock_ms(std::time::SystemTime::now()), &context)
+                .is_ok(),
+            "positive control: the same grant verifies under the real clock"
+        );
+    }
+}
+
+#[cfg(test)]
+mod renewal_lineage_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::sync::Arc;
+
+    use super::{AgentHandler, Destination, Flow, GrantCache, MAX_LINEAGE, ResourceBinding};
+    use zs_grant::{ControlSigningKey, Grant, SignedGrant};
+    use zs_mitm::FlowHandler;
+
+    struct NoExchange;
+
+    #[async_trait::async_trait]
+    impl zs_materializer::ExchangeProvider for NoExchange {
+        async fn exchange(
+            &self,
+            _grant: &Grant,
+        ) -> Result<zs_credential::Credential, zs_materializer::MaterializationError> {
+            Err(zs_materializer::MaterializationError::Exchange(
+                "not configured".into(),
+            ))
+        }
+    }
+
+    fn binding() -> ResourceBinding {
+        serde_json::from_value(serde_json::json!({
+            "resource": "stripe-production",
+            "host": "api.stripe.com",
+            "protocol": "https",
+            "auth": {"scheme": "bearer"}
+        }))
+        .unwrap()
+    }
+
+    fn grant(key: &ControlSigningKey, grant_id: &str) -> SignedGrant {
+        let connection = zs_policy::Connection::default()
+            .resolve("api.stripe.com", "https")
+            .unwrap();
+        key.sign(Grant {
+            subject: "alice@company.com".into(),
+            workload: "claude-code".into(),
+            resource: "stripe-production".into(),
+            host: "api.stripe.com".into(),
+            protocol: "https".into(),
+            source: zs_policy::CredentialSource::file("stripe-prod"),
+            operations: vec!["GET".into()],
+            environment: "development".into(),
+            expires_at_ms: super::clock_ms(std::time::SystemTime::now()) + 300_000,
+            grant_id: grant_id.into(),
+            materialization: zs_policy::Materialization::Retrieve,
+            upstream_host: connection.upstream_host,
+            upstream_port: connection.upstream_port,
+            upstream_tls: connection.upstream_tls,
+            local_endpoint: connection.local_endpoint,
+        })
+        .unwrap()
+    }
+
+    fn handler(key: &ControlSigningKey) -> AgentHandler {
+        let cache = GrantCache::new();
+        cache.insert(grant(key, "g-0"));
+        let verifier = zs_grant::AgentVerifier::new(vec![(
+            key.key_id().to_string(),
+            ed25519_dalek::VerifyingKey::from_bytes(&key.verifying_key_bytes()).unwrap(),
+        )]);
+        let materializer = Arc::new(zs_materializer::Materializer::new(
+            zs_materializer::StoreRegistry::new(Arc::new(zs_materializer::FileStore::new(
+                "/nonexistent",
+            ))),
+            Arc::new(NoExchange),
+        ));
+        AgentHandler::from_grants(
+            zs_identity::Subject::new("alice@company.com").unwrap(),
+            zs_identity::WorkloadLabel::new("claude-code").unwrap(),
+            vec![binding()],
+            cache,
+            verifier,
+            materializer,
+        )
+    }
+
+    fn denial(handler: &AgentHandler) -> String {
+        match handler.classify(&Destination::new("api.stripe.com".to_string(), 443)) {
+            Flow::Deny { reason } => reason,
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_renewal_lineage_is_bounded() {
+        let key = ControlSigningKey::generate("control-k1");
+        let handler = handler(&key);
+        assert!(
+            matches!(
+                handler.classify(&Destination::new("api.stripe.com".to_string(), 443)),
+                Flow::Intercept { .. }
+            ),
+            "positive control: the first grant is usable"
+        );
+
+        let renewals = MAX_LINEAGE * 3;
+        for i in 1..=renewals {
+            handler.renew_grant(grant(&key, &format!("g-{i}")));
+        }
+
+        let chain = {
+            let lineage = handler.lineage.lock().unwrap();
+            assert_eq!(lineage.len(), 1, "one chain per resource");
+            lineage.values().next().unwrap().clone()
+        };
+        assert_eq!(
+            chain.len(),
+            MAX_LINEAGE,
+            "the chain must not grow with every renewal"
+        );
+        assert_eq!(chain.last().unwrap(), &format!("g-{}", renewals - 1));
+        assert!(
+            !chain.contains(&"g-0".to_string()),
+            "the oldest ancestor falls out of the bounded window"
+        );
+
+        handler.apply_revocations(&[chain.last().unwrap().clone()]);
+        assert!(
+            denial(&handler).contains("revoked"),
+            "positive control: a revoked ancestor inside the window still denies"
+        );
     }
 }

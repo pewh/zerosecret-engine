@@ -381,6 +381,7 @@ struct Found {
 }
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
+    let first = read_first(client, conn).await?;
     let password = match (conn.shared.materialize)() {
         Ok(credential) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
@@ -393,12 +394,10 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopp
                     .code("decision", "deny")
                     .code("deny_kind", denied.kind().as_str()),
             );
-            read_first(client, conn).await?;
             conn.answer(client, &DENIED).await;
             return Err(Stopped("refused"));
         }
     };
-    let first = read_first(client, conn).await?;
     let hello = topology::handshake_hello(
         &first.hello,
         &first.database,

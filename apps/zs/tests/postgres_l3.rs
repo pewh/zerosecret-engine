@@ -385,3 +385,292 @@ async fn zs_run_verifies_a_postgres_upstream_with_its_upstream_ca() {
     );
     assert!(!third.exists(), "the child ran with a missing upstream_ca");
 }
+
+const INTRUDER: &str = "zs_intruder_role";
+
+fn bind_user(policy: &std::path::Path, port: u16, user: &str) {
+    let text = std::fs::read_to_string(policy).unwrap();
+    let field = format!("\"upstream_port\": {port}");
+    assert!(text.contains(&field), "{text}");
+    std::fs::write(
+        policy,
+        text.replace(&field, &format!("{field}, \"user\": \"{user}\"")),
+    )
+    .unwrap();
+}
+
+struct PgRun {
+    agent: common::AgentProcess,
+    upstream: pg_fake::Fake,
+    audit: std::path::PathBuf,
+    dir: common::TestHome,
+}
+
+impl PgRun {
+    async fn start(user: Option<&str>) -> Self {
+        Self::start_with(user, pg_fake::Script::new(pg_fake::Answer::N), true).await
+    }
+
+    async fn start_with(user: Option<&str>, script: pg_fake::Script, grant: bool) -> Self {
+        let upstream = pg_fake::start(script).await;
+        let port = upstream.addr.port();
+        let dir = common::TestHome::new(".zs-ca");
+        let (policy, creds, audit, ca_dir) = common::write_postgres_setup(dir.path(), port, grant);
+        std::fs::write(creds.join("pg-prod"), format!("{}\n", pg_fake::PASSWORD)).unwrap();
+        if let Some(user) = user {
+            bind_user(&policy, port, user);
+        }
+        let agent = tokio::task::block_in_place(|| {
+            common::spawn_agent(
+                &common::bin_path(),
+                &policy,
+                &creds,
+                &audit,
+                &ca_dir,
+                &["sleep", "30"],
+                true,
+            )
+        })
+        .expect("the agent must start");
+        Self {
+            agent,
+            upstream,
+            audit,
+            dir,
+        }
+    }
+
+    fn listener(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            self.agent.postgres_port.expect("a `zs: postgres` line"),
+        ))
+    }
+
+    fn diag(&self) -> String {
+        std::fs::read_dir(self.dir.path().join(".zs-log"))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stop(mut self) -> (Vec<serde_json::Value>, String, String) {
+        let _ = self.agent.child.kill();
+        let _ = self.agent.child.wait();
+        let text = std::fs::read_to_string(&self.audit).unwrap();
+        let records = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let diag = self.diag();
+        (records, text, diag)
+    }
+}
+
+fn audited(records: &[serde_json::Value], decision: &str, reason: Option<&str>) -> usize {
+    records
+        .iter()
+        .filter(|r| {
+            r["resource"] == "appdb"
+                && r["protocol"] == "postgres"
+                && r["operation"] == "connect"
+                && r["decision"] == decision
+                && r.get("reason").and_then(|v| v.as_str()) == reason
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_startup_user_other_than_the_bound_user_is_refused() {
+    let run = PgRun::start(Some("app")).await;
+
+    let refused = pg_fake::login_with(
+        run.listener(),
+        &pg_fake::startup(&[("user", INTRUDER), ("database", "appdb")]),
+    )
+    .await
+    .expect_err("a startup user other than the bound user must be refused");
+    assert_eq!(
+        refused,
+        pg_fake::error_frame(("28000", "database user not allowed by the binding"))
+    );
+    assert!(!String::from_utf8_lossy(&refused).contains(INTRUDER));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        run.upstream.seen(|s| s.accepts),
+        0,
+        "upstream was contacted"
+    );
+
+    let mut client = pg_fake::login_with(
+        run.listener(),
+        &pg_fake::startup(&[("user", "app"), ("database", "appdb")]),
+    )
+    .await
+    .expect("positive control: the bound user logs in");
+    assert_eq!(pg_fake::query(&mut client, "SELECT 1").await, "SELECT 1");
+    assert_eq!(run.upstream.seen(|s| s.accepts), 1);
+    assert!(run.upstream.seen(|s| s.authenticated));
+    drop(client);
+
+    let (records, text, diag) = run.stop();
+    assert_eq!(
+        audited(&records, "deny", Some("user mismatch")),
+        1,
+        "{text}"
+    );
+    assert_eq!(audited(&records, "allow", None), 1, "{text}");
+    assert!(!text.contains(INTRUDER), "{text}");
+    assert!(!diag.contains(INTRUDER), "{diag}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replication_startup_is_refused() {
+    let run = PgRun::start(None).await;
+
+    for value in ["database", "true", "false", "0"] {
+        let refused = pg_fake::login_with(
+            run.listener(),
+            &pg_fake::startup(&[
+                ("user", "alice"),
+                ("database", "appdb"),
+                ("replication", value),
+            ]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("replication={value} must be refused"));
+        assert_eq!(
+            refused,
+            pg_fake::error_frame(("28000", "replication connections are refused")),
+            "replication={value}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        run.upstream.seen(|s| s.accepts),
+        0,
+        "upstream was contacted"
+    );
+
+    let client = pg_fake::login(run.listener())
+        .await
+        .expect("positive control: a startup without replication logs in");
+    assert_eq!(run.upstream.seen(|s| s.accepts), 1);
+    drop(client);
+
+    let (records, text, _) = run.stop();
+    assert_eq!(
+        audited(&records, "deny", Some("replication refused")),
+        4,
+        "{text}"
+    );
+    assert_eq!(audited(&records, "allow", None), 1, "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_close_ends_the_relay() {
+    let run = PgRun::start_with(
+        None,
+        pg_fake::Script::new(pg_fake::Answer::N).with_close_after_auth(),
+        true,
+    )
+    .await;
+    let client = pg_fake::login(run.listener())
+        .await
+        .expect("positive control: the login completes before the upstream closes");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut diag = run.diag();
+    while !diag.contains("\"conn_closed\"") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        diag = run.diag();
+    }
+    assert!(
+        diag.contains("\"conn_closed\""),
+        "an upstream close must end the relay while the client is idle: {diag}"
+    );
+    assert!(
+        diag.contains("\"closed_by\":\"upstream\""),
+        "the upstream closed first: {diag}"
+    );
+    drop(client);
+
+    let (records, text, _) = run.stop();
+    assert_eq!(audited(&records, "allow", None), 1, "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminate_is_recorded_before_the_relay_ends() {
+    let run = PgRun::start(None).await;
+    let mut client = pg_fake::login(run.listener())
+        .await
+        .expect("positive control: the login works");
+    pg_fake::write_tagged(&mut client, b'X', b"").await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut diag = run.diag();
+    while !diag.contains("\"conn_closed\"") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        diag = run.diag();
+    }
+    let terminate = diag.find("\"client_terminate\"").unwrap_or_else(|| {
+        panic!("the relay must record a Terminate before the upstream sees it: {diag}")
+    });
+    let closed = diag
+        .find("\"conn_closed\"")
+        .unwrap_or_else(|| panic!("a Terminate must end the relay: {diag}"));
+    assert!(terminate < closed, "{diag}");
+    assert!(diag.contains("\"closed_by\":\"client\""), "{diag}");
+    assert!(
+        pg_fake::eventually(|| run.upstream.seen(|s| s.terminated)).await,
+        "the relay must forward the Terminate after recording it"
+    );
+    drop(client);
+
+    let (records, text, _) = run.stop();
+    assert_eq!(audited(&records, "allow", None), 1, "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_without_a_grant_is_refused() {
+    let run = PgRun::start_with(None, pg_fake::Script::new(pg_fake::Answer::N), false).await;
+    pg_fake::send_cancel(run.listener()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        run.upstream.seen(|s| s.accepts),
+        0,
+        "a cancel without a grant must not reach the upstream"
+    );
+
+    let (records, text, diag) = run.stop();
+    let refused: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| {
+            r["resource"] == "appdb"
+                && r["protocol"] == "postgres"
+                && r["operation"] == "cancel"
+                && r["decision"] == "deny"
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    assert_eq!(refused[0]["reason"], "cancel without a grant", "{text}");
+    assert!(diag.contains("\"reason\":\"cancel\""), "{diag}");
+
+    let authorized = PgRun::start(None).await;
+    pg_fake::send_cancel(authorized.listener()).await;
+    assert!(
+        pg_fake::eventually(|| authorized.upstream.seen(|s| s.cancels.len()) == 1).await,
+        "positive control: a cancel covered by the grant reaches the upstream"
+    );
+    let (records, text, _) = authorized.stop();
+    assert_eq!(
+        audited(&records, "allow", None),
+        0,
+        "a cancel must not materialize a credential: {text}"
+    );
+}

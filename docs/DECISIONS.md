@@ -531,6 +531,11 @@ it never lets a request through. If every admin is lost, the only way back is to
 role (SECURITY §3). The row set is in SECURITY §7. Dashboard changes stay `control:` lines and do
 not enter the hash-chained audit journal.
 
+**Consequence, 2026-11-05.** D13's subject is the `email` claim only when the same ID token
+carries `email_verified: true`. Otherwise it is `sub` (decision D2 of the deep review). An IdP
+that omits `email_verified`, such as Entra ID by default, signs in by `sub`, so
+`ZS_CONTROL_ADMINS` and member rows list `sub` values for it.
+
 **Not closed here.** The dashboard acts on one organization. `ZS_CONTROL_ORG` seeds the policy
 for its own organization, and the dashboard still acts on `default`: this mismatch is an open
 item, tracked outside the published docs. SECURITY §3 owns the other limits.
@@ -938,6 +943,15 @@ device has no project, so it reaches only unprojected resources (ADR-0021). A su
 several organizations cannot self-enrol and needs an operator token. The login code does not
 stop a user who ignores it (SECURITY §3).
 
+**Consequence (2026-11-05).** The callback no longer completes a CLI sign-in. It shows the code
+with a confirm button, and only `POST /login/confirm` from the browser that completed the IdP
+sign-in, carrying the `zs_login_confirm` cookie that the callback set and the hidden value from
+the confirm page, makes the login claimable. The CLI callback creates no dashboard session. One
+login gives at most one self-enrolment token, also under concurrent claims. A pending login
+expires 10 minutes after
+`/login` and is deleted after an hour. A dashboard login is bound to its browser by the
+`zs_login_state` cookie, and `POST /login/claim` answers 404 for it.
+
 **Reversed by:** a platform attestation mechanism that proves the device as well as the user,
 or a need to approve each self-enrolment.
 
@@ -1053,6 +1067,13 @@ message (`apiKey`), not in a header, so a header scheme cannot broker it.
   at most its first 7 bytes reach the workload.
 - A legitimate message that happens to end with 8 bytes of the key's start waits for the next
   message, up to 5 s, and then ends the session.
+- **2026-11-06.** The held-message rule is now a write-time invariant: before the agent writes
+  anything to the workload it checks the bytes about to go out plus the last 7 written bytes,
+  and ends the session as an echo if they would put any 8-byte window of the credential on the
+  client stream. A held message is therefore no longer released when a later message breaks
+  the match, if that release would expose such a window; the session ends instead. A control
+  frame cannot release a held message, and an upstream Close ends the session after it is
+  forwarded.
 - Upstream messages are delivered whole, not streamed. A large message arrives only after its
   last fragment.
 - Compression extensions are not negotiated, so frames stay readable.
@@ -1490,6 +1511,9 @@ An `https://` origin on a port other than 443 got its credential in cleartext.
 - Revoking a grant ID ends it within one refresh.
 - An operator finds the grant ID in the agent's `zs: grant` and `zs: renewed grant` lines.
   The dashboard does not list minted grants.
+- Bounded 2026-11-06: the agent keeps the IDs of the last 32 replaced grants, not all of
+  them. A grant lives minutes, so no ancestor older than the window can still be valid, and
+  the bound stops the chain from growing with every renewal.
 
 **Reversed by:** a policy model where the control plane, not the binding, chooses the
 operations to mint. Or a minted-grant registry, which would let the dashboard list grants
@@ -1960,7 +1984,7 @@ step — TPM-backed or cloud instance identity. That would remove the token, not
 
 ## ADR-0014 — Custom request signing is deferred to v2
 
-**2026-09-11 · Accepted**
+**2026-09-11 · Superseded by ADR-0035 and ADR-0046 (2026-11-05)**
 
 ROADMAP v1's data plane lists "HTTPS: bearer, basic, api-key header, query parameter,
 custom signing". The first four are mechanical header or query manipulations. Custom
@@ -1974,6 +1998,11 @@ is v2.
 **Consequence:** ZeroSecret cannot front an AWS API in v1. That is a real gap and must be
 stated when the data plane is described, not discovered by a design partner. The four
 shipped schemes cover the API-key-shaped majority, which is what PRODUCT §4's demo needs.
+
+**Consequence, 2026-11-05.** ADR-0035 shipped signing schemes that re-sign on the agent
+(`aws-sigv4` and the payment-gateway HMAC scheme), and ADR-0046 renamed the second to
+`hmac-body-signature`. The "cannot front an AWS API" gap above is closed for those two named
+schemes. A general, user-defined signing scheme is still not built.
 
 **Reversed by:** a design partner whose primary resource requires SigV4. The work is
 bounded but it pulls in per-provider canonicalization, which is the shape ROADMAP's

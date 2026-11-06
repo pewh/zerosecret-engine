@@ -1,5 +1,5 @@
 {
-  "about": "AuditIngestRecord (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "about": "AuditIngestRecord (spec 5.3): an accepted text, optional nulls, the u64 timestamp bound, the journal seq and chain hash, an unknown field, a wrong-case key, a duplicate key",
   "version": 1,
   "frozen": false,
   "context": {},
@@ -10,6 +10,44 @@
       "expect": {
         "accepted": true,
         "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"reason\":\"policy allows\",\"credential_ref\":\"prod-db\",\"timestamp_ms\":1800000000000,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\"}"
+      }
+    },
+    {
+      "name": "accepted_with_seq_and_hash",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"reason\": \"policy allows\", \"credential_ref\": \"prod-db\", \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\", \"seq\": 7, \"hash\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"reason\":\"policy allows\",\"credential_ref\":\"prod-db\",\"timestamp_ms\":1800000000000,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\",\"seq\":7,\"hash\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"}"
+      }
+    },
+    {
+      "name": "null_optional_fields_are_absent",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"reason\": null, \"credential_ref\": null, \"timestamp_ms\": 1800000000000, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"timestamp_ms\":1800000000000,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\"}"
+      }
+    },
+    {
+      "name": "u64_max_timestamp_is_accepted",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"timestamp_ms\": 18446744073709551615, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"subject\":\"alice@example.com\",\"workload\":\"checkout\",\"resource\":\"acme-db\",\"protocol\":\"postgres\",\"operation\":\"read\",\"decision\":\"allow\",\"timestamp_ms\":18446744073709551615,\"device_id\":\"dev-0123456789abcdef0123456789abcdef\"}"
+      }
+    },
+    {
+      "name": "negative_timestamp_is_refused",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"timestamp_ms\": -1, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\"}",
+      "expect": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "timestamp_over_u64_max_is_refused",
+      "input": "{\"subject\": \"alice@example.com\", \"workload\": \"checkout\", \"resource\": \"acme-db\", \"protocol\": \"postgres\", \"operation\": \"read\", \"decision\": \"allow\", \"timestamp_ms\": 18446744073709551616, \"device_id\": \"dev-0123456789abcdef0123456789abcdef\"}",
+      "expect": {
+        "accepted": false
       }
     },
     {

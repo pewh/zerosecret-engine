@@ -40,7 +40,7 @@ The sales sentence:
 
 > Sign in once with SSO. ZeroSecret authenticates your development workloads to APIs,
 > databases, and services without putting credentials in `.env`, application memory,
-> or agent context—mathematically proving non-leakage to satisfy SOC 2, EU AI Act, and NIST AI RMF requirements.
+> or agent context, on every path ZeroSecret intercepts, with an audit record that never holds the credential.
 
 ZeroSecret is the credential **consumption** layer. Vaults are the credential
 **custody** layer. They are different products.
@@ -48,7 +48,7 @@ ZeroSecret is the credential **consumption** layer. Vaults are the credential
 ```mermaid
 flowchart LR
     A["Application<br/>holds no credential"]
-    V["Vault · OpenBao · Infisical<br/>AWS SM · GCP SM · Azure KV · 1Password<br/>custody layer"]
+    V["Vault · OpenBao · Infisical<br/>AWS SM · GCP SM · Azure KV · 1Password<br/>custody layer (ZeroSecret adapters: roadmap)"]
     Z["ZeroSecret<br/>consumption layer"]
     D["Destination"]
 
@@ -146,9 +146,9 @@ Avoid Fortune 100 first. Procurement and security review will outrun product-mar
 | Infisical Agent Proxy | AI agent credential brokering at the network boundary | ZeroSecret starts from human SSO identity and covers every development workload, not the agent alone |
 | StrongDM | Privileged access to infrastructure — SSH, K8s, databases | ZeroSecret targets outbound dependencies of a workload, not operator access to infrastructure |
 | Teleport | Infrastructure and workload identity platform | ZeroSecret stays narrow. Competing on breadth loses |
-| Vault / OpenBao | Credential custody, dynamic secrets | ZeroSecret consumes them. Integration, not replacement |
+| Vault / OpenBao | Credential custody, dynamic secrets | ZeroSecret is meant to consume them. Integration, not replacement. The provider adapters are roadmap: today a source is a file or AWS SSM |
 | CyberArk Secretless Broker | Protocol connectors that keep credentials from the app | Closest technical ancestor. ZeroSecret adds identity, policy, delegation, and audit |
-| Auditors / Compliance | Manual evidence gathering for SOC 2, EU AI Act, NIST AI RMF | ZeroSecret makes audits trivial by mathematically proving the workload *never held* the secret, automatically fulfilling access controls rather than just documenting them |
+| Auditors / Compliance | Manual evidence gathering for SOC 2, EU AI Act, NIST AI RMF | On an intercepted path the workload never holds the upstream credential, and the audit record shows each decision without the value. That is evidence for an access-control review, not a proof and not a compliance certification (§7) |
 
 Do not fight Infisical on "AI agent secrets proxy". Do not fight Teleport on breadth.
 Do not fight Vault on custody.
@@ -189,6 +189,10 @@ analytics-db       db.internal     postgres  L3  exchange  strict
 session-cache      cache.internal  redis     -   exchange  not-strict
 ```
 
+The `exchange` rows are an illustration of the report format. Exchange materialization is
+roadmap and not implemented (the agent refuses it), so a real resource reports `retrieve`
+today.
+
 **Strict is decided by interception, not by materialization (2026-09-18, ADR-0022).** This
 section's definition asks *who holds the credential*, and both interception layers answer it
 the same way: `zs-mitm` terminates TLS and injects on the upstream leg, `PostgresListener`
@@ -218,8 +222,8 @@ proxied an unintercepted protocol and injected its credential — found by runni
 not by the suite, and closed by
 `apps/zs/tests/fail_closed.rs::a_protocol_no_layer_carries_is_denied_rather_than_proxied`.
 
-Eight tests in `apps/zs/tests/claims_reporting.rs`, one in
-`control/internal/dashboard/resources_test.go`, and one in
+Nine tests in `apps/zs/tests/claims_reporting.rs`, one in
+the commercial repository's dashboard tests, and one in
 `apps/zs/tests/https_validating_upstream.rs` that joins the label to the evidence: the
 resource reporting `strict` is the one whose child environ holds no credential while the
 call is accepted. **A label is a claim; the child's environ is the evidence** — asserting the
@@ -259,8 +263,10 @@ authenticated call, which is exactly what this section's strict definition asks.
 resource now reports `strict`.
 
 The claim is scoped to intercepted paths — HTTPS through `zs-mitm`, PostgreSQL through
-`PostgresListener`. It is not a claim about unintercepted traffic, not a claim that the agent
-is a sandbox (SECURITY §3's same-user limit is untouched), and strict mode reduces credential
+`PostgresListener`, MySQL through `MysqlListener`, MongoDB through `MongoListener`. It is not
+a claim about unintercepted traffic, not a claim that the agent is a sandbox (SECURITY §3's
+local-process limit is untouched: any local account that can reach the loopback port gets the
+developer's access, and caller authentication is planned), and strict mode reduces credential
 theft to session abuse rather than providing isolation. See ROADMAP's v1 status block.
 
 ## 8. Edition boundary
@@ -271,7 +277,7 @@ what it does. The answer must be "read it".
 
 | Open source | Commercial |
 |---|---|
-| Agent, CLI, MITM engine, protocol implementations, materializer, policy evaluator, credential provider adapters, audit primitives | Hosted control plane, organizations, SSO federation, policy distribution, central audit and export, dashboard, gateway, device posture, approvals, SLA |
+| Agent, CLI, MITM engine, protocol implementations, materializer, policy evaluator, audit primitives; credential source adapters (AWS SSM is the one shipped source; the other providers are roadmap) | Hosted control plane, organizations, SSO federation, policy distribution, central audit and export, dashboard, gateway, device posture, approvals, SLA |
 
 Never monetize the vault. The pitch is "keep your existing secret manager, stop it
 delivering secrets into developer processes" — a far easier sale than "replace Vault".

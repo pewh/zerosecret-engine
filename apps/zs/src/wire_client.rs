@@ -1,6 +1,6 @@
 // The grant-verifying key is pinned at enrolment and never refetched per request (ADR-0016).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -361,8 +361,5 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock_ms(SystemTime::now())
 }

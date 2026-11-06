@@ -119,41 +119,67 @@ impl Journal {
         let path = path.as_ref().to_path_buf();
         let mut seq = 0u64;
         let mut prev_hash = "0".repeat(64);
-        if path.exists() {
-            let file = File::open(&path)
-                .map_err(|e| AuditError::SinkUnavailable(format!("{}: {e}", path.display())))?;
-            for line in BufReader::new(file).lines() {
-                let line = line.map_err(|e| AuditError::SinkUnavailable(e.to_string()))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let record: AuditRecord =
-                    serde_json::from_str(&line).map_err(|_| AuditError::ChainBroken(seq + 1))?;
-                if record.seq != seq + 1 || record.prev_hash != prev_hash || !framed(&record) {
-                    return Err(AuditError::ChainBroken(seq + 1));
-                }
-                let request = AuditRequest {
-                    subject: record.subject.clone(),
-                    workload: record.workload.clone(),
-                    resource: record.resource.clone(),
-                    protocol: record.protocol.clone(),
-                    operation: record.operation.clone(),
-                    decision: record.decision,
-                    reason: record.reason.clone(),
-                    credential_ref: record.credential_ref.clone(),
-                };
-                let expected =
-                    hash_record(&request, record.seq, record.timestamp_ms, &record.prev_hash);
-                if expected != record.hash {
-                    return Err(AuditError::ChainBroken(record.seq));
-                }
-                seq = record.seq;
-                prev_hash = record.hash;
+        let content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(AuditError::SinkUnavailable(format!(
+                    "{}: {e}",
+                    path.display()
+                )));
             }
+        };
+        // A crash between the write and its sync_all can leave part of a line. That record
+        // was never written, so it is dropped; appending behind it would corrupt the next one.
+        let content = if !content.is_empty() && !content.ends_with(b"\n") {
+            let complete = content
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |last| last + 1);
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| AuditError::SinkUnavailable(format!("{}: {e}", path.display())))?;
+            file.set_len(complete as u64)
+                .map_err(|e| AuditError::SinkUnavailable(format!("{}: {e}", path.display())))?;
+            content[..complete].to_vec()
+        } else {
+            content
+        };
+        let text = std::str::from_utf8(&content)
+            .map_err(|_| AuditError::SinkUnavailable("the journal is not UTF-8".into()))?;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AuditRecord =
+                serde_json::from_str(line).map_err(|_| AuditError::ChainBroken(seq + 1))?;
+            if record.seq != seq + 1 || record.prev_hash != prev_hash || !framed(&record) {
+                return Err(AuditError::ChainBroken(seq + 1));
+            }
+            let request = AuditRequest {
+                subject: record.subject.clone(),
+                workload: record.workload.clone(),
+                resource: record.resource.clone(),
+                protocol: record.protocol.clone(),
+                operation: record.operation.clone(),
+                decision: record.decision,
+                reason: record.reason.clone(),
+                credential_ref: record.credential_ref.clone(),
+            };
+            let expected =
+                hash_record(&request, record.seq, record.timestamp_ms, &record.prev_hash);
+            if expected != record.hash {
+                return Err(AuditError::ChainBroken(record.seq));
+            }
+            seq = record.seq;
+            prev_hash = record.hash;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(&path)
             .map_err(|e| AuditError::SinkUnavailable(format!("{}: {e}", path.display())))?;
         Ok(Self {
@@ -281,6 +307,32 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_new_journal_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let journal = Journal::open(&path).unwrap();
+        journal.append(&request("alice", "GET"), 1000).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "journal mode is {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_journal_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let journal = Journal::open(&path).unwrap();
+        journal.append(&request("alice", "GET"), 1000).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "journal mode is {mode:o}");
+    }
+
     #[test]
     fn chain_survives_reload_and_verifies() {
         let dir = tempfile::tempdir().unwrap();
@@ -308,6 +360,59 @@ mod tests {
         std::fs::write(&path, tampered).unwrap();
         assert!(verify_chain(&path).is_err());
         assert!(Journal::open(&path).is_err());
+    }
+
+    #[test]
+    fn a_torn_last_line_is_dropped_and_the_chain_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let journal = Journal::open(&path).unwrap();
+            journal.append(&request("alice", "GET"), 1000).unwrap();
+            journal.append(&request("alice", "POST"), 2000).unwrap();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let torn = format!("{}\n{}", lines[0], &lines[1][..lines[1].len() / 2]);
+        std::fs::write(&path, &torn).unwrap();
+        assert!(
+            verify_chain(&path).is_err(),
+            "an incomplete record stays visible to a verifier"
+        );
+
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.last_seq().unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", lines[0]),
+            "the incomplete line is removed, not kept as a prefix"
+        );
+        journal.append(&request("carol", "GET"), 3000).unwrap();
+        assert_eq!(verify_chain(&path).unwrap(), 2);
+        assert_eq!(Journal::open(&path).unwrap().last_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_complete_corrupt_line_still_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let journal = Journal::open(&path).unwrap();
+            journal.append(&request("alice", "GET"), 1000).unwrap();
+            journal.append(&request("alice", "POST"), 2000).unwrap();
+        }
+        assert!(Journal::open(&path).is_ok(), "positive control");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut corrupt = lines[1].to_string();
+        corrupt.pop();
+        corrupt.push_str("x}\n");
+        std::fs::write(&path, format!("{}\n{}", lines[0], corrupt)).unwrap();
+        assert!(
+            matches!(Journal::open(&path), Err(AuditError::ChainBroken(_))),
+            "a corrupt line that ends with a newline must still refuse"
+        );
     }
 
     #[test]

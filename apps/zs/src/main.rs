@@ -10,6 +10,7 @@ macro_rules! stderr_line {
     }};
 }
 
+mod audit_ship;
 mod init;
 mod instructions;
 mod login;
@@ -430,15 +431,15 @@ fn login_locally() -> i32 {
     let subject = match default_subject() {
         Ok(subject) => subject,
         Err(e) => {
-            eprintln!("zs: {e}");
+            stderr_line!("zs: {e}");
             return 1;
         }
     };
     if let Err(e) = store_session(subject.as_str()) {
-        eprintln!("zs: {e}");
+        stderr_line!("zs: {e}");
         return 1;
     }
-    println!(
+    stdout_line!(
         "signed in as {} (local session, no identity provider — pass --control <url> for SSO)",
         subject.as_str()
     );
@@ -518,7 +519,7 @@ fn resources(args: &Args) -> i32 {
     let file = match AgentFile::load(&args.policy) {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("zs: cannot read {}: {e}", args.policy.display());
+            stderr_line!("zs: cannot read {}: {e}", args.policy.display());
             return 1;
         }
     };

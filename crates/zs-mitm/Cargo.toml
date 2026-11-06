@@ -21,6 +21,7 @@ zs-diag.workspace = true
 zs-identity.workspace = true
 zs-protocol.workspace = true
 zs-proto-http.workspace = true
+zs-upstream.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -39,6 +40,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 zs-test-keychain.workspace = true

@@ -9,6 +9,9 @@ use zs_mitm::{Flow, FlowHandler};
 use zs_protocol::Destination;
 
 mod common;
+#[cfg(unix)]
+mod matrix_support;
+mod ws_fake;
 
 const SUBJECT: &str = "alice@company.com";
 const WORKLOAD: &str = "claude-code";
@@ -44,7 +47,16 @@ fn grant_with_id(grant_id: &str) -> Grant {
 }
 
 fn agent_with(signed: SignedGrant, verifier_key: &ControlSigningKey) -> AgentHandler {
-    let bindings = vec![ResourceBinding {
+    agent_in(
+        bearer_binding(),
+        signed,
+        verifier_key,
+        std::path::Path::new("/nonexistent"),
+    )
+}
+
+fn bearer_binding() -> ResourceBinding {
+    ResourceBinding {
         resource: RESOURCE.to_string(),
         host: HOST.to_string(),
         protocol: "https".to_string(),
@@ -63,7 +75,15 @@ fn agent_with(signed: SignedGrant, verifier_key: &ControlSigningKey) -> AgentHan
         auth: zs::HttpAuth::Bearer,
         source: None,
         loaded_ca: None,
-    }];
+    }
+}
+
+fn agent_in(
+    binding: ResourceBinding,
+    signed: SignedGrant,
+    verifier_key: &ControlSigningKey,
+    store: &std::path::Path,
+) -> AgentHandler {
     let verifier = zs_grant::AgentVerifier::new(vec![(
         verifier_key.key_id().to_string(),
         ed25519_dalek::VerifyingKey::from_bytes(&verifier_key.verifying_key_bytes()).unwrap(),
@@ -73,14 +93,14 @@ fn agent_with(signed: SignedGrant, verifier_key: &ControlSigningKey) -> AgentHan
     AgentHandler::from_grants(
         zs_identity::Subject::new(SUBJECT).unwrap(),
         zs_identity::WorkloadLabel::new(WORKLOAD).unwrap(),
-        bindings,
+        vec![binding],
         cache,
         verifier,
-        test_materializer(),
+        test_materializer(store),
     )
 }
 
-fn test_materializer() -> Arc<zs_materializer::Materializer> {
+fn test_materializer(store: &std::path::Path) -> Arc<zs_materializer::Materializer> {
     struct NoExchange;
     #[async_trait::async_trait]
     impl zs_materializer::ExchangeProvider for NoExchange {
@@ -94,9 +114,7 @@ fn test_materializer() -> Arc<zs_materializer::Materializer> {
         }
     }
     Arc::new(zs_materializer::Materializer::new(
-        zs_materializer::StoreRegistry::new(Arc::new(zs_materializer::FileStore::new(
-            "/nonexistent",
-        ))),
+        zs_materializer::StoreRegistry::new(Arc::new(zs_materializer::FileStore::new(store))),
         Arc::new(NoExchange),
     ))
 }
@@ -276,4 +294,201 @@ async fn a_revoked_grant_keeps_its_reason_through_materialize() {
         .err()
         .expect("a revoked grant must deny");
     assert!(denied.audit_reason().contains("revoked"), "{denied}");
+}
+
+struct Proxied {
+    addr: std::net::SocketAddr,
+    ca_pem: String,
+    handler: Arc<AgentHandler>,
+    journal: std::path::PathBuf,
+    seen: Arc<std::sync::Mutex<ws_fake::Seen>>,
+    _home: tempfile::TempDir,
+}
+
+async fn proxy_to_websocket_upstream(grant_id: &str) -> Proxied {
+    let seen = Arc::new(std::sync::Mutex::new(ws_fake::Seen::default()));
+    let port = ws_fake::spawn_ws_upstream(ws_fake::Reply::Ok, seen.clone()).await;
+    let mut binding = bearer_binding();
+    binding.upstream_host = Some("127.0.0.1".into());
+    binding.upstream_port = Some(port);
+    binding.upstream_plaintext = !binding.is_http();
+    let connection = binding.connection().unwrap();
+    let key = ControlSigningKey::generate("control-k1");
+    let signed = key
+        .sign(Grant {
+            upstream_host: connection.upstream_host,
+            upstream_port: connection.upstream_port,
+            upstream_tls: connection.upstream_tls,
+            local_endpoint: connection.local_endpoint,
+            ..grant_with_id(grant_id)
+        })
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join("creds");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("stripe-prod"),
+        "sk_test_zsv_revocation_value_5d3a",
+    )
+    .unwrap();
+    let handler = Arc::new(agent_in(binding, signed, &key, &store));
+    let ca = Arc::new(zs_mitm::LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap());
+    let ca_pem = ca.certificate_pem();
+    let journal = home.path().join("audit.jsonl");
+    let proxy = zs_mitm::ProxyServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        ca,
+        handler.clone(),
+        Arc::new(zs_audit::Journal::open(&journal).unwrap()),
+    )
+    .await
+    .unwrap();
+    let addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move { proxy.serve().await });
+    Proxied {
+        addr,
+        ca_pem,
+        handler,
+        journal,
+        seen,
+        _home: home,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revocation_ends_an_open_header_scheme_websocket() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let proxied = proxy_to_websocket_upstream("g-websocket").await;
+    let mut tls = common::open_tunnel(&proxied.addr.to_string(), &proxied.ca_pem, HOST, 443)
+        .await
+        .unwrap();
+    tls.write_all(b"GET /v1 HTTP/1.1\r\nHost: api.stripe.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        .await
+        .unwrap();
+    let head = ws_fake::read_head(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    let upgrade = proxied.seen.lock().unwrap().head.to_ascii_lowercase();
+    assert!(
+        upgrade.contains("authorization: bearer "),
+        "positive control: the upgrade carries the injected header"
+    );
+    let ping = ws_fake::frame(1, br#"{"op":"ping"}"#, Some([7, 1, 9, 3]));
+    for _ in 0..2 {
+        tls.write_all(&ping).await.unwrap();
+        assert_eq!(
+            ws_fake::read_frame(&mut tls)
+                .await
+                .map(|(opcode, _)| opcode),
+            Some(1),
+            "positive control: a message is relayed before the revocation"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(proxied.seen.lock().unwrap().messages, 2);
+
+    let revoked_at = std::time::Instant::now();
+    proxied
+        .handler
+        .apply_revocations(&["g-websocket".to_string()]);
+    let close = loop {
+        assert!(
+            revoked_at.elapsed() < Duration::from_secs(7),
+            "the session stayed open 7 s after revocation"
+        );
+        let _ = tls.write_all(&ping).await;
+        match ws_fake::read_frame(&mut tls).await {
+            Some((8, payload)) => break payload,
+            Some(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            None => panic!("the session ended without a Close frame"),
+        }
+    };
+    assert_eq!(close, 1008u16.to_be_bytes(), "the Close code is 1008");
+    let revoked = || {
+        std::fs::read_to_string(&proxied.journal)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|record| {
+                record["operation"] == "websocket message"
+                    && record["decision"] == "deny"
+                    && record["reason"] == "websocket revoked"
+            })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !revoked() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        revoked(),
+        "{}",
+        std::fs::read_to_string(&proxied.journal).unwrap_or_default()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn slow_renewals_do_not_delay_revocation() {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+
+    use matrix_support::{FakeControl, FakeGrant};
+
+    let control = FakeControl::start();
+    control.answer(FakeGrant::ShortThenHang);
+    let home = control.token_home();
+    let mut agent = home.spawn_child(&["sleep", "30"], &[("ZS_REFRESH_SECONDS", "1")]);
+    let stdout = agent.stdout.take().unwrap();
+    let (sender, lines) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = sender.send(line);
+        }
+    });
+    let mut seen: Vec<String> = Vec::new();
+    let wait = |lines: &std::sync::mpsc::Receiver<String>,
+                seen: &mut Vec<String>,
+                limit: Duration,
+                until: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
+                seen.push(line.clone());
+                if until(&line) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    assert!(
+        wait(&lines, &mut seen, Duration::from_secs(15), &|line| {
+            line.starts_with("zs: proxy ")
+        }),
+        "the agent did not start: {seen:?}"
+    );
+    let renewed = Instant::now() + Duration::from_secs(15);
+    while control.grant_calls() < 2 && Instant::now() < renewed {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        control.grant_calls() >= 2,
+        "positive control: the agent asked for a renewal, which the control plane hangs"
+    );
+
+    control.revoke("g-fake");
+    let applied = wait(&lines, &mut seen, Duration::from_secs(5), &|line| {
+        line.contains("revoked grant")
+    });
+    let _ = agent.kill();
+    let _ = agent.wait();
+    drop(reader);
+    assert!(
+        applied,
+        "the revocation list did not arrive within 5 s while a renewal hung: {seen:?}"
+    );
 }

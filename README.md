@@ -94,7 +94,7 @@ ZeroSecret provides commands for developers and AI coding agents to scaffold pol
 
 ```bash
 zs schema               # View JSON Schema for zs-policy.json
-zs init                 # Scan .env, create 0600 backup, and scaffold zs-policy.json
+zs init                 # Scan .env, back it up to ~/.zs-backups/<project>/ (0600), and scaffold zs-policy.json
 zs agent-instructions   # Print system prompt for AI coding agents
 ```
 
@@ -178,7 +178,7 @@ Run `zs agent-instructions` and follow the protocol to integrate ZeroSecret into
 |---|---|
 | `zs agent-instructions` | Prints the zero-credential integration protocol for AI coding agents |
 | `zs schema` | Outputs the Draft 2020-12 JSON Schema for `zs-policy.json` |
-| `zs init [--dry-run]` | Scans `.env`, writes a timestamped backup (`0600`), updates `.gitignore`, scaffolds `zs-policy.json`, and replaces the secrets it brokers with placeholders. Other secrets stay in `.env` and are listed by key name as "not brokered". A second run on a sanitized file is refused; restore the backup first |
+| `zs init [--dry-run]` | Scans `.env`, writes a timestamped backup to `~/.zs-backups/<project>/` (directory `0700`, file `0600`, outside the repository), updates `.gitignore`, scaffolds `zs-policy.json`, and replaces the secrets it brokers with placeholders. Other secrets stay in `.env` and are listed by key name as "not brokered". `--dry-run` prints unbrokered values as `<withheld>`. A second run on a sanitized file is refused; restore the backup first |
 | `zs doctor --json` | Outputs policy validation as JSON; a policy error is in `diagnostics` and exits 1 |
 | `zs status --json` | Outputs session and device enrolment as JSON; exits 1 when signed out |
 | `zs version` | Prints the build version, the commit, the UTC build time and the target triple; `zs --version` prints the same line |
@@ -438,7 +438,13 @@ devices.
 
 `ZS_CONTROL_ADMINS` sets the first admins. It is a comma-separated list of subjects, for example
 `ZS_CONTROL_ADMINS=ana@example.com,ben@example.com`. The subject is the `email` claim of the
-sign-in, or `sub` when there is no `email`. The match is exact, case included.
+sign-in when the ID token also carries `email_verified: true`, and `sub` otherwise. The match is
+exact, case included.
+
+An IdP that does not send `email_verified` always signs in by `sub`. Microsoft Entra ID is one: it
+omits the claim by default, so a user there is identified by their `sub` value, and
+`ZS_CONTROL_ADMINS` must list `sub` values, not email addresses. Keycloak sets the claim from the
+user's `emailVerified` flag; mark the demo-style users verified.
 
 - At startup, `control` makes each listed subject an `admin` of the dashboard organization. When
   the variable lists at least one subject, `control` also prints

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use fake::{CLIENT_CAPS, Flow, PASSWORD, Script, WRONG};
 use zs_proto_mysql::packet;
-use zs_proto_mysql::{CHANGE_USER_REFUSED, UPSTREAM_AUTH_FAILED};
+use zs_proto_mysql::{CHANGE_USER_REFUSED, UPSTREAM_AUTH_FAILED, USER_REFUSED};
 
 const RESOURCE: &str = "orders-mysql";
 
@@ -194,9 +194,11 @@ fn mysql_binding_fields_are_checked_at_config_load() {
     };
 
     let valid = load(&format!(
-        r#"{{"resource":"a","host":"db","protocol":"mysql","upstream_ca":{ca}}},{{"resource":"b","host":"db","protocol":"mysql","upstream_cert_sha256":"{pin}"}},{{"resource":"c","host":"db","protocol":"mysql"}},{{"resource":"d","host":"db","protocol":"mysql","client_auth_plugin":"mysql_native_password"}}"#
+        r#"{{"resource":"a","host":"db","protocol":"mysql","upstream_ca":{ca}}},{{"resource":"b","host":"db","protocol":"mysql","upstream_cert_sha256":"{pin}"}},{{"resource":"c","host":"db","protocol":"mysql"}},{{"resource":"d","host":"db","protocol":"mysql","client_auth_plugin":"mysql_native_password"}},{{"resource":"e","host":"db","protocol":"mysql","user":"app"}},{{"resource":"f","host":"db","protocol":"postgres","user":"app"}}"#
     ))
     .expect("positive control: valid mysql bindings load");
+    assert_eq!(valid.bindings[4].user.as_deref(), Some("app"));
+    assert_eq!(valid.bindings[5].user.as_deref(), Some("app"));
     assert_eq!(valid.bindings[2].upstream(), ("db".to_string(), 3306));
     assert_eq!(valid.bindings[2].operations(), vec!["connect".to_string()]);
     assert_eq!(valid.bindings[2].env_prefix(), "ZS_C");
@@ -220,6 +222,11 @@ fn mysql_binding_fields_are_checked_at_config_load() {
         r#"{"resource":"a","host":"db","protocol":"mysql","auth":{"scheme":"basic"}}"#.to_string(),
         r#"{"resource":"a","host":"db","protocol":"mysql","paths":["/x"]}"#.to_string(),
         r#"{"resource":"a","host":"db","protocol":"mysql","client_auth_plugin":"sha256_password"}"#.to_string(),
+        r#"{"resource":"a","host":"db","protocol":"mysql","user":""}"#.to_string(),
+        r#"{"resource":"a","host":"db","protocol":"postgres","user":""}"#.to_string(),
+        r#"{"resource":"a","host":"db","protocol":"mysql","user":"app","auth_source":"admin"}"#.to_string(),
+        r#"{"resource":"a","host":"db","protocol":"postgres","auth_source":"admin"}"#.to_string(),
+        r#"{"resource":"a","host":"api.stripe.com","user":"app"}"#.to_string(),
         r#"{"resource":"a","host":"db","protocol":"postgres","client_auth_plugin":"mysql_native_password"}"#.to_string(),
         r#"{"resource":"orders-db","host":"db","protocol":"mysql"},{"resource":"orders.db","host":"db","protocol":"postgres"}"#
             .to_string(),
@@ -441,6 +448,52 @@ async fn a_mysql_client_reaches_the_server_through_zs_run_and_each_step_is_recor
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_port_scan_writes_no_allow() {
+    let upstream = fake::start(Script::new(packet::NATIVE_PASSWORD, Flow::Accept)).await;
+    let dir = common::TestHome::new(".zs-ca");
+    let setup = write_setup(
+        dir.path(),
+        &[(RESOURCE, "mysql", upstream.addr.port())],
+        PASSWORD,
+    );
+    let agent = spawn(&setup);
+
+    for _ in 0..3 {
+        drop(
+            tokio::net::TcpStream::connect(listener(&agent))
+                .await
+                .unwrap(),
+        );
+    }
+    let session = fake::login(listener(&agent), CLIENT_CAPS).await;
+    assert_eq!(
+        session.reply.payload.first(),
+        Some(&packet::OK_HEADER),
+        "positive control"
+    );
+    drop(session);
+    for _ in 0..100 {
+        if diag_text(dir.path()).matches("\"conn_closed\"").count() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let diag = diag_text(dir.path());
+    assert_eq!(diag.matches("\"conn_closed\"").count(), 4, "{diag}");
+    stop(agent);
+
+    let audit = std::fs::read_to_string(&setup.audit).unwrap();
+    let allowed = audit
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| {
+            r["resource"] == RESOURCE && r["operation"] == "connect" && r["decision"] == "allow"
+        })
+        .count();
+    assert_eq!(allowed, 1, "{audit}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_brokered_password_fails_upstream_auth_and_relays_nothing() {
     let upstream = fake::start(Script::new(packet::NATIVE_PASSWORD, Flow::Accept)).await;
     let dir = common::TestHome::new(".zs-ca");
@@ -469,4 +522,79 @@ async fn a_wrong_brokered_password_fails_upstream_auth_and_relays_nothing() {
         "positive control: the credential exists"
     );
     assert!(!diag.contains(WRONG));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshake_user_other_than_the_bound_user_is_refused() {
+    const INTRUDER: &[u8] = b"zs_intruder_role";
+    let upstream = fake::start(Script::new(packet::NATIVE_PASSWORD, Flow::Accept)).await;
+    let port = upstream.addr.port();
+    let dir = common::TestHome::new(".zs-ca");
+    let setup = write_setup(dir.path(), &[(RESOURCE, "mysql", port)], PASSWORD);
+    let policy = std::fs::read_to_string(&setup.policy).unwrap();
+    let from = format!(r#""upstream_port":{port}}}"#);
+    assert!(policy.contains(&from), "{policy}");
+    std::fs::write(
+        &setup.policy,
+        policy.replacen(
+            &from,
+            &format!(r#""upstream_port":{port},"user":"app"}}"#),
+            1,
+        ),
+    )
+    .unwrap();
+    let agent = spawn(&setup);
+
+    let refused = fake::login_as(listener(&agent), CLIENT_CAPS, INTRUDER, Some(b"appdb")).await;
+    assert_eq!(refused.reply.payload, USER_REFUSED.packet());
+    let error = packet::ServerError::parse(&refused.reply.payload).unwrap();
+    assert_eq!(
+        (error.code, error.sqlstate.as_deref()),
+        (1045, Some("28000"))
+    );
+    assert!(
+        !refused
+            .reply
+            .payload
+            .windows(INTRUDER.len())
+            .any(|w| w == INTRUDER)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        upstream.seen(|s| s.responses),
+        0,
+        "the handshake response reached the server"
+    );
+
+    let session = fake::login_as(listener(&agent), CLIENT_CAPS, b"app", Some(b"appdb")).await;
+    assert_eq!(
+        session.reply.payload.first(),
+        Some(&packet::OK_HEADER),
+        "positive control: the bound user logs in"
+    );
+    assert_eq!(upstream.seen(|s| s.responses), 1);
+    assert_eq!(upstream.seen(|s| s.user.clone()), b"app".to_vec());
+    assert!(upstream.seen(|s| s.authenticated));
+    drop(session);
+
+    stop(agent);
+    let audit = std::fs::read_to_string(&setup.audit).unwrap();
+    let count = |decision: &str, reason: Option<&str>| {
+        audit
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|r| {
+                r["resource"] == RESOURCE
+                    && r["protocol"] == "mysql"
+                    && r["operation"] == "connect"
+                    && r["decision"] == decision
+                    && r.get("reason").and_then(|v| v.as_str()) == reason
+            })
+            .count()
+    };
+    assert_eq!(count("deny", Some("user mismatch")), 1, "{audit}");
+    assert_eq!(count("allow", None), 1, "{audit}");
+    let intruder = String::from_utf8_lossy(INTRUDER);
+    assert!(!audit.contains(intruder.as_ref()), "{audit}");
+    assert!(!diag_text(dir.path()).contains(intruder.as_ref()));
 }

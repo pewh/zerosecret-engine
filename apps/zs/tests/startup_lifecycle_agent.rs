@@ -394,6 +394,148 @@ fn the_child_receives_every_proxy_ca_and_postgres_variable() {
     assert!(!stdout.contains("PGPASSWORD="));
 }
 
+#[cfg(unix)]
+struct LiveAgent {
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+}
+
+#[cfg(unix)]
+impl LiveAgent {
+    fn new(ws: &Workspace, child: &[String]) -> Self {
+        let home = ws.path();
+        let mut command = Command::new(common::bin_path());
+        command
+            .args([
+                "run",
+                "--policy",
+                &home.join("zs-policy.json").display().to_string(),
+                "--credentials-dir",
+                &home.join(".zs-credentials").display().to_string(),
+                "--audit",
+                &home.join("audit.jsonl").display().to_string(),
+                "--ca-dir",
+                &home.join(".zs-ca").display().to_string(),
+                "--",
+            ])
+            .args(child)
+            .env("ZS_HOME", home)
+            .env("USER", "alice")
+            .current_dir(home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("zs must run");
+        let stdout = child.stdout.take().expect("zs stdout is piped");
+        let stderr = child.stderr.take().expect("zs stderr is piped");
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn pid(&self) -> i32 {
+        i32::try_from(self.child.id()).expect("the child pid fits in i32")
+    }
+
+    fn signal(&self, signal: i32) {
+        // SAFETY: `pid` is the live child this process spawned and has not reaped.
+        let pid = self.pid();
+        unsafe { libc::kill(pid, signal) };
+    }
+
+    fn wait_ready(&mut self, path: &Path) {
+        for _ in 0..300 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the child never reached {}", path.display());
+    }
+
+    fn wait_code(&mut self) -> Option<i32> {
+        self.child.wait().expect("zs must exit").code()
+    }
+
+    fn output_text(&mut self) -> String {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut self.stdout, &mut text).expect("zs stdout must read");
+        std::io::Read::read_to_string(&mut self.stderr, &mut text).expect("zs stderr must read");
+        text
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_to_zs_reaches_the_child_and_zs_exits_with_its_code() {
+    let ws = Workspace::new();
+    let ready = ws.path().join("child-ready");
+    let marker = ws.path().join("child-term");
+    let script = format!(
+        "trap 'echo got-term > \"{}\"; exit 7' TERM; touch \"{}\"; i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
+        marker.display(),
+        ready.display()
+    );
+    let mut agent = LiveAgent::new(&ws, &["/bin/sh".to_string(), "-c".to_string(), script]);
+    agent.wait_ready(&ready);
+    agent.signal(libc::SIGTERM);
+
+    let code = agent.wait_code();
+    let output = agent.output_text();
+    assert_eq!(code, Some(7), "output:\n{output}");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "got-term",
+        "output:\n{output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_to_zs_reaches_the_child_and_zs_exits_with_its_code() {
+    let ws = Workspace::new();
+    let ready = ws.path().join("child-ready");
+    let marker = ws.path().join("child-hup");
+    let script = format!(
+        "trap 'echo got-hup > \"{}\"; exit 9' HUP; touch \"{}\"; i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
+        marker.display(),
+        ready.display()
+    );
+    let mut agent = LiveAgent::new(&ws, &["/bin/sh".to_string(), "-c".to_string(), script]);
+    agent.wait_ready(&ready);
+    agent.signal(libc::SIGHUP);
+
+    let code = agent.wait_code();
+    let output = agent.output_text();
+    assert_eq!(code, Some(9), "output:\n{output}");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "got-hup",
+        "output:\n{output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_does_not_kill_zs_before_the_child_exits() {
+    let ws = Workspace::new();
+    let ready = ws.path().join("child-ready");
+    let script = format!(
+        "trap '' INT; touch \"{}\"; sleep 0.5; exit 3",
+        ready.display()
+    );
+    let mut agent = LiveAgent::new(&ws, &["/bin/sh".to_string(), "-c".to_string(), script]);
+    agent.wait_ready(&ready);
+    agent.signal(libc::SIGINT);
+
+    let code = agent.wait_code();
+    let output = agent.output_text();
+    assert_eq!(code, Some(3), "output:\n{output}");
+    assert!(output.contains("zs: child-pid"), "output:\n{output}");
+}
+
 #[test]
 fn a_closed_stdout_does_not_stop_the_agent() {
     let ws = Workspace::new();

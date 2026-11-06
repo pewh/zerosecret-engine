@@ -3,7 +3,7 @@ mod sts;
 mod xml;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
@@ -27,7 +27,7 @@ struct CachedSession {
 
 pub struct SsmStore {
     http: reqwest::Client,
-    sessions: Mutex<HashMap<(String, String), CachedSession>>,
+    sessions: Arc<Mutex<HashMap<(String, String), CachedSession>>>,
 }
 
 fn transport(step: &'static str, error: &reqwest::Error) -> MaterializationError {
@@ -55,7 +55,7 @@ impl SsmStore {
         .map_err(|_| MaterializationError::NoStore(SourceKind::AwsSsm))?;
         Ok(Self {
             http,
-            sessions: Mutex::default(),
+            sessions: Arc::default(),
         })
     }
 
@@ -95,6 +95,24 @@ impl SsmStore {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(key);
         }
+    }
+
+    // The STS session can outlive its grant by 900 s. A timer tied to the grant drops it
+    // without waiting for the next retrieve.
+    fn schedule_drop(&self, key: &(String, String), grant_expires_at_ms: u64, now_ms: u64) {
+        let sessions = Arc::downgrade(&self.sessions);
+        let key = key.clone();
+        let lifetime = Duration::from_millis(grant_expires_at_ms.saturating_sub(now_ms));
+        tokio::spawn(async move {
+            tokio::time::sleep(lifetime).await;
+            let Some(sessions) = sessions.upgrade() else {
+                return;
+            };
+            if let Ok(mut sessions) = sessions.lock() {
+                sessions
+                    .retain(|k, s| !(k == &key && s.grant_expires_at_ms <= grant_expires_at_ms));
+            }
+        });
     }
 
     async fn assume_role(
@@ -186,6 +204,7 @@ impl CredentialStore for SsmStore {
         let key = (grant.resource.clone(), source.role_arn.as_str().to_string());
         let mut refreshed = false;
         loop {
+            let mut drop_at = None;
             let session = match self.cached_session(&key, source, cx.now_ms) {
                 Some(session) => session,
                 None => {
@@ -200,14 +219,20 @@ impl CredentialStore for SsmStore {
                                 creds: session.clone(),
                             },
                         );
+                        drop_at = Some(grant.expires_at_ms);
                     }
                     session
                 }
             };
             if let Ok(mut sessions) = self.sessions.lock()
                 && let Some(cached) = sessions.get_mut(&key)
+                && cached.grant_expires_at_ms != grant.expires_at_ms
             {
                 cached.grant_expires_at_ms = grant.expires_at_ms;
+                drop_at = Some(grant.expires_at_ms);
+            }
+            if let Some(expires_at_ms) = drop_at {
+                self.schedule_drop(&key, expires_at_ms, cx.now_ms);
             }
             match self.get_parameter(source, &session, cx.now_ms).await {
                 Ok(value) => return Ok(value),

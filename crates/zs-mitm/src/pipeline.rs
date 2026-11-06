@@ -17,6 +17,9 @@ use crate::http1::{self, Body, Sender};
 use crate::proxy::{FlowHandler, ProxyError, Upstream, connect_upstream, outbound};
 use crate::scope::{PathScope, Refusal, ScopeDecision, target_refusal};
 
+// Matches the request timeout of the common LLM API clients, whose answers can take minutes.
+pub(crate) const RESPONSE_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub(crate) type Reply = Box<Response<Body>>;
 pub(crate) type Injected = Option<(Arc<dyn Protocol>, Credential)>;
 
@@ -329,7 +332,13 @@ async fn send(pending: Pending) -> Response<Body> {
             attempt += 1;
             continue;
         }
-        match sender.try_send_request(request).await {
+        let Ok(sent) =
+            tokio::time::timeout(RESPONSE_HEAD_TIMEOUT, sender.try_send_request(request)).await
+        else {
+            pending.report.failed(&pending.facts, "relay", "timed_out");
+            return http1::reply(http1::Reply::UpstreamUnreachable);
+        };
+        match sent {
             Ok(response) => break (response, sender),
             Err(mut error) => {
                 let unwritten = error.take_message().is_some();
@@ -741,6 +750,40 @@ mod tests {
             "Forward must not answer a denied request"
         );
         assert_eq!(materialized.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_upstream_answers_unreachable_after_the_head_timeout() {
+        let (io, mut upstream) = tokio::io::duplex(1 << 16);
+        let sender = http1::client(io, false).await.unwrap();
+        let pending = Pending {
+            facts: facts(),
+            request: request(),
+            extensions: hyper::http::Extensions::new(),
+            authority: "h".into(),
+            route: Route::Tunnel {
+                senders: Arc::new(tokio::sync::Mutex::new(Some(sender))),
+                upstream: crate::proxy::Upstream {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    tls: false,
+                },
+            },
+            report: Arc::new(Recorder::default()),
+            skip_inject: true,
+            echo: None,
+        };
+        let started = tokio::time::Instant::now();
+        let reply = tokio::time::timeout(RESPONSE_HEAD_TIMEOUT * 2, send(pending))
+            .await
+            .expect("a silent upstream must not hold the request open");
+        assert!(started.elapsed() >= RESPONSE_HEAD_TIMEOUT);
+        assert_eq!(reply.status(), hyper::StatusCode::BAD_GATEWAY);
+        let mut written = vec![0u8; 3];
+        tokio::io::AsyncReadExt::read_exact(&mut upstream, &mut written)
+            .await
+            .unwrap();
+        assert_eq!(written, b"GET", "the request reached the upstream");
     }
 
     #[test]

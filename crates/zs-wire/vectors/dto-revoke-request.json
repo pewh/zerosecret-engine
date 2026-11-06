@@ -1,5 +1,5 @@
 {
-  "about": "RevokeRequest (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "about": "RevokeRequest (spec 5.3): one accepted text with a null optional reason, an unknown field, a wrong-case key, a duplicate key",
   "version": 1,
   "frozen": false,
   "context": {},

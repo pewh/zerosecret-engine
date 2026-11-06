@@ -26,6 +26,7 @@ pub use zs_protocol::Materialize;
 pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
 
 pub const CHANGE_USER_REFUSED_REASON: &str = "client COM_CHANGE_USER is refused";
+pub const USER_MISMATCH_REASON: &str = "user mismatch";
 
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 const MAX_AUTH_ROUNDS: usize = 3;
@@ -82,6 +83,11 @@ pub const CHANGE_USER_REFUSED: Reply = Reply {
     sqlstate: "42000",
     message: "ZeroSecret refused COM_CHANGE_USER",
 };
+pub const USER_REFUSED: Reply = Reply {
+    code: 1045,
+    sqlstate: "28000",
+    message: "ZeroSecret refused the database user",
+};
 pub const UPSTREAM_REFUSED: &str = "ZeroSecret upstream refused the connection";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +130,7 @@ struct Shared {
     tls_pinned: bool,
     materialize: Materialize,
     audit_refusal: AuditRefusal,
+    expected_user: Option<Arc<[u8]>>,
     diag: DiagLog,
     resource: String,
     client_auth: ClientAuth,
@@ -147,6 +154,7 @@ impl MysqlListener {
                 tls_pinned: tls.pinned(),
                 materialize,
                 audit_refusal: Arc::new(|_: &'static str, _: &'static str| None::<u64>),
+                expected_user: None,
                 diag: DiagLog::disabled(),
                 resource: String::new(),
                 client_auth: ClientAuth::default(),
@@ -168,6 +176,11 @@ impl MysqlListener {
 
     pub fn with_refusal_audit(mut self, audit: AuditRefusal) -> Self {
         self.shared.audit_refusal = audit;
+        self
+    }
+
+    pub fn with_expected_user(mut self, user: Option<String>) -> Self {
+        self.shared.expected_user = user.map(|user| Arc::from(user.into_bytes()));
         self
     }
 
@@ -265,9 +278,8 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
 }
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, Stopped> {
-    let password = materialize(client, conn).await?;
     let (tcp, greeting) = open_upstream(client, conn).await?;
-    let Some((plugin, auth_data)) = first_answer(&greeting, &password) else {
+    if greeting.scramble.len() != SCRAMBLE_LEN {
         return Err(conn
             .fail(
                 client,
@@ -276,9 +288,25 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, S
                 &UPSTREAM_UNAVAILABLE,
             )
             .await);
-    };
+    }
     let offered = greeting.capabilities & !STRIPPED_CAPABILITIES;
     let response = greet_client(client, conn, &greeting, offered).await?;
+    if let Some(expected) = &conn.shared.expected_user
+        && response.user != **expected
+    {
+        let mut event = conn
+            .event("client_refused")
+            .warn()
+            .code("reason", "user_mismatch");
+        if let Some(seq) = (conn.shared.audit_refusal)("connect", USER_MISMATCH_REASON) {
+            event = event.audit_seq(seq);
+        }
+        conn.emit(event);
+        conn.refuse(client, &USER_REFUSED).await;
+        return Err(Stopped("refused"));
+    }
+    let password = materialize(client, conn).await?;
+    let (plugin, auth_data) = first_answer(&greeting, &password);
     let tls = greeting.capabilities & CLIENT_SSL != 0;
     let mut flags = (response.capabilities & offered) | REQUIRED_SERVER_CAPABILITIES;
     if tls {
@@ -409,23 +437,17 @@ async fn open_upstream(
     Ok((tcp, greeting))
 }
 
-fn first_answer(
-    greeting: &Greeting,
-    password: &[u8],
-) -> Option<(&'static [u8], Zeroizing<Vec<u8>>)> {
-    if greeting.scramble.len() != SCRAMBLE_LEN {
-        return None;
-    }
+fn first_answer(greeting: &Greeting, password: &[u8]) -> (&'static [u8], Zeroizing<Vec<u8>>) {
     if greeting.plugin == CACHING_SHA2_PASSWORD {
-        Some((
+        (
             CACHING_SHA2_PASSWORD,
             Zeroizing::new(scramble::caching_sha2(password, &greeting.scramble)),
-        ))
+        )
     } else {
-        Some((
+        (
             NATIVE_PASSWORD,
             Zeroizing::new(scramble::native(password, &greeting.scramble)),
-        ))
+        )
     }
 }
 

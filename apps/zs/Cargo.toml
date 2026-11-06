@@ -53,3 +53,6 @@ zs-test-keychain.workspace = true
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

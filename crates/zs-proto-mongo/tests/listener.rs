@@ -825,8 +825,8 @@ async fn diag_records_each_step_and_never_the_password_user_or_host() {
         names,
         [
             "conn_accepted",
-            "materialized",
             "client_hello",
+            "materialized",
             "upstream_connected",
             "tls",
             "discovery",

@@ -13,7 +13,7 @@ Procedure:
 3. Preview:
    Run `zs init --dry-run`. Review the generated bindings and every key listed as not brokered.
 4. Scaffold:
-   Run `zs init` to write `zs-policy.json`, back up `.env` with 0600 permissions, and replace brokered secrets with placeholders.
+   Run `zs init` to write `zs-policy.json`, back up `.env` to `~/.zs-backups/<project>/` with 0600 permissions, and replace brokered secrets with placeholders.
    For each key listed as not brokered, ask the developer how to handle it. Do not copy its value anywhere.
 5. Wrap startup commands:
    Prefix application run scripts (package.json, Makefile, Dockerfile) with `zs run -- <command>`.

@@ -1296,10 +1296,16 @@ impl Drop for Tripwire {
 
 // The current UTC time as an AWS `X-Amz-Date` (YYYYMMDDTHHMMSSZ).
 pub fn amz_now() -> String {
+    amz_after(0)
+}
+
+// The UTC time `offset_secs` from now as an AWS `X-Amz-Date`.
+pub fn amz_after(offset_secs: i64) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_secs() as i64
+        + offset_secs;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

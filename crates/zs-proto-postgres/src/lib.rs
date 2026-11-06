@@ -30,45 +30,54 @@ pub enum PostgresError {
 
 pub type Result<T> = std::result::Result<T, PostgresError>;
 
-pub fn parse_startup(payload: &[u8]) -> Result<(String, String)> {
+fn startup_parameters(payload: &[u8]) -> Result<Vec<(&[u8], &[u8])>> {
     let len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if len < 8 || len > payload.len() {
         return Err(PostgresError::BadStartup);
     }
-    let body = &payload[8..len];
-    let parts: Vec<&[u8]> = body.split(|b| *b == 0).collect();
+    let parts: Vec<&[u8]> = payload[8..len].split(|b| *b == 0).collect();
+    Ok(parts
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[key, value]| (*key, *value))
+        .collect())
+}
+
+pub fn parse_startup(payload: &[u8]) -> Result<(String, String)> {
     let mut user = String::new();
     let mut database = String::new();
-    let mut i = 0;
-    while i + 1 < parts.len() {
-        let key = String::from_utf8_lossy(parts[i]);
-        let value = String::from_utf8_lossy(parts[i + 1]);
-        match key.as_ref() {
-            "user" => user = value.into_owned(),
-            "database" => database = value.into_owned(),
+    for (key, value) in startup_parameters(payload)? {
+        let value = String::from_utf8_lossy(value).into_owned();
+        match key {
+            b"user" => user = value,
+            b"database" => database = value,
             _ => {}
         }
-        i += 2;
     }
     Ok((user, database))
 }
 
-pub fn cleartext_password_request() -> Vec<u8> {
-    let mut message = b"R".to_vec();
-    message.extend_from_slice(&8u32.to_be_bytes());
-    message.extend_from_slice(&3u32.to_be_bytes());
-    message
-}
+pub const USER_MISMATCH_REASON: &str = "user mismatch";
+pub const REPLICATION_REFUSED_REASON: &str = "replication refused";
 
-pub fn read_password_message(payload: &[u8]) -> Result<String> {
-    if payload.len() < 8 || payload[0] != b'p' {
-        return Err(PostgresError::BadFraming);
+fn startup_refusal(payload: &[u8], expected_user: Option<&str>) -> Result<Option<&'static str>> {
+    let parameters = startup_parameters(payload)?;
+    if parameters
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case(b"replication"))
+    {
+        return Ok(Some(REPLICATION_REFUSED_REASON));
     }
-    let len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-    let body = &payload[8..len.min(payload.len())];
-    Ok(String::from_utf8_lossy(body)
-        .trim_end_matches('\0')
-        .to_string())
+    let Some(expected) = expected_user else {
+        return Ok(None);
+    };
+    let mut users = parameters
+        .iter()
+        .filter(|(key, _)| *key == b"user")
+        .peekable();
+    let matches = users.peek().is_some() && users.all(|(_, user)| *user == expected.as_bytes());
+    Ok((!matches).then_some(USER_MISMATCH_REASON))
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -101,6 +110,7 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
     result
 }
 
+const MIN_SCRAM_ITERATIONS: u32 = 4096;
 const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 
 pub struct ScramExchange {
@@ -137,7 +147,7 @@ pub fn client_final_message(
     }
     let salt = salt.ok_or_else(|| PostgresError::Scram("no salt".into()))?;
     let iterations: u32 = iterations.ok_or_else(|| PostgresError::Scram("no iterations".into()))?;
-    if !(1..=MAX_SCRAM_ITERATIONS).contains(&iterations) {
+    if !(MIN_SCRAM_ITERATIONS..=MAX_SCRAM_ITERATIONS).contains(&iterations) {
         return Err(PostgresError::Scram("iteration count out of range".into()));
     }
     let server_nonce = server_nonce.ok_or_else(|| PostgresError::Scram("no nonce".into()))?;
@@ -465,7 +475,11 @@ mod tests {
         .await
         .unwrap();
         let local = listener.local_addr();
-        tokio::spawn(listener.serve_with(connect));
+        tokio::spawn(
+            listener
+                .with_cancel_authorize(Arc::new(|| Ok(())))
+                .serve_with(connect),
+        );
         local
     }
 
@@ -807,6 +821,54 @@ mod tests {
         assert_eq!(reply, error_frame("08006", "upstream unavailable"));
     }
 
+    fn startup_with(parameters: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = 196_608u32.to_be_bytes().to_vec();
+        for (key, value) in parameters {
+            body.extend_from_slice(key.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut packet = ((body.len() + 4) as u32).to_be_bytes().to_vec();
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    #[test]
+    fn startup_refusal_pins_the_parameter_edge_cases() {
+        let mismatched = |parameters: &[(&str, &str)]| {
+            startup_refusal(&startup_with(parameters), Some("app")).unwrap()
+        };
+        assert_eq!(
+            mismatched(&[("user", "app"), ("user", "postgres")]),
+            Some(USER_MISMATCH_REASON)
+        );
+        assert_eq!(
+            mismatched(&[("database", "appdb")]),
+            Some(USER_MISMATCH_REASON)
+        );
+        assert_eq!(mismatched(&[("USER", "app")]), Some(USER_MISMATCH_REASON));
+        assert_eq!(
+            startup_refusal(&startup_with(&[("REPLICATION", "database")]), None).unwrap(),
+            Some(REPLICATION_REFUSED_REASON)
+        );
+        assert_eq!(
+            startup_refusal(&startup_with(&[("Replication", "false")]), Some("app")).unwrap(),
+            Some(REPLICATION_REFUSED_REASON)
+        );
+        assert_eq!(
+            mismatched(&[("user", "app")]),
+            None,
+            "positive control: the bound user is accepted"
+        );
+        assert_eq!(
+            mismatched(&[("user", "app"), ("user", "app")]),
+            None,
+            "a repeated user with the same value is accepted"
+        );
+    }
+
     #[tokio::test]
     async fn oversized_startup_parameters_are_refused() {
         let live = fake_postgres(None, 1_200_000).await;
@@ -896,6 +958,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancel_without_an_authorizer_is_refused() {
+        let (connect, asked) = scripted(vec![vec![]]);
+        let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
+        let listener = PostgresListener::bind_endpoint(
+            "127.0.0.1:0",
+            endpoint,
+            SslPolicy::RefuseOnLoopback,
+            UpstreamTls::WhenOffered,
+            materialize_password(PASSWORD),
+        )
+        .await
+        .unwrap();
+        let local = listener.local_addr();
+        tokio::spawn(listener.serve_with(connect));
+
+        let mut client = TcpStream::connect(local).await.unwrap();
+        client
+            .write_all(&negotiation_request(CANCEL_REQUEST))
+            .await
+            .unwrap();
+        let mut written = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut written))
+            .await
+            .expect("a refused cancel must close the connection")
+            .unwrap();
+
+        assert!(written.is_empty());
+        assert_eq!(asked.lock().unwrap().len(), 0, "the upstream was contacted");
+    }
+
+    #[tokio::test]
     async fn a_silent_tls_answer_to_a_cancel_ends_within_the_budget() {
         let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
         let upstream = scripted_upstream(|mut stream| async move {
@@ -914,6 +1007,8 @@ mod tests {
             resource: "orders-db".to_string(),
             host: UNRESOLVABLE_HOST.to_string(),
             port: 5432,
+            cancel_authorize: Some(Arc::new(|| Ok(()))),
+            ..Trace::disabled()
         };
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = front.local_addr().unwrap();
@@ -1056,6 +1151,23 @@ mod tests {
         let server_first =
             "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001";
         assert!(client_final_message("pencil", server_first, client_first_bare).is_err());
+    }
+
+    #[test]
+    fn an_iteration_count_below_4096_is_refused() {
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let with = |i: u32| {
+            let server_first = format!(
+                "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={i}"
+            );
+            client_final_message("pencil", &server_first, client_first_bare)
+        };
+        for i in [1, 4095] {
+            assert!(
+                matches!(with(i), Err(PostgresError::Scram(m)) if m == "iteration count out of range")
+            );
+        }
+        assert!(with(4096).is_ok());
     }
 
     #[test]
@@ -1239,11 +1351,79 @@ mod tests {
         assert_eq!(failed["error"]["text"], "login blocked by policy");
         assert!(!log.contains("zsdiag_marker_42"), "{log}");
     }
+
+    const LARGE_BODY: usize = 1_500_000;
+
+    #[tokio::test]
+    async fn a_large_frontend_message_is_relayed_intact() {
+        let trace = Trace::disabled();
+        let (mut from_client, client) = tokio::io::duplex(64 * 1024);
+        let (upstream, mut relayed_to_upstream) = tokio::io::duplex(64 * 1024);
+        let counter = AtomicU64::new(0);
+
+        let mut query = b"Q".to_vec();
+        query.extend_from_slice(&(4 + 9u32).to_be_bytes());
+        query.extend_from_slice(b"SELECT 1\0");
+        let mut large = b"Q".to_vec();
+        large.extend_from_slice(&(4 + LARGE_BODY as u32).to_be_bytes());
+        large.extend(std::iter::repeat_n(b'q', LARGE_BODY));
+        let expected: Vec<u8> = query.iter().chain(large.iter()).copied().collect();
+
+        let write = async {
+            from_client.write_all(&query).await.unwrap();
+            from_client.write_all(&large).await.unwrap();
+            from_client.shutdown().await.unwrap();
+        };
+        let copy = copy_frontend(client, upstream, &counter, &trace);
+        let collect = async {
+            let mut received = Vec::new();
+            relayed_to_upstream
+                .read_to_end(&mut received)
+                .await
+                .unwrap();
+            received
+        };
+        let ((), copied, received) = tokio::join!(write, copy, collect);
+
+        assert_eq!(copied.unwrap(), expected.len() as u64);
+        assert_eq!(received.len(), expected.len());
+        assert!(
+            received.starts_with(&query),
+            "positive control: the normal query is relayed first"
+        );
+        assert_eq!(received, expected);
+        assert_eq!(counter.load(Ordering::Relaxed), expected.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_bad_frontend_length_ends_the_relay() {
+        let trace = Trace::disabled();
+        let (mut from_client, client) = tokio::io::duplex(1024);
+        let (upstream, mut relayed_to_upstream) = tokio::io::duplex(1024);
+        let counter = AtomicU64::new(0);
+        from_client.write_all(&[b'Q', 0, 0, 0, 3]).await.unwrap();
+
+        let error = copy_frontend(client, upstream, &counter, &trace)
+            .await
+            .expect_err("a length below the framing minimum must end the relay");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut received = Vec::new();
+        relayed_to_upstream
+            .read_to_end(&mut received)
+            .await
+            .unwrap();
+        assert!(
+            received.is_empty(),
+            "nothing is forwarded past a bad length"
+        );
+    }
 }
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1259,6 +1439,11 @@ pub enum SslPolicy {
 
 // A `Denied` must deny the connection, never relay it unauthenticated.
 pub use zs_protocol::Materialize;
+pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
+pub type CancelAuthorize =
+    Arc<dyn Fn() -> std::result::Result<(), zs_protocol::Denied> + Send + Sync>;
+
+const CANCEL_REFUSED_REASON: &str = "cancel without a grant";
 
 #[derive(Clone)]
 struct Trace {
@@ -1267,6 +1452,9 @@ struct Trace {
     resource: String,
     host: String,
     port: u16,
+    expected_user: Option<Arc<str>>,
+    audit_refusal: AuditRefusal,
+    cancel_authorize: Option<CancelAuthorize>,
 }
 
 impl Trace {
@@ -1277,6 +1465,33 @@ impl Trace {
             .dest(&self.host, self.port)
     }
 
+    fn refuse_startup(&self, reason: &'static str) -> Vec<u8> {
+        let (code, reply) = match reason {
+            REPLICATION_REFUSED_REASON => ("replication", REPLICATION_REFUSED),
+            _ => ("user_mismatch", USER_REFUSED),
+        };
+        let mut event = self.event("client_refused").warn().code("reason", code);
+        if let Some(seq) = (self.audit_refusal)("connect", reason) {
+            event = event.audit_seq(seq);
+        }
+        self.diag.emit(event);
+        error_frame(reply.0, reply.1)
+    }
+
+    fn cancel_authorized(&self) -> bool {
+        self.cancel_authorize
+            .as_ref()
+            .is_some_and(|authorize| authorize().is_ok())
+    }
+
+    fn refuse_cancel(&self) {
+        let mut event = self.event("client_refused").warn().code("reason", "cancel");
+        if let Some(seq) = (self.audit_refusal)("cancel", CANCEL_REFUSED_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.diag.emit(event);
+    }
+
     #[cfg(test)]
     fn disabled() -> Self {
         Self {
@@ -1285,8 +1500,15 @@ impl Trace {
             resource: String::new(),
             host: String::new(),
             port: 0,
+            expected_user: None,
+            audit_refusal: no_refusal_audit(),
+            cancel_authorize: None,
         }
     }
+}
+
+fn no_refusal_audit() -> AuditRefusal {
+    Arc::new(|_: &'static str, _: &'static str| None::<u64>)
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -1491,6 +1713,9 @@ pub struct PostgresListener {
     materialize: Materialize,
     diag: DiagLog,
     resource: String,
+    expected_user: Option<Arc<str>>,
+    audit_refusal: AuditRefusal,
+    cancel_authorize: Option<CancelAuthorize>,
 }
 
 impl PostgresListener {
@@ -1519,12 +1744,30 @@ impl PostgresListener {
             materialize,
             diag: DiagLog::disabled(),
             resource: String::new(),
+            expected_user: None,
+            audit_refusal: no_refusal_audit(),
+            cancel_authorize: None,
         })
     }
 
     pub fn with_diag(mut self, diag: DiagLog, resource: &str) -> Self {
         self.diag = diag;
         self.resource = resource.to_string();
+        self
+    }
+
+    pub fn with_expected_user(mut self, user: Option<String>) -> Self {
+        self.expected_user = user.map(Arc::from);
+        self
+    }
+
+    pub fn with_refusal_audit(mut self, audit: AuditRefusal) -> Self {
+        self.audit_refusal = audit;
+        self
+    }
+
+    pub fn with_cancel_authorize(mut self, authorize: CancelAuthorize) -> Self {
+        self.cancel_authorize = Some(authorize);
         self
     }
 
@@ -1556,6 +1799,9 @@ impl PostgresListener {
                 resource: self.resource.clone(),
                 host: self.upstream.endpoint.host().to_string(),
                 port: self.upstream.endpoint.port(),
+                expected_user: self.expected_user.clone(),
+                audit_refusal: self.audit_refusal.clone(),
+                cancel_authorize: self.cancel_authorize.clone(),
             };
             tokio::spawn(async move {
                 trace.diag.emit(trace.event("conn_accepted"));
@@ -1614,6 +1860,10 @@ where
     let startup = match startup {
         Startup::Session(payload) => payload,
         Startup::Cancel(request) => {
+            if !trace.cancel_authorized() {
+                trace.refuse_cancel();
+                return Ok(());
+            }
             let deadline = tokio::time::Instant::now() + budget;
             let tcp = connect(target.endpoint.clone())
                 .await
@@ -1627,9 +1877,13 @@ where
         }
         Startup::Closed => return Ok(()),
     };
-    let (_user, _database) = parse_startup(&startup)
+    let refusal = startup_refusal(&startup, trace.expected_user.as_deref())
         .map_err(std::io::Error::other)
         .map_err(at("startup"))?;
+    if let Some(reason) = refusal {
+        let _ = client.write_all(&trace.refuse_startup(reason)).await;
+        return Ok(());
+    }
 
     let credential = match materialize() {
         Ok(credential) => {
@@ -1797,7 +2051,7 @@ where
         .map_err(at("ready"))?;
 
     let started = std::time::Instant::now();
-    let relayed = relay(client, upstream).await;
+    let relayed = relay(client, upstream, trace).await;
     trace.diag.emit(
         trace
             .event("conn_closed")
@@ -1817,6 +2071,8 @@ const UPSTREAM_UNAVAILABLE: (&str, &str) = ("08006", "upstream unavailable");
 const UPSTREAM_REFUSED: &str = "upstream refused the connection";
 const UPSTREAM_AUTHENTICATION_FAILED: (&str, &str) = ("28000", "upstream authentication failed");
 const UPSTREAM_TLS_FAILED: (&str, &str) = ("08006", "upstream TLS failed");
+const USER_REFUSED: (&str, &str) = ("28000", "database user not allowed by the binding");
+const REPLICATION_REFUSED: (&str, &str) = ("28000", "replication connections are refused");
 
 async fn refuse(
     client: &mut TcpStream,
@@ -2067,25 +2323,41 @@ struct Relayed {
 
 type Copied = std::result::Result<std::io::Result<u64>, tokio::task::JoinError>;
 
-fn copied(joined: Copied) -> std::io::Result<u64> {
-    joined.unwrap_or_else(|joined| Err(std::io::Error::other(joined)))
+fn counted(joined: Copied, counter: &AtomicU64) -> std::io::Result<u64> {
+    match joined {
+        Ok(result) => result,
+        Err(joined) if joined.is_cancelled() => Ok(counter.load(Ordering::Relaxed)),
+        Err(joined) => Err(std::io::Error::other(joined)),
+    }
 }
 
-async fn relay(client: TcpStream, upstream: Box<dyn Io>) -> Relayed {
-    let (mut client_read, mut client_write) = client.into_split();
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+async fn relay(client: TcpStream, upstream: Box<dyn Io>, trace: &Trace) -> Relayed {
+    let (client_read, client_write) = client.into_split();
+    let (upstream_read, upstream_write) = tokio::io::split(upstream);
+    let up_bytes = Arc::new(AtomicU64::new(0));
+    let down_bytes = Arc::new(AtomicU64::new(0));
+    let (up_count, down_count) = (up_bytes.clone(), down_bytes.clone());
+    let frontend_trace = trace.clone();
     let mut to_upstream = tokio::spawn(async move {
-        let copied = tokio::io::copy(&mut client_read, &mut upstream_write).await;
-        let _ = upstream_write.shutdown().await;
-        copied
+        copy_frontend(client_read, upstream_write, &up_count, &frontend_trace).await
     });
     let mut to_client =
-        tokio::spawn(async move { tokio::io::copy(&mut upstream_read, &mut client_write).await });
-    let (closed_by, up, down) = tokio::select! {
-        up = &mut to_upstream => ("client", up, to_client.await),
-        down = &mut to_client => ("upstream", to_upstream.await, down),
+        tokio::spawn(async move { copy_backend(upstream_read, client_write, &down_count).await });
+    let first = tokio::select! {
+        up = &mut to_upstream => First::Up(up),
+        down = &mut to_client => First::Down(down),
     };
-    let (up, down) = (copied(up), copied(down));
+    let (closed_by, up, down) = match first {
+        First::Up(up) => {
+            to_client.abort();
+            ("client", up, to_client.await)
+        }
+        First::Down(down) => {
+            to_upstream.abort();
+            ("upstream", to_upstream.await, down)
+        }
+    };
+    let (up, down) = (counted(up, &up_bytes), counted(down, &down_bytes));
     let bytes = |copied: &std::io::Result<u64>| copied.as_ref().map_or(0, |n| *n);
     Relayed {
         up: bytes(&up),
@@ -2093,6 +2365,87 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>) -> Relayed {
         closed_by,
         failure: up.err().or(down.err()),
     }
+}
+
+enum First {
+    Up(Copied),
+    Down(Copied),
+}
+
+const MAX_FRONTEND_MESSAGE: u32 = i32::MAX as u32;
+
+async fn copy_frontend<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counter: &AtomicU64,
+    trace: &Trace,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut body = vec![0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let mut tag = [0u8; 1];
+        if reader.read(&mut tag).await? == 0 {
+            break;
+        }
+        let mut length = [0u8; 4];
+        reader.read_exact(&mut length).await?;
+        let length = u32::from_be_bytes(length);
+        if !(4..=MAX_FRONTEND_MESSAGE).contains(&length) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad postgres message length",
+            ));
+        }
+        if tag[0] == b'X' {
+            trace.diag.emit(trace.event("client_terminate"));
+        }
+        writer.write_all(&tag).await?;
+        writer.write_all(&length.to_be_bytes()).await?;
+        total += 5;
+        let mut remaining = length as usize - 4;
+        while remaining > 0 {
+            let chunk = remaining.min(body.len());
+            reader.read_exact(&mut body[..chunk]).await?;
+            writer.write_all(&body[..chunk]).await?;
+            remaining -= chunk;
+            total += chunk as u64;
+        }
+        writer.flush().await?;
+        counter.store(total, Ordering::Relaxed);
+        if tag[0] == b'X' {
+            break;
+        }
+    }
+    writer.shutdown().await?;
+    Ok(total)
+}
+
+async fn copy_backend<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counter: &AtomicU64,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut body = vec![0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut body).await?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&body[..read]).await?;
+        total += read as u64;
+        counter.store(total, Ordering::Relaxed);
+    }
+    writer.shutdown().await?;
+    Ok(total)
 }
 
 pub fn authentication_ok() -> Vec<u8> {

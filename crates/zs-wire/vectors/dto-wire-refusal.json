@@ -1,5 +1,5 @@
 {
-  "about": "WireRefusal (spec 5.3): one accepted text, an unknown field, a wrong-case key, a duplicate key",
+  "about": "WireRefusal (spec 5.3): every refusal code the control plane emits (device_unknown, enrolment_expired, subject_mismatch, not_a_member), an unknown field, a wrong-case key, a duplicate key",
   "version": 1,
   "frozen": false,
   "context": {},
@@ -10,6 +10,30 @@
       "expect": {
         "accepted": true,
         "reserialized": "{\"code\":\"device_unknown\"}"
+      }
+    },
+    {
+      "name": "accepted_enrolment_expired",
+      "input": "{\"code\": \"enrolment_expired\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"code\":\"enrolment_expired\"}"
+      }
+    },
+    {
+      "name": "accepted_subject_mismatch",
+      "input": "{\"code\": \"subject_mismatch\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"code\":\"subject_mismatch\"}"
+      }
+    },
+    {
+      "name": "accepted_not_a_member",
+      "input": "{\"code\": \"not_a_member\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"code\":\"not_a_member\"}"
       }
     },
     {

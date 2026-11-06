@@ -24,6 +24,22 @@ plainly. This file exists to be read by a hostile reviewer.
 The control plane (`control/`) never stores a credential value. It stores a reference and
 the policy that authorizes its use.
 
+**The IdP's `email_verified` claim decides whether `email` names the signer-in (D2).** The
+control plane uses the `email` claim of an ID token as the session subject only when the same
+token carries `"email_verified": true`. An unverified email, a missing `email_verified` claim and
+an `email_verified` that is not a JSON boolean all fall back to `sub` (a non-boolean is refused as
+a malformed token). The subject is what `ZS_CONTROL_ADMINS` and the dashboard member check
+match, so an IdP that lets a user set an unverified email must not be able to pick the
+subject. An IdP that never sends `email_verified`, such as Microsoft Entra ID by default, signs
+in by `sub`, and the operator lists `sub` values.
+
+**A dashboard session lasts 8 hours from sign-in, enforced by the server, and is stored hashed
+(D4).** The control plane refuses a session whose row is older than 8 hours, whatever the
+browser still sends, and deletes expired rows on the next sign-in; the cookie `Max-Age` is the
+same value. It stores the SHA-256 of the cookie value as the session key, in `sessions` and
+`csrf_tokens`, so a read of the database does not yield a usable cookie. There is no sliding
+renewal. The migration that introduced the hashing ended every existing dashboard session.
+
 **Tenancy is a boundary the control plane enforces, in two nested scopes.** Organization
 carries the isolation property: policy, grants, audit and revocation are all
 organization-scoped, and every `/wire/*` route denies cross-tenant access. Project
@@ -54,8 +70,11 @@ letting one test stand in for the set.
 
 Stated plainly, because reviewers will find these anyway.
 
-**A hostile process running as the same user as the agent.** It can talk to the agent's
-local listener and obtain the same access the developer has. ZeroSecret converts
+**A hostile local process, from the same user or any other local account.** The agent's
+listener binds to a loopback address only (`--listen` refuses any other address), but
+loopback is reachable by every account on the machine. Any local account that can reach
+the port can talk to the listener and obtain the same access the developer has, not only
+processes running as the same user. ZeroSecret converts
 credential theft into session abuse. That is a real reduction — a stolen session expires
 and is attributable — but it is not isolation. For an `aws_ssm` source, such a process can
 also ask for a grant as the device and give its identity token to STS and SSM itself, with
@@ -73,6 +92,22 @@ injected response's head before it reads the body, so when the body echoes the c
 (§4 rule 9) the agent ends the response and the workload sees a truncated response, not a
 502, with the bytes before the echo already delivered.
 
+**The echo guard matches exact bytes.** The HTTP guard (§4 rule 9) matches the credential
+raw and percent-encoded, and injected values as sent. The WebSocket guard (§4 rule 8) matches
+the credential's raw bytes in the message stream. An upstream that returns the credential
+JSON-escaped (`\/` for `/`, a `\u` escape), base64-encoded, percent-encoded inside a
+WebSocket frame, or otherwise transformed is not matched. A credential made only of letters,
+digits, `-`, `_`, `.`, `+` and `=` has one JSON form, so this matters for a credential with
+`/` or a non-ASCII byte.
+
+**No cap on concurrent connections, and one body clone per attempt.** Any local process can
+open many connections to the agent's listener. The agent bounds a request head in 30 s and a
+client TLS handshake in 10 s, but it does not cap the number of connections. An upstream
+request body is cloned once for each attempt, two at most. An upgraded WebSocket session has
+no data-frame deadline: a peer that declares a frame and then stalls holds the task until the
+peer closes, or, when the session carries an injected credential, until the grant is revoked or
+expires.
+
 **Malicious code on the agent host.** Root, kernel, or EDR-level compromise defeats the
 agent. ZeroSecret is not a sandbox.
 
@@ -80,13 +115,25 @@ agent. ZeroSecret is not a sandbox.
 revocation cannot reach an agent until it next contacts the control plane. `POST
 /wire/revoke` records the withdrawal immediately and durably; the agent learns of it when
 it next calls `GET /wire/revocations` and refuses the grant from that moment, before its
-own expiry.
+own expiry. An open WebSocket session that carries an injected credential, a header-scheme
+session (`bearer`, `basic`, `api-key-header`) included, is checked again every 5 s: it ends
+within 5 s of a revocation that the agent has learned of, or of grant expiry. The workload
+gets a Close frame with code 1008 (or the connection drops if a frame was partly written),
+and the agent audits `deny` `websocket revoked` (§7 row 91).
 
 **The bound is the refresh interval, not the grant TTL.** Revocation does not wait for a
 grant to expire — that is the distinction between revocation and expiry, and it is why
-shortening TTLs is not a substitute. An agent that cannot reach the control plane keeps
+shortening TTLs is not a substitute. The fetch runs on its own 60 s timer, separately from grant renewal, so a slow renewal cannot
+delay it.
+An agent that cannot reach the control plane keeps
 using cached grants until they expire (SECURITY §7 row 5), so an unreachable agent's worst
 case remains one TTL.
+
+**Revocations are served for 660 s and need standing.** `GET /wire/revocations` returns
+only the last 660 s of revocations: two 300 s grant lifetimes plus 60 s of clock skew. An
+older row cannot affect a live grant, and the list stays bounded. `POST /wire/revoke` needs
+a live enrolment with a subject and a current membership of the device's organization; a
+caller without them is refused and writes no row.
 
 This is a deliberate trade for availability and latency: a per-request revocation check
 would put the control plane in the path of every data-plane request, break ADR-0004's
@@ -101,12 +148,20 @@ that ignores `HTTPS_PROXY` is not intercepted. It also gets no credential, so it
 rather than leaking — but the developer experience is a failure, not silent protection.
 
 **The login code does not stop a user who ignores it.** An attacker can start `zs login` on
-their own machine and send the sign-in URL to a member. If the member signs in, the attacker's
-`zs login` has the verifier, claims the self-enrolment token and enrols a device as that member.
-The callback page shows `code <CODE> for device <NAME>`, and `zs login` prints the same code and
-device name. Only a member who compares the page with their own `zs login` output sees the
-attack. ADR-0036 accepts this limit. The attacker's device is an ordinary self-enrolled
+their own machine and send the sign-in URL to a member. If the member signs in and confirms,
+the attacker's `zs login` has the verifier, claims the self-enrolment token and enrols a device
+as that member. The callback page shows `code <CODE> for device <NAME>` and a confirm button,
+and `zs login` prints the same code and device name. The sign-in completes only after one click
+on that button. The click must carry the `zs_login_confirm` cookie, which binds it to the browser
+that completed the IdP sign-in, and a hidden value from the confirm page itself, so another page
+cannot submit it and following the link alone enrols nothing. The CLI callback creates
+no dashboard session. Only a member who compares the page with their own `zs login` output
+before the click sees the attack. A pending login lives 10 minutes after `zs login` starts it.
+ADR-0036 accepts this limit. The attacker's device is an ordinary self-enrolled
 device, so the project, expiry and revocation bounds in ADR-0036 "Consequences" apply to it.
+The dashboard ends a session only through `POST /logout`, which needs the session's CSRF token, so
+a `GET /logout` signs nobody out. Sign-in uses PKCE: the authorize request carries an S256
+challenge and the callback redeems the code with the verifier stored with the pending login.
 
 **Committed run settings are as trusted as the repository.** `zs run` and `zs login` read the
 `run` block of `zs-policy.json`, and an app repository commits that file. The repository also
@@ -165,6 +220,8 @@ and in local mode:
   operations still bound every request.
 - `user` and `auth_source` on a `mongo` binding. They name the account and the database for SCRAM
   to the signed host. SCRAM never sends the password.
+- `user` on a `postgres` or `mysql` binding. It only narrows: the agent refuses a client that
+  names another user. A binding without it lets the workload choose the role.
 - `client_auth_plugin` on a `mysql` binding. It is the plugin between the local client and the
   agent. The upstream handshake does not change.
 
@@ -210,9 +267,14 @@ device enrolled with such a token between the ADR-0036 deploy and 2026-10-20 has
 and must enrol again. The device's private keys prove the device, not the person at the
 keyboard: a same-user process that reads the native record and `.zs-device.json` acts as that
 subject until the enrolment expires or an admin deletes the device or removes the membership.
-`/wire/policy`, `/wire/audit` and `/wire/revocations` do not check the device standing: an
-expired device, or a device whose member was removed, can still read the policy of its
-organization and send audit records until an admin deletes the device.
+`/wire/audit` does not check the device standing: an expired device, or a device whose
+member was removed, can still send audit records until an admin deletes the device.
+`/wire/policy` and `/wire/revocations` apply the same standing checks as `/wire/grant` and
+refuse with its `device_unknown`, `enrolment_expired` and `not_a_member` codes.
+
+**Approvals are roadmap.** The control plane does not treat `approval:` specially: with no
+such resource in the policy, a grant request for one is denied as an unknown resource and
+writes nothing (ROADMAP v2).
 
 **The control CA is the only trust anchor for sign-in and `/wire/*`.** `zs login` and the
 `/wire/*` clients of `zs run` trust only the control CA, from `--control-ca`, `run.control_ca`
@@ -234,7 +296,7 @@ admin. Protect both as you protect `ZS_CONTROL_CA_DIR`. The README section "Dash
 has the operator rules.
 
 **A session subject is printed without a control-character check.** The IdP session subject
-(the `email` claim, else `sub`) is printed in `control:` lines for refused and changed
+(the verified `email` claim, else `sub`) is printed in `control:` lines for refused and changed
 dashboard writes. The member forms and `ZS_CONTROL_ADMINS` refuse control characters, but the
 IdP value does not pass that rule. A hostile IdP value can add a line break to such a log line.
 Treat the line text as data when you read it.
@@ -277,6 +339,21 @@ commands (PRODUCT §3). A client under `zs run` can do everything that the broke
 roles allow. A user with user-administration roles can read the stored SCRAM keys of users
 (`usersInfo` with `showCredentials`). Give the brokered user the least role that the app needs.
 
+**The workload chooses the PostgreSQL or MySQL database and role unless `user` is bound.** The
+agent sends the server the client's own startup packet or handshake response with the brokered
+credential. The user, the database, the PostgreSQL startup options and the MySQL connection
+attributes are the client's. A password that is valid for more than one role is valid for each
+role that the client names. Set `user` on the binding: the agent then refuses a client that
+names another user before it materializes the credential, with SQLSTATE `28000` or MySQL ERR
+1045, and audits `deny` `connect`, reason `user mismatch` (§7). The refusal text never names the
+user. `user` binds the role, not the database or the startup options. PostgreSQL `SET ROLE`
+still reaches each role that the bound user is a member of. MySQL sends its greeting before the
+client names a user, so with `user` set the agent reads the server greeting first: a refused
+MySQL client still opens one upstream connection, and the agent closes it before it sends a
+handshake response. A MySQL policy denial on such a binding also comes after the greeting. The
+agent always refuses a PostgreSQL startup that carries the `replication` parameter, whatever its
+value and whatever the binding says, and audits `deny` `connect`, reason `replication refused`.
+
 **An http binding sends the credential in cleartext.** A binding with `protocol: "http"` opts
 in to plaintext (ADR-0033). The agent adds the credential to a request that crosses the network
 unencrypted, so anyone on the path can read and replay it. The agent refuses an `http://`
@@ -287,7 +364,8 @@ only where a binding names it.
 `POST /.zs/presign` with a URL signed by the real secret (ADR-0035). Any process of the same
 user can ask, as for the proxy. The agent checks the grant for the method and the binding's
 path scope first, requires `X-Amz-Date` within 15 minutes of now, and caps `X-Amz-Expires` at
-15 minutes. After that, the URL is a bearer token: revoking the grant does not stop a URL
+15 minutes. It also refuses a URL whose `X-Amz-Date` plus `X-Amz-Expires` is more than
+15 minutes from now, so a date ahead of the clock cannot stretch the lifetime. After that, the URL is a bearer token: revoking the grant does not stop a URL
 already issued, which is why the cap is fifteen minutes. The answer carries a signature, never
 the secret. The endpoint refuses a request whose `Host` is not its own loopback address or
 that has an `Origin` header, so a web page cannot reach it by DNS rebinding.
@@ -332,6 +410,13 @@ path (ADR-0022). The two fit together: an unintercepted workload receives no cre
 the strict claim survives — what it does not receive is *access*, so it fails. §7 adds no
 limit this section does not already state.
 
+**A PostgreSQL protocol 3.2 CancelRequest is not relayed.** The relay accepts a CancelRequest
+only in the 16-byte form, with a 4-byte process ID and a 4-byte secret key. Protocol 3.2 allows
+a secret key of 4 to 256 bytes, so a 3.2 CancelRequest is classified as `Startup::Closed` and
+dropped before any upstream contact. The drop is fail-closed, but a 3.2 client cannot cancel a
+query through the relay. This path is not validated against PostgreSQL 18: the test compose
+file and this machine provide PostgreSQL 16 and psql 15 only.
+
 ## 4. Credential handling rules
 
 These are enforced in code review and in CI, not by convention.
@@ -357,15 +442,24 @@ These are enforced in code review and in CI, not by convention.
    request path, a query string, a header value, SQL text, a body, argv after argv[0], an
    environment value and the subject are never logged. Server error text is kept only when it does not contain the credential.
 8. No credential value reaches the workload. The agent holds each WebSocket data message from
-   the upstream until its last fragment, and checks it and every control frame before it
-   writes them. One that carries the credential ends the session unseen (audit `deny`
-   `websocket message`, reason `websocket echo`, ADR-0034). While the upstream stream ends with
-   8 or more bytes of the credential's start, the agent holds whole messages: a credential
-   split across separate messages ends the session before any held message is written, and a
-   held message is never written if the upstream ends or is quiet for 5 s (reason
-   `websocket withheld`). At most 7 bytes of the credential's start (fewer than half of a
-   credential under 16 bytes) can reach the workload this way. A signing scheme gives the
-   workload a signature, never the secret (ADR-0035).
+   the upstream until its last fragment, and checks every data message and control frame before
+   it writes it. One that carries the credential ends the session unseen (audit `deny`
+   `websocket message`, reason `websocket echo`, ADR-0034). No 8-byte window of the credential
+   (the whole credential when it is shorter) ever reaches the workload: before writing any
+   payload taken from an upstream frame, the agent checks the bytes about to go out together
+   with the last 7 payload bytes already written, and ends the session with nothing more
+   written if they contain such a window. Frame headers and the agent's own Close frame carry
+   no payload from the upstream and are outside that check. While the data
+   tail ends with 8 or more bytes of the credential's start (half the credential if it is
+   shorter than 16 bytes), the agent holds whole messages: a
+   credential split across separate messages ends the session before any held message is
+   written, a held message that would expose an 8-byte window is never written, and a held
+   message is never written if the upstream ends or is quiet for 5 s (reason `websocket
+   withheld`). A control frame cannot be held and does not release a held message; its payload
+   is checked the same way, so a Close reason that carries a fragment behind its status code
+   ends the session too. An upstream Close ends the session once it is written: no later frame
+   is read and held messages are dropped (reason `websocket withheld`). A signing scheme gives
+   the workload a signature, never the secret (ADR-0035).
 9. An injected response whose head carries the credential (raw, percent-encoded, or an
    injected header or query value) is refused with 502 and audited `deny` `response echo`.
    `TRACE` is refused on an injected binding. The head check covers every header name and
@@ -382,6 +476,14 @@ These are enforced in code review and in CI, not by convention.
    8 or more bytes of the start of one, is cut and audited `deny` `response echo` (§3). A WebSocket
    binding's refused upgrade answer gets the same checks. A copy of the credential that is
    transformed, or that has other bytes between its parts, is not matched.
+10. Four inputs from outside the agent fail closed. A PostgreSQL SCRAM challenge with fewer
+    than 4096 or more than 1,000,000 iterations is refused. The MySQL listener never offers
+    `CLIENT_LOCAL_FILES` upstream: it is removed from the greeting and from the response the
+    agent forwards, so a server cannot start a `LOCAL INFILE` transfer through the agent. A
+    `file` credential reference resolves only when every part of its path is a plain name, so
+    a drive prefix, a root, or a `.` part is refused as not resolvable. `zs run` with
+    `--enrollment-token` applies the control URL rule (`https`, or `http` for a loopback host)
+    to `--control` and to `--enroll-url` before it opens any connection.
 
 **A policy evaluation that does not allow denies.** `zs-policy` evaluates every request with the
 Cedar engine over a fixed policy set (ADR-0040). `Ok` requires an explicit allow, no diagnostic
@@ -403,7 +505,19 @@ Append-only and per-organization, written in two places with deliberately differ
 **The agent's local journal is hash-chained.** Each record carries `seq`, subject, workload
 label, resource, protocol, operation, decision, reason, timestamp, and the `prev_hash`/`hash`
 pair that makes an edit detectable. Each line is `sync_all`'d **before the decision
-proceeds**, so a record cannot be lost by a crash that still let the request through.
+proceeds**, so a record cannot be lost by a crash that still let the request through. On Unix
+the agent creates a new journal with mode 0600. A journal that already exists keeps the mode
+it has; the agent does not change it.
+
+**A torn last journal line is repaired, never trusted.** Each append writes one line and then
+`sync_all`s it, so a crash between the two leaves a partial line. On the next start the agent
+verifies every complete record in order, truncates a final line that ends without a newline,
+and appends from the last complete record. The dropped bytes carry no `seq` and no `hash`, so
+no record depends on them. A corrupt line that does end with a newline still fails closed, and
+`zs-verify` reports a torn journal as broken until the agent repairs it. A repair outside the
+agent is the same truncation: remove the bytes after the last `0x0a` byte, and never edit or
+reorder a complete line. The journal is read for shipping on a blocking thread, not on a
+runtime worker, so its size cannot stall request handling.
 
 **A deny record says why (ADR-0032).** `operation` names the action: the request method,
 `connect`, or a protocol operation. A NUL byte in `operation`, `reason` or `credential_ref` is
@@ -416,8 +530,35 @@ an upstream message or request content. It is part of the hash chain.
 
 **The control plane's trail is the central one**, and the agent ships to it — periodically
 while running, and once more as it exits (2026-09-17). Shipped records carry the enrolled
-`device_id`, from which the control plane reads tenancy; they do **not** carry the chain,
-because a hash chain across two independent stores is a property neither maintains.
+`device_id`, from which the control plane reads tenancy, and the journal's own `seq` and
+`hash` fields, so an ingested record can be matched to the local chain. The control plane
+does not maintain that chain across the two stores; the fields are carried, not verified
+against a second chain. Tenancy, device and subject come from the client certificate and the
+device row; a record's body subject that differs from the device row is kept as
+`claimed_subject`.
+
+**Shipping resumes from a persisted cursor.** The agent stores the highest accepted `seq`
+in `<journal>.shipped` beside the journal, written atomically and with mode 0600. It advances
+the cursor only after the control plane accepts a batch, so a refused or unreachable batch is
+retried from the last accepted record instead of lost. Each ingest request carries at most
+1 MiB of serialized ingest records; one record larger than the cap ships alone rather than
+being dropped. The cap measures those ingest records, which carry `seq` and `hash` but not
+`prev_hash`, so the journal lines behind one request can exceed 1 MiB. The cursor belongs to
+the workspace, not to a device: a workspace re-pointed at another control deployment ships
+its backlog under its next enrolment there, and the ingested records carry that device's
+attribution.
+
+**Signals do not cut the final ship short when the handlers install.** While the child runs,
+`zs` forwards `SIGTERM` and `SIGHUP` to it. It does not forward `SIGINT`, because the terminal
+already delivered that signal to the child's process group when it delivered it to `zs`. `zs`
+keeps waiting for the child to exit, so the final ship runs before `zs` exits. A child that
+traps the forwarded signal can exit with its own code; a child that does not trap it dies from
+the signal, and `zs` still ships. If the signal handlers do not install, `zs` writes a fixed
+line naming the failure to stderr and waits without forwarding; on that path a signal can
+still kill `zs` and skip the final ship. The handlers stay registered for the rest of the
+process, so after the child exits `SIGINT`, `SIGTERM` and `SIGHUP` are swallowed until `zs`
+exits; a long final ship can then be stopped only by a signal the agent does not handle
+(`SIGKILL`, `SIGQUIT`, `SIGABRT`).
 
 Corrected 2026-09-17: this section previously claimed each record carries **policy version,
 grant id, and agent id**. None of the three is in `zs_audit::AuditRecord` or in
@@ -452,6 +593,12 @@ The agent generates a local root CA on first run. Its private key stays in the p
 native secure store, is never exported, is never shared between machines, and is never
 issued by ZeroSecret's infrastructure. The CA signs only for hosts that match a configured
 resource.
+
+A new root is named `CN=ZeroSecret local CA`, signs only end-entity certificates (path length
+0, key usages `keyCertSign` and `cRLSign`), and is valid from 5 minutes before it is created
+for 10 years. A root that an earlier release created keeps its own name and validity and is
+not replaced. Each leaf names its host in lowercase, is valid from 5 minutes before it is
+minted for 24 hours, and is reused for at most 12 hours.
 
 The agent modifies no trust store. `zs run` points the child at `ca.crt` through
 `NODE_EXTRA_CA_CERTS`, which adds to Node's roots. `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and
@@ -727,7 +874,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Protocol implementation panicked | Deny that resource. Agent stays up |
 | Grant revoked | Deny before expiry. Lag bounded by the refresh interval (ADR-0018) |
 | Local CA storage locked, denied, unavailable, ambiguous, malformed or mismatched | Deny startup before any listener or child. Never mint a replacement CA (§6) |
-| Grant revoked, then renewed | Deny. A renewal keeps the revoked grant's ID in its chain (ADR-0026) |
+| Grant revoked, then renewed | Deny. A renewal keeps each revoked grant's ID in the chain of the grant it replaced, for the last 32 renewals (ADR-0026) |
 | Request method not in the grant | Deny that request. Audit the method (ADR-0026) |
 | `https://` upstream on any port | TLS. Plaintext only by `upstream_plaintext` on a loopback upstream (ADR-0026) |
 | A `Transfer-Encoding` other than exactly one `chunked`, conflicting `Content-Length` values, a body over 32 MiB, a head over 64 KiB, or a target carrying a fragment | Refuse the request. hyper reads the framing and refuses what it will not frame; the proxy refuses the codings hyper accepts and the fragment hyper would silently drop (ADR-0026, ADR-0039) |
@@ -760,7 +907,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `/.zs/presign` for a method not in the grant, a path outside the scope, a non-https binding, signed headers other than `host`, an expiry outside 1 s to 15 minutes, or an `X-Amz-Date` more than 15 minutes from now | Deny. Audit `deny` `presign <METHOD>`. Never call upstream (ADR-0035) |
 | Local endpoint request whose `Host` is not its loopback address, or that has an `Origin` header | Refuse before the upstream (ADR-0035) |
 | Grant revoked or expired, or the audit write fails, during a WebSocket session | Refuse the next message that would carry the credential and end the session. Audit `deny` `websocket message` (ADR-0034) |
-| Upstream WebSocket messages that together carry the credential, or a held message that ends with 8 or more bytes of its start when the upstream ends or is quiet for 5 s | End the session before any held message reaches the workload. Audit `deny` `websocket message`, reason `websocket echo` or `websocket withheld` (ADR-0034) |
+| Upstream WebSocket data messages or control frames that would put an 8-byte window of the credential (the whole credential when it is shorter) on the client stream, including a held prefix released by a later data message and a Close reason that carries a fragment behind its status code | End the session before that write; a held message is never released when it would expose such a window. A control frame does not release a held message. An upstream Close ends the session and no later frame is read; held messages are dropped. Audit `deny` `websocket message`, reason `websocket echo` or `websocket withheld` (ADR-0034) |
 | `zs run` with a control URL, no `--enrollment-token`, and no enrolment for that URL in `.zs-device.json` | Stop before any network call and before the child: `zs: not enrolled with <url>; run zs login` (ADR-0036) |
 | `.zs-device.json` has an enrolment for the control URL, but its native device record is missing | Stop before any network call: `zs: not enrolled with <url>; run zs login` (ADR-0036) |
 | Native device record locked or unavailable | Stop before any network call: `zs: device record: secure storage locked` or `zs: device record: secure storage unavailable` (ADR-0036) |
@@ -806,6 +953,13 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `TRACE` request on an injected binding | Refuse with 502 before materialization; nothing reaches the upstream. Audit `deny` `trace refused` (`apps/zs/tests/response_echo.rs`) |
 | Upstream response body or trailer to an injected request (a WebSocket binding's refused upgrade answer included) carries the credential, raw or percent-encoded, or an injected value ≥ 8 bytes, whole or split across chunks, or ends with 8 or more bytes of its start | Cut the response before those bytes reach the workload; the workload sees a truncated response. Audit `deny` `response echo` (`apps/zs/tests/response_echo.rs`, `apps/zs/tests/websocket_binding.rs`) |
 | Upstream response to an injected request has a `Content-Encoding` other than `identity` | Refuse with 502 before any byte reaches the workload. Audit `deny` `response encoded` (`apps/zs/tests/response_echo.rs`, `apps/zs/tests/websocket_binding.rs`) |
+| Grant revoked or expired during a WebSocket session that carries an injected credential, a header-scheme session that sends no credential in its messages included | End the session within 5 s of the agent learning of it: send the workload a Close frame with code 1008, or drop the connection if a frame was partly written. Audit `deny` `websocket message`, reason `websocket revoked` (`apps/zs/tests/revocation.rs`, `apps/zs/tests/fail_closed_matrix.rs` row 91) |
+| PostgreSQL upstream SCRAM challenge has fewer than 4096 iterations | Refuse. Never derive a proof from it (`apps/zs/tests/fail_closed_matrix.rs`) |
+| `/.zs/presign` URL whose `X-Amz-Date` plus `X-Amz-Expires` is more than 15 minutes from now, though each is within its own limit | Deny. Audit `deny` `presign <METHOD>`. Never call upstream (`apps/zs/tests/fail_closed_matrix.rs`) |
+| MySQL client sets `CLIENT_LOCAL_FILES` | The agent clears it: the response forwarded to the server never carries it (`apps/zs/tests/fail_closed_matrix.rs`) |
+| PostgreSQL startup or MySQL handshake names a user other than the binding's `user` | Refuse before materialization: PostgreSQL SQLSTATE `28000`, MySQL ERR 1045. The refusal text never names the user. Audit `deny` `connect`, reason `user mismatch`. PostgreSQL never connects upstream; MySQL reads the server greeting but never sends the server a handshake response (`apps/zs/tests/fail_closed_matrix.rs`) |
+| PostgreSQL startup carries the `replication` parameter, whatever its value | Refuse with SQLSTATE `28000` before materialization and before any upstream connection. Audit `deny` `connect`, reason `replication refused` (`apps/zs/tests/fail_closed_matrix.rs`) |
+| More than 30 requests in one minute from one TCP peer host to `/login`, `/login/callback`, `/login/confirm`, `/login/claim`, `/enrollment-token` and `/wire/enroll` together | The 31st and later get 429 `too many requests` before the handler runs, so no token is minted. The limit keys on the TCP peer address, never on `X-Forwarded-For`. `/healthz` and `/ca` are not limited (D11) (commercial suite) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
@@ -825,12 +979,13 @@ session keys and the SSM value can stay in freed agent memory until the memory i
 
 Tracked here until answered, then moved into a decision.
 
-- **v1 — multi-user and remote agent scenarios.** How does the agent authenticate a
-  caller on its local listener beyond same-user? Peer credentials plus a per-run token is
-  the current thinking. Not yet a numbered step: it must depend on mTLS device enrolment
-  (v1 plan step 12, not published), which issues the device identity it
-  would bind to. Note the ceiling — this narrows the gap §3 concedes, it does not close
-  it, and it must not be described as isolation.
+- **v1 — local caller authentication.** The agent's listener is loopback-only, and any
+  local account that can reach the port gets the developer's access (§3). Caller
+  authentication on that listener, so that only the process the agent started is served,
+  is a planned design and is not built. It must depend on mTLS device enrolment (v1 plan
+  step 12, not published), which issues the device identity it would bind to. Note the
+  ceiling: this narrows the gap §3 concedes, it does not close it, and it must not be
+  described as isolation.
 - **Deferred to v2.** Does the CI runner case need a different identity model than a
   developer workstation?
 - **What is the correct grant TTL?** It trades revocation lag against control-plane load

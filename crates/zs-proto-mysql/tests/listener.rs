@@ -307,12 +307,16 @@ async fn an_upstream_err_before_the_greeting_is_relayed_as_a_refusal() {
     assert_eq!(error.code, 1040);
     assert_eq!(error.sqlstate.as_deref(), Some("08004"));
     assert_eq!(error.message, UPSTREAM_REFUSED);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the client never sent a handshake response, so no credential is materialized"
+    );
     assert_eq!(fake.seen(|s| s.accepts), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_materialize_denial_answers_before_the_greeting_and_never_connects() {
+async fn a_materialize_denial_answers_after_the_client_handshake() {
     let fake = fake::start(native()).await;
     let allowed = fake
         .listen(UpstreamTls::WhenOffered, fake::materialize(PASSWORD))
@@ -328,9 +332,12 @@ async fn a_materialize_denial_answers_before_the_greeting_and_never_connects() {
     let denied: zs_proto_mysql::Materialize =
         Arc::new(|| Err(zs_protocol::Denied::new("no grant for orders-mysql")));
     let local = fake.listen(UpstreamTls::WhenOffered, denied).await;
-    let reply = fake::first_packet(local).await;
-    assert_eq!((reply.seq, reply.payload.clone()), (0, DENIED.packet()));
-    let error = ServerError::parse(&reply.payload).unwrap();
+    let session = fake::login(local, CLIENT_CAPS).await;
+    assert_eq!(
+        (session.reply.seq, session.reply.payload.clone()),
+        (2, DENIED.packet())
+    );
+    let error = ServerError::parse(&session.reply.payload).unwrap();
     assert_eq!(
         (
             error.code,
@@ -340,7 +347,7 @@ async fn a_materialize_denial_answers_before_the_greeting_and_never_connects() {
         (1045, Some("28000"), "ZeroSecret denied the connection")
     );
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(fake.seen(|s| s.accepts), 1);
+    assert_eq!(fake.seen(|s| s.accepts), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -866,4 +873,34 @@ async fn a_cleartext_plugin_in_the_greeting_gets_a_native_scramble_on_plaintext(
         assert!(!fake.saw_bytes(PASSWORD.as_bytes()));
         assert!(!fake.seen(|s| s.authenticated));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_infile_is_never_offered_upstream() {
+    let fake = fake::start(native()).await;
+    let local = fake
+        .listen(UpstreamTls::WhenOffered, fake::materialize(PASSWORD))
+        .await;
+    let session = fake::login(local, CLIENT_CAPS | packet::CLIENT_LOCAL_FILES).await;
+
+    assert_eq!(
+        session.reply.payload.first(),
+        Some(&packet::OK_HEADER),
+        "positive: the login reached the server"
+    );
+    assert!(fake.seen(|s| s.authenticated));
+    assert_eq!(
+        fake.seen(|s| s.capabilities & packet::CLIENT_LOCAL_FILES),
+        0,
+        "the forwarded response must not carry CLIENT_LOCAL_FILES"
+    );
+    assert_eq!(
+        session.greeting.capabilities & packet::CLIENT_LOCAL_FILES,
+        0
+    );
+    assert_ne!(
+        fake.seen(|s| s.capabilities & packet::CLIENT_CONNECT_ATTRS),
+        0,
+        "negative control: a capability the client set and the server offered survives"
+    );
 }

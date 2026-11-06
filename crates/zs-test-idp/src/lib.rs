@@ -196,6 +196,7 @@ fn claims(subject: &str, audience: &str, expires_in: i64) -> serde_json::Value {
         "iss": ISSUER,
         "sub": subject,
         "email": subject,
+        "email_verified": true,
         "aud": audience,
         "iat": now - 10,
         "exp": now + expires_in,

@@ -3992,3 +3992,290 @@ async fn row_90_a_coded_response_to_an_injected_request_is_refused() {
         journal_text(&served)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_91_a_websocket_session_ends_when_its_grant_expires() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let key = ControlSigningKey::generate("k1");
+    let seen = Arc::new(std::sync::Mutex::new(ws_fake::Seen::default()));
+    let port = ws_fake::spawn_ws_upstream(ws_fake::Reply::Ok, seen.clone()).await;
+    let lifetime = Duration::from_secs(3);
+    let expires = std::time::Instant::now() + lifetime;
+    let served = serve_with_upstream(
+        binding(),
+        vec![
+            key.sign(grant(now_ms() + lifetime.as_millis() as u64, "g-1"))
+                .unwrap(),
+        ],
+        &key,
+        Some(CREDENTIAL),
+        Recorder {
+            port,
+            heads: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+    )
+    .await;
+    let (mut tls, head) = ws_upgrade(&served).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "row 91: {head}");
+    assert!(
+        seen.lock()
+            .unwrap()
+            .head
+            .to_ascii_lowercase()
+            .contains("authorization: bearer "),
+        "row 91 positive control: the upgrade carries the injected header"
+    );
+
+    let ping = ws_fake::frame(1, br#"{"op":"ping"}"#, Some([7, 1, 9, 3]));
+    let mut relayed = 0;
+    let close = loop {
+        assert!(
+            std::time::Instant::now() < expires + Duration::from_secs(7),
+            "row 91: the session stayed open 7 s after the grant expired"
+        );
+        let _ = tls.write_all(&ping).await;
+        match ws_fake::read_frame(&mut tls).await {
+            Some((8, payload)) => break payload,
+            Some(_) => relayed += 1,
+            None => panic!("row 91: the session ended without a Close frame"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        relayed > 0,
+        "row 91 positive control: a message is relayed before expiry"
+    );
+    assert!(
+        std::time::Instant::now() > expires,
+        "row 91: the session ended before the grant expired"
+    );
+    assert_eq!(close, 1008u16.to_be_bytes(), "row 91");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !journal_denies(&served, "websocket revoked") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        journal_denies(&served, "websocket revoked"),
+        "row 91: {}",
+        journal_text(&served)
+    );
+}
+
+#[test]
+fn row_92_a_postgres_scram_challenge_below_4096_iterations_is_refused() {
+    let client_first_bare = "n=,r=rOprNGfwEbeRWgbNEkqO";
+    let challenge = |iterations: u32| {
+        format!(
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={iterations}"
+        )
+    };
+    assert!(
+        zs_proto_postgres::client_final_message("pw", &challenge(4096), client_first_bare).is_ok(),
+        "row 92 positive control: the floor itself is accepted"
+    );
+    for iterations in [1, 4095] {
+        let refused = zs_proto_postgres::client_final_message(
+            "pw",
+            &challenge(iterations),
+            client_first_bare,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(zs_proto_postgres::PostgresError::Scram(ref reason))
+                    if reason == "iteration count out of range"
+            ),
+            "row 92: {iterations} iterations"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_93_an_endpoint_presign_dated_ahead_cannot_outlive_fifteen_minutes() {
+    let (endpoint, upstream, journal, _home) = presign_endpoint(with_auth(sigv4())).await;
+
+    let now = presign_dated(
+        &endpoint,
+        "/bucket/k.txt",
+        "host",
+        900,
+        "GET",
+        &common::amz_now(),
+    )
+    .await;
+    assert!(
+        now.starts_with("HTTP/1.1 200"),
+        "row 93 positive control: {now}"
+    );
+
+    let ahead = presign_dated(
+        &endpoint,
+        "/bucket/k.txt",
+        "host",
+        900,
+        "GET",
+        &common::amz_after(600),
+    )
+    .await;
+    assert!(ahead.starts_with("HTTP/1.1 502"), "row 93: {ahead}");
+    let audit = std::fs::read_to_string(&journal).unwrap();
+    assert!(
+        audit.contains(r#""operation":"presign GET","decision":"deny""#),
+        "row 93: {audit}"
+    );
+    assert!(upstream.heads.lock().unwrap().is_empty(), "row 93");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_94_a_mysql_client_local_files_request_never_reaches_the_server() {
+    let upstream = fake::start(mysql_script(fake::Flow::Accept)).await;
+    let local = upstream
+        .listen(UpstreamTls::WhenOffered, fake::materialize(fake::PASSWORD))
+        .await;
+    let session = fake::login(local, fake::CLIENT_CAPS | packet::CLIENT_LOCAL_FILES).await;
+    assert_eq!(
+        session.reply.payload.first(),
+        Some(&packet::OK_HEADER),
+        "row 94 positive control: the login reached the server"
+    );
+    assert!(upstream.seen(|s| s.authenticated), "row 94");
+    assert_eq!(
+        upstream.seen(|s| s.capabilities & packet::CLIENT_LOCAL_FILES),
+        0,
+        "row 94: the forwarded response carried CLIENT_LOCAL_FILES"
+    );
+    assert_ne!(
+        upstream.seen(|s| s.capabilities & packet::CLIENT_CONNECT_ATTRS),
+        0,
+        "row 94 negative control: another client capability survives"
+    );
+}
+
+async fn bound_pg_listener(
+    upstream: &pg_fake::Fake,
+    user: Option<&str>,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    fake::Refusals,
+) {
+    let (materialize, calls) = pg_fake::counted(pg_fake::PASSWORD);
+    let (audit, refusals) = fake::audit_recorder();
+    let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
+        "127.0.0.1:0",
+        zs_proto_postgres::UpstreamEndpoint::new("127.0.0.1", upstream.addr.port()).unwrap(),
+        zs_proto_postgres::SslPolicy::RefuseOnLoopback,
+        UpstreamTls::WhenOffered,
+        materialize,
+    )
+    .await
+    .unwrap()
+    .with_expected_user(user.map(str::to_string))
+    .with_refusal_audit(audit);
+    let local = listener.local_addr();
+    tokio::spawn(listener.serve());
+    (local, calls, refusals)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_95_a_database_user_other_than_the_bound_user_is_refused() {
+    const INTRUDER: &str = "zs_intruder_role";
+    let pg = pg_fake::start(pg_fake::Script::new(pg_fake::Answer::N)).await;
+    let (local, calls, refusals) = bound_pg_listener(&pg, Some("app")).await;
+    let refused = pg_fake::login_with(
+        local,
+        &pg_fake::startup(&[("user", INTRUDER), ("database", "appdb")]),
+    )
+    .await
+    .expect_err("row 95: postgres must refuse");
+    assert_eq!(
+        refused,
+        pg_fake::error_frame(("28000", "database user not allowed by the binding")),
+        "row 95"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(pg.seen(|s| s.accepts), 0, "row 95: postgres upstream");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "row 95");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_postgres::USER_MISMATCH_REASON)],
+        "row 95"
+    );
+    pg_fake::login_with(
+        local,
+        &pg_fake::startup(&[("user", "app"), ("database", "appdb")]),
+    )
+    .await
+    .expect("row 95 positive control: the bound postgres user logs in");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "row 95");
+
+    let mysql = fake::start(mysql_script(fake::Flow::Accept)).await;
+    let (materialize, calls) = fake::counted(fake::PASSWORD);
+    let (audit, refusals) = fake::audit_recorder();
+    let listener = zs_proto_mysql::MysqlListener::bind_endpoint(
+        "127.0.0.1:0",
+        zs_proto_mysql::UpstreamEndpoint::new("127.0.0.1", mysql.addr.port()).unwrap(),
+        UpstreamTls::WhenOffered,
+        materialize,
+    )
+    .await
+    .unwrap()
+    .with_expected_user(Some("app".to_string()))
+    .with_refusal_audit(audit);
+    let local = listener.local_addr();
+    tokio::spawn(listener.serve());
+    let refused = fake::login_as(local, fake::CLIENT_CAPS, INTRUDER.as_bytes(), None).await;
+    assert_eq!(
+        refused.reply.payload,
+        zs_proto_mysql::USER_REFUSED.packet(),
+        "row 95"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(mysql.seen(|s| s.responses), 0, "row 95: mysql upstream");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "row 95");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_mysql::USER_MISMATCH_REASON)],
+        "row 95"
+    );
+    let session = fake::login_as(local, fake::CLIENT_CAPS, b"app", None).await;
+    assert_eq!(
+        session.reply.payload.first(),
+        Some(&packet::OK_HEADER),
+        "row 95 positive control: the bound mysql user logs in"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "row 95");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_96_a_postgres_replication_startup_is_refused() {
+    let pg = pg_fake::start(pg_fake::Script::new(pg_fake::Answer::N)).await;
+    let (local, calls, refusals) = bound_pg_listener(&pg, None).await;
+    for value in ["database", "false"] {
+        let refused = pg_fake::login_with(
+            local,
+            &pg_fake::startup(&[("user", "alice"), ("replication", value)]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("row 96: replication={value} must be refused"));
+        assert_eq!(
+            refused,
+            pg_fake::error_frame(("28000", "replication connections are refused")),
+            "row 96: replication={value}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(pg.seen(|s| s.accepts), 0, "row 96");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "row 96");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_postgres::REPLICATION_REFUSED_REASON); 2],
+        "row 96"
+    );
+    pg_fake::login(local)
+        .await
+        .expect("row 96 positive control: a startup without replication logs in");
+    assert_eq!(pg.seen(|s| s.accepts), 1, "row 96");
+}

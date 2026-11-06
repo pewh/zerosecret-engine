@@ -49,8 +49,16 @@ pub const POLICY_JSON_SCHEMA: &str = r#"{
             "description": "set only by the control plane; a local policy that sets it is refused"
           },
           "operations": { "type": "array", "items": { "type": "string" } },
-          "user": { "type": "string", "minLength": 1 },
-          "auth_source": { "type": "string", "minLength": 1 },
+          "user": {
+            "type": "string",
+            "minLength": 1,
+            "description": "mongo: the SCRAM user; postgres and mysql: the only user a client may name"
+          },
+          "auth_source": {
+            "type": "string",
+            "minLength": 1,
+            "description": "mongo only"
+          },
           "auth": {
             "type": "object",
             "required": ["scheme"],

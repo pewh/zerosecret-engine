@@ -835,6 +835,52 @@ async fn a_grant_that_expires_without_renewal_drops_its_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_session_is_dropped_at_grant_expiry() {
+    let h = harness();
+    let now = now_ms();
+    let long = now + 30_000;
+    let lasting = verified_for(
+        &h,
+        OTHER_RESOURCE,
+        source("arn:aws:iam::111122223333:role/zs/app-mongo", MONGO),
+        SUBJECT,
+        "g-lasting",
+        long,
+    );
+    fetch(&h.cache, &lasting, Some(&token(&h, OTHER_SUB, long)), now)
+        .await
+        .unwrap();
+    assert_eq!(h.cache.inner().session_count(), 1);
+
+    let short = now + 400;
+    let expiring = verified(&h, DB, "g-short", short);
+    fetch(&h.cache, &expiring, Some(&token(&h, SUB, short)), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.cache.inner().session_count(),
+        2,
+        "positive control: both grants keep a session before expiry"
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        h.cache.inner().session_count(),
+        1,
+        "the session of the expired grant must be dropped without another read"
+    );
+    fetch(&h.cache, &lasting, Some(&token(&h, OTHER_SUB, long)), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.aws.sts_calls(),
+        2,
+        "positive control: the live grant still reuses its session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn kms_denied_is_refused_with_kind_aws_ssm() {
     let h = harness();
     happy(&h).await.unwrap();
@@ -928,7 +974,7 @@ async fn denial_text_has_no_parameter_or_arn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "latency measurement; run in release with --ignored"]
+#[ignore = "latency measurement with no budget; CI runs it with --ignored"]
 async fn s09_latency_cold_and_warm() {
     let h = harness();
     let n = 40;

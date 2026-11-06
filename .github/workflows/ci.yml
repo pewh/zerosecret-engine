@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5.1.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -46,16 +46,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
-      - uses: actions/setup-node@v7.1.0
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      - run: cargo clippy --workspace --tests --benches -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       - name: Workspace tests on a private Secret Service
@@ -68,7 +69,15 @@ jobs:
             openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
             cargo test --workspace --locked
           '
-      - run: cargo install cargo-deny --locked
+      # The one ignored SSM test is a latency measurement that runs under the fake STS and SSM and
+      # asserts the warm path adds no AWS call. The workspace run above skips it.
+      - name: Ignored SSM latency test
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs-materializer --test aws_ssm -- --ignored | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 1 ignored SSM test to pass" >&2; exit 1; }
+      - run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo deny check
 
   conformance:
@@ -77,11 +86,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring mysql-client-8.0
       - run: npm install -g mongosh
       - run: tools/db-test-certs.sh target/db-test-certs
@@ -108,11 +117,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Create disposable keychain
         env:
           ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-ci.keychain-db
@@ -126,7 +135,7 @@ jobs:
           security list-keychains -d user -s "$ZS_CI_KEYCHAIN"
       # The H4 test runs a real Node `fetch` through the agent and needs Node 24 or later.
       # With ZS_TEST_NODE set, a missing or older Node fails the test instead of skipping it.
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       - name: Workspace tests on a disposable keychain
@@ -186,6 +195,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
+      ZS_REQUIRE_PG: "1"
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5434/zerosecret_test
       ZS_REQUIRE_MYSQL: "1"
       ZS_TEST_MYSQL: 127.0.0.1:3307
       ZS_TEST_MYSQL_PLAIN: 127.0.0.1:3308
@@ -195,14 +206,14 @@ jobs:
       ZS_REQUIRE_MONGO: "1"
       ZS_TEST_MONGO: 127.0.0.1:27018
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config postgresql-client
       - run: tools/db-test-certs.sh target/db-test-certs
-      - run: docker compose up -d --wait mysql mysql-plain postgres-tls mongo
+      - run: docker compose up -d --wait postgres mysql mysql-plain postgres-tls mongo
       - run: tools/mongo-test-setup.sh
       - run: for image in mysql:5.7 mysql:8.0 mysql:9; do docker pull -q "$image"; done
       - run: cargo test --locked -p zs-proto-mysql --test mysql_real -- --test-threads=1 --include-ignored --nocapture
@@ -211,9 +222,9 @@ jobs:
       - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
         env:
           ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
-      - run: cargo test --locked -p zs --test postgres_real tls_ -- --test-threads=1 --nocapture
+      - run: cargo test --locked -p zs --test postgres_real -- --test-threads=1 --nocapture
       - if: failure()
-        run: docker compose --profile mysql --profile pgtls --profile mongo logs mysql mysql-plain postgres-tls mongo
+        run: docker compose --profile mysql --profile pgtls --profile mongo logs postgres mysql mysql-plain postgres-tls mongo
 
   # The Keychain tests are ignored by default and panic unless the run proves it targets a
   # disposable keychain: `ZS_CI_KEYCHAIN` must name a keychain file under RUNNER_TEMP that is
@@ -226,11 +237,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Create disposable keychain
         env:
           ZS_CI_KEYCHAIN: ${{ runner.temp }}/zerosecret-native.keychain-db
@@ -332,14 +343,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring libsecret-tools
-      - run: cargo clippy --locked -p zs-mitm --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      - run: cargo clippy --locked -p zs-mitm --lib --bins -- -D warnings
+      - run: cargo clippy --locked -p zs-mitm --tests --benches -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
       # The filter also matches the ignored native tests of `tests_linux`, counted as ignored.
       - name: Core CA storage tests
         run: |
@@ -420,13 +432,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5.1.0
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.98.1"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked -p zs-mitm --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --locked -p zs-mitm --lib --bins -- -D warnings
+      - run: cargo clippy --locked -p zs-mitm --tests --benches -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
       # The filter also matches the ignored native tests of `tests_windows`, counted as ignored.
       - name: Core CA storage tests
         shell: bash

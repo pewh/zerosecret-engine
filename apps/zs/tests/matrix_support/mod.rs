@@ -116,6 +116,21 @@ impl PlainHome {
         crate::common::run_zs(self.home.path(), &args, &[])
     }
 
+    /// Starts `zs run` against this home and leaves it running.
+    pub fn spawn_child(&self, child: &[&str], env: &[(&str, &str)]) -> std::process::Child {
+        let mut command = std::process::Command::new(crate::common::bin_path());
+        command
+            .args(["run", "--enrollment-token", "enr-fake", "--"])
+            .args(child)
+            .env("ZS_HOME", self.home.path())
+            .env("USER", "localuser")
+            .envs(env.iter().copied())
+            .current_dir(self.home.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().expect("the agent must start")
+    }
+
     pub fn assert_refused(&self, code: i32, output: &str, line: &str, row: &str) {
         assert_eq!(code, 1, "{row}:\n{output}");
         assert!(
@@ -151,6 +166,8 @@ pub enum FakeGrant {
     },
     Signed(&'static str, &'static str, zs_policy::ResolvedConnection),
     Forged,
+    /// Answers the first request with a grant that needs renewal at once, then never answers.
+    ShortThenHang,
     Remote {
         source: zs_policy::CredentialSource,
         token: String,
@@ -165,6 +182,8 @@ pub struct FakeControl {
     pub url: String,
     ca_pem: String,
     grant: Arc<std::sync::Mutex<FakeGrant>>,
+    revoked: Arc<std::sync::Mutex<Vec<String>>>,
+    grant_calls: Arc<std::sync::atomic::AtomicUsize>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -179,6 +198,8 @@ impl FakeControl {
             host: HOST.into(),
             protocol: "https".into(),
         }));
+        let revoked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let grant_calls: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
@@ -199,11 +220,19 @@ impl FakeControl {
             }
         };
         let mint = {
-            let (key, grant) = (key.clone(), grant.clone());
+            let (key, grant, grant_calls) = (key.clone(), grant.clone(), grant_calls.clone());
             move |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                use std::sync::atomic::Ordering;
                 let text = |field: &str| request[field].as_str().unwrap_or_default().to_string();
                 let mut source = zs_policy::CredentialSource::file("fake");
                 let mut identity_token = None;
+                let mut expires_in_ms = 300_000;
+                let answered = grant_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if answered > 1 && matches!(&*grant.lock().unwrap(), FakeGrant::ShortThenHang) {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "slow renewal")
+                        .into_response();
+                }
                 let (host, protocol, forged, connection) = match &*grant.lock().unwrap() {
                     FakeGrant::Refuse(status, body) => {
                         return (axum::http::StatusCode::from_u16(*status).unwrap(), *body)
@@ -215,6 +244,15 @@ impl FakeControl {
                         false,
                         crate::common::default_connection(host, protocol),
                     ),
+                    FakeGrant::ShortThenHang => {
+                        expires_in_ms = 60_000;
+                        (
+                            HOST.into(),
+                            "https".into(),
+                            false,
+                            crate::common::default_connection(HOST, "https"),
+                        )
+                    }
                     FakeGrant::Signed(host, protocol, connection) => (
                         host.to_string(),
                         protocol.to_string(),
@@ -250,7 +288,7 @@ impl FakeControl {
                         operations: serde_json::from_value(request["operations"].clone())
                             .unwrap_or_default(),
                         environment: "development".into(),
-                        expires_at_ms: now_ms() + 300_000,
+                        expires_at_ms: now_ms() + expires_in_ms,
                         grant_id: "g-fake".into(),
                         materialization: zs_policy::Materialization::Retrieve,
                         upstream_host: connection.upstream_host,
@@ -271,10 +309,16 @@ impl FakeControl {
             .route("/wire/grant", axum::routing::post(mint))
             .route(
                 "/wire/revocations",
-                axum::routing::get(|| async {
-                    axum::Json(zs_wire::RevocationsResponse {
-                        revoked_grant_ids: Vec::new(),
-                    })
+                axum::routing::get({
+                    let revoked = revoked.clone();
+                    move || {
+                        let revoked = revoked.lock().unwrap().clone();
+                        async move {
+                            axum::Json(zs_wire::RevocationsResponse {
+                                revoked_grant_ids: revoked,
+                            })
+                        }
+                    }
                 }),
             )
             .route("/wire/audit", axum::routing::post(|| async { "" }));
@@ -285,12 +329,22 @@ impl FakeControl {
             url,
             ca_pem: ca.certificate_pem(),
             grant,
+            revoked,
+            grant_calls,
             _runtime: runtime,
         }
     }
 
     pub fn answer(&self, grant: FakeGrant) {
         *self.grant.lock().unwrap() = grant;
+    }
+
+    pub fn revoke(&self, grant_id: &str) {
+        self.revoked.lock().unwrap().push(grant_id.to_string());
+    }
+
+    pub fn grant_calls(&self) -> usize {
+        self.grant_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn token_home(&self) -> PlainHome {
@@ -309,7 +363,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly ninety.
+/// exactly ninety-seven.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -333,8 +387,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        90,
-        "SECURITY §7 must have ninety rows; found {}:\n{}",
+        97,
+        "SECURITY §7 must have ninety-seven rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

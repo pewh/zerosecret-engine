@@ -384,6 +384,43 @@ fn resources_without_a_config_exits_nonzero() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn resources_survives_a_closed_stdout() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let home = workspace();
+
+    let open = zs(home.path(), &["resources"]);
+    assert_eq!(open.code, 0, "positive control: {}", open.stderr);
+    assert!(!open.stdout.trim().is_empty(), "positive control");
+
+    for command in ["resources", "login", "doctor"] {
+        let (writer, reader) = UnixStream::pair().expect("socket pair");
+        drop(reader);
+        let output = Command::new(binary())
+            .arg(command)
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .env("ZS_HOME", home.path())
+            .env("USER", "alice")
+            .current_dir(home.path())
+            .output()
+            .expect("zs must run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.to_lowercase().contains("panicked"),
+            "zs {command} panicked with a closed stdout: {stderr}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "zs {command} failed with a closed stdout: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn doctor_still_reports_config_and_ca_state() {
     let home = workspace();

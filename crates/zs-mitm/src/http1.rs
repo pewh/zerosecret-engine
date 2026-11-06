@@ -20,6 +20,7 @@ use crate::proxy::ProxyError;
 
 pub(crate) const MAX_HEAD: usize = 64 * 1024;
 pub(crate) const MAX_BODY: usize = 32 * 1024 * 1024;
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) const HOP_BY_HOP: &[&str] = &[
     "Connection",
@@ -308,6 +309,8 @@ pub(crate) type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 pub(crate) fn server() -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .max_buf_size(MAX_HEAD)
         .auto_date_header(false)
         .preserve_header_case(true)
@@ -603,6 +606,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_head_is_closed() {
+        let (io, mut client) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(server().serve_connection(
+            TokioIo::new(io),
+            hyper::service::service_fn(|_request: Request<Incoming>| async {
+                Ok::<_, Infallible>(Response::new(empty_body()))
+            }),
+        ));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 200"));
+        client.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(HEADER_READ_TIMEOUT * 2, served)
+            .await
+            .expect("a stalled head must close the connection");
+        assert!(closed.unwrap().is_err());
+        assert!(started.elapsed() >= HEADER_READ_TIMEOUT);
+    }
 
     async fn read_head(stream: &mut DuplexStream) -> String {
         let mut head = Vec::new();

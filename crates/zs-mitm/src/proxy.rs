@@ -24,6 +24,8 @@ use crate::pipeline;
 use crate::scope::{PathScope, Refusal, ScopeDecision};
 use crate::websocket;
 
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("io: {0}")]
@@ -523,11 +525,19 @@ async fn handle_presign(
             resource,
             scheme: Scheme::Https,
             scope,
-            ..
+            upstream_host,
+            upstream_port,
+            upstream_tls,
         } = shared.handler.classify(&destination)
         else {
             return Err(zs_protocol::Denied::new("not an https binding"));
         };
+        let upstream = Upstream {
+            host: upstream_host,
+            port: upstream_port,
+            tls: upstream_tls,
+        };
+        let authority = forwarded_authority(Scheme::Https, &destination, &upstream);
         let path = path_and_query.split('?').next().unwrap_or("");
         if scope.decide(path) != ScopeDecision::Inject {
             return Err(zs_protocol::Denied::new(
@@ -539,20 +549,14 @@ async fn handle_presign(
             .protocol_for(&resource)
             .ok_or_else(|| zs_protocol::Denied::new("no protocol"))?;
         let credential = shared.handler.materialize(&resource, &method)?;
-        protocol.resign_url(
-            &authority(host, port),
-            &path_and_query,
-            &method,
-            &credential,
-        )
+        protocol
+            .resign_url(&authority, &path_and_query, &method, &credential)
+            .map(|signed| format!("https://{authority}{signed}"))
     })();
     match signed {
-        Ok(signed) => {
+        Ok(url) => {
             audit(shared, &destination, Decision::Allow, &operation, None)?;
-            Ok(http1::text_response(format!(
-                "https://{}{signed}",
-                authority(host, port)
-            )))
+            Ok(http1::text_response(url))
         }
         Err(denied) => {
             audit(
@@ -630,8 +634,11 @@ fn transport_error(error: hyper::Error) -> Result<(), ProxyError> {
 }
 
 async fn passthrough_upstream(host: &str, port: u16) -> Option<TcpStream> {
-    let addr = tokio::net::lookup_host((host, port)).await.ok()?.next()?;
-    TcpStream::connect(addr).await.ok()
+    zs_upstream::UpstreamEndpoint::new(host, port)
+        .ok()?
+        .connect()
+        .await
+        .ok()
 }
 
 #[derive(Clone)]
@@ -962,9 +969,16 @@ pub(crate) struct Upstream {
 }
 
 // The `Host` sent upstream. It is also written into the request before `inject`, so a scheme
-// that signs `Host` signs what the upstream receives.
-fn authority(host: &str, port: u16) -> String {
-    authority_for(Scheme::Https, host, port)
+// that signs `Host` signs what the upstream receives. When the binding reaches the origin host
+// on another port, that port is named; an upstream on another host stands in for the origin
+// and keeps the origin's port.
+fn forwarded_authority(scheme: Scheme, origin: &Destination, upstream: &Upstream) -> String {
+    let port = if upstream.host.eq_ignore_ascii_case(&origin.host) {
+        upstream.port
+    } else {
+        origin.port
+    };
+    authority_for(scheme, &origin.host, port)
 }
 
 fn authority_for(scheme: Scheme, host: &str, port: u16) -> String {
@@ -1247,6 +1261,7 @@ async fn handle_absolute(
     };
 
     request.remove_header("Proxy-Connection");
+    let authority = forwarded_authority(scheme, &destination, &upstream);
     let facts = pipeline::RequestFacts {
         resource: resource.clone(),
         operation: method.clone(),
@@ -1270,7 +1285,7 @@ async fn handle_absolute(
         facts,
         request,
         extensions,
-        authority: authority_for(scheme, &host, port),
+        authority,
         route: pipeline::Route::Fresh { upstream },
         report: report.clone(),
         skip_inject: false,
@@ -1368,7 +1383,15 @@ where
         .with_cert_resolver(Arc::new(StaticResolver(certified)));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let tls_client = match acceptor.accept(client).await {
+    let accepted = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client TLS handshake timed out",
+            ))
+        });
+    let tls_client = match accepted {
         Ok(tls) => tls,
         Err(e) => {
             shared.diag.emit(
@@ -1489,7 +1512,7 @@ async fn tunneled_request(
         return http1::reply(http1::Reply::Refused);
     }
     injected.remove_header("Proxy-Connection");
-    let authority = authority(&origin.host, origin.port);
+    let authority = forwarded_authority(Scheme::Https, &origin, &upstream);
 
     if upgrade.is_some() && websocket::is_upgrade(&injected) {
         let skip_inject = match pipeline::authorize_only(&shared.handler, &*report, &scope, &facts)
@@ -1574,7 +1597,8 @@ async fn serve_websocket(
             return http1::reply(http1::Reply::UpstreamUnreachable);
         }
     };
-    let mut outbound = match outbound(request, &authority(&origin.host, origin.port), extensions) {
+    let authority = forwarded_authority(Scheme::Https, origin, upstream);
+    let mut outbound = match outbound(request, &authority, extensions) {
         Ok(outbound) => outbound,
         Err(error) => {
             shared.diag.emit(
@@ -1590,9 +1614,23 @@ async fn serve_websocket(
         hyper::header::CONNECTION,
         hyper::header::HeaderValue::from_static("Upgrade"),
     );
-    let mut response = match sender.send_request(outbound).await {
-        Ok(response) => response,
+    let sent = tokio::time::timeout(
+        pipeline::RESPONSE_HEAD_TIMEOUT,
+        sender.send_request(outbound),
+    )
+    .await;
+    let mut response = match sent.map_err(|_| timed_out("upstream response head timed out")) {
+        Ok(Ok(response)) => response,
         Err(error) => {
+            shared.diag.emit(
+                event("upstream_failed")
+                    .warn()
+                    .code("stage", "relay")
+                    .failure(error.code()),
+            );
+            return http1::reply(http1::Reply::UpstreamUnreachable);
+        }
+        Ok(Err(error)) => {
             shared.diag.emit(
                 event("upstream_failed")
                     .warn()
@@ -1692,16 +1730,17 @@ async fn serve_websocket(
             return;
         };
         let event = |name: &'static str| proxy_event(conn, name).req(req).resource(&resource);
+        let verdict = || match shared.handler.classify(&record) {
+            Flow::Intercept { .. } => shared
+                .handler
+                .authorize_message(&resource, &method)
+                .map_err(|denied| denied.reason),
+            Flow::Deny { reason } => Err(reason),
+            Flow::Passthrough => Err("no binding".to_string()),
+        };
+        let revalidate = || verdict().is_ok();
         let on_inject = || {
-            let verdict = match shared.handler.classify(&record) {
-                Flow::Intercept { .. } => shared
-                    .handler
-                    .authorize_message(&resource, &method)
-                    .map_err(|denied| denied.reason),
-                Flow::Deny { reason } => Err(reason),
-                Flow::Passthrough => Err("no binding".to_string()),
-            };
-            let (decision, reason) = match verdict {
+            let (decision, reason) = match verdict() {
                 Ok(()) => (Decision::Allow, None),
                 Err(reason) => (Decision::Deny, Some(reason)),
             };
@@ -1720,35 +1759,43 @@ async fn serve_websocket(
             TokioIo::new(upstream_io),
             injection,
             &on_inject,
+            &revalidate,
         )
         .await;
-        match ended {
-            websocket::Ended::Closed => shared.diag.emit(event("websocket_closed")),
-            websocket::Ended::Echoed | websocket::Ended::Withheld => {
-                let (reason, result) = if ended == websocket::Ended::Echoed {
-                    ("websocket echo", "echo")
-                } else {
-                    ("websocket withheld", "withheld")
-                };
-                let seq = audit(
-                    &shared,
-                    &record,
-                    Decision::Deny,
-                    "websocket message",
-                    Some(reason),
-                )
-                .ok();
-                shared.diag.emit(with_seq(
-                    event("websocket_closed").warn().code("result", result),
-                    seq,
-                ));
+        let denied = match ended {
+            websocket::Ended::Closed => {
+                shared.diag.emit(event("websocket_closed"));
+                None
             }
-            websocket::Ended::Refused => shared
-                .diag
-                .emit(event("websocket_closed").warn().code("result", "refused")),
-            websocket::Ended::Violation(_) => shared
-                .diag
-                .emit(event("websocket_closed").warn().code("result", "violation")),
+            websocket::Ended::Echoed => Some(("websocket echo", "echo")),
+            websocket::Ended::Withheld => Some(("websocket withheld", "withheld")),
+            websocket::Ended::Revoked => Some(("websocket revoked", "revoked")),
+            websocket::Ended::Refused => {
+                shared
+                    .diag
+                    .emit(event("websocket_closed").warn().code("result", "refused"));
+                None
+            }
+            websocket::Ended::Violation(_) => {
+                shared
+                    .diag
+                    .emit(event("websocket_closed").warn().code("result", "violation"));
+                None
+            }
+        };
+        if let Some((reason, result)) = denied {
+            let seq = audit(
+                &shared,
+                &record,
+                Decision::Deny,
+                "websocket message",
+                Some(reason),
+            )
+            .ok();
+            shared.diag.emit(with_seq(
+                event("websocket_closed").warn().code("result", result),
+                seq,
+            ));
         }
     });
     switching
@@ -1784,35 +1831,45 @@ pub(crate) async fn connect_upstream(
     http1::client(upstream_io(host, port, tls).await?, upgrades).await
 }
 
+// Every resolved address is tried in turn under `zs_upstream`'s connect budget.
 async fn upstream_io(host: &str, port: u16, tls: bool) -> Result<Box<dyn AsyncStream>, ProxyError> {
-    let addr = tokio::net::lookup_host((host, port))
-        .await?
-        .next()
-        .ok_or_else(|| {
-            ProxyError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no address",
-            ))
-        })?;
-    let tcp = TcpStream::connect(addr).await?;
+    let tcp = zs_upstream::UpstreamEndpoint::new(host, port)?
+        .connect()
+        .await?;
     if tls {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| ProxyError::Ca(crate::ca::CaError::Certificate(e.to_string())))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let server_name = LocalCa::server_name_for(host)?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tls = connector.connect(server_name, tcp).await?;
-        Ok(Box::new(tls) as Box<dyn AsyncStream>)
+        Ok(Box::new(upstream_tls(tcp, host).await?) as Box<dyn AsyncStream>)
     } else {
         Ok(Box::new(tcp) as Box<dyn AsyncStream>)
     }
+}
+
+async fn upstream_tls<S>(
+    io: S,
+    host: &str,
+) -> Result<tokio_rustls::client::TlsStream<S>, ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ProxyError::Ca(crate::ca::CaError::Certificate(e.to_string())))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = LocalCa::server_name_for(host)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(server_name, io))
+        .await
+        .map_err(|_| timed_out("upstream TLS handshake timed out"))?
+        .map_err(ProxyError::Io)
+}
+
+fn timed_out(what: &'static str) -> ProxyError {
+    ProxyError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, what))
 }
 
 struct StaticResolver(Arc<CertifiedKey>);
@@ -2781,14 +2838,14 @@ mod tests {
         }
     }
 
-    struct Forwarding(u16);
+    struct Forwarding(&'static str, u16);
 
     impl FlowHandler for Forwarding {
         fn classify(&self, _destination: &Destination) -> Flow {
             Flow::Intercept {
                 resource: "upstream.test".into(),
-                upstream_host: "127.0.0.1".into(),
-                upstream_port: self.0,
+                upstream_host: self.0.into(),
+                upstream_port: self.1,
                 upstream_tls: false,
                 scheme: Scheme::Https,
                 scope: PathScope::from_entries(Some(&["/other".to_string()][..])).unwrap(),
@@ -2822,12 +2879,19 @@ mod tests {
     async fn forwarding_proxy(
         upstream_port: u16,
     ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>) {
+        forwarding_proxy_to("127.0.0.1", upstream_port).await
+    }
+
+    async fn forwarding_proxy_to(
+        upstream_host: &'static str,
+        upstream_port: u16,
+    ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>) {
         let home = tempfile::tempdir().unwrap();
         let ca = Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ca.clone(),
-            Arc::new(Forwarding(upstream_port)),
+            Arc::new(Forwarding(upstream_host, upstream_port)),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
         )
         .await
@@ -2841,11 +2905,21 @@ mod tests {
         addr: std::net::SocketAddr,
         ca: &crate::ca::LocalCa,
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        tunnel_client_to(addr, ca, "upstream.test").await
+    }
+
+    async fn tunnel_client_to(
+        addr: std::net::SocketAddr,
+        ca: &crate::ca::LocalCa,
+        host: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
         use rustls::pki_types::pem::PemObject;
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.write_all(b"CONNECT upstream.test:443 HTTP/1.1\r\nHost: upstream.test:443\r\n\r\n")
-            .await
-            .unwrap();
+        tcp.write_all(
+            format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut established = vec![0u8; 39];
         tcp.read_exact(&mut established).await.unwrap();
         assert!(established.starts_with(b"HTTP/1.1 200"), "{established:?}");
@@ -2862,7 +2936,7 @@ mod tests {
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let name = crate::ca::LocalCa::server_name_for("upstream.test").unwrap();
+        let name = crate::ca::LocalCa::server_name_for(host).unwrap();
         connector.connect(name, tcp).await.unwrap()
     }
 
@@ -2962,6 +3036,155 @@ mod tests {
         assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_starts_the_tls_handshake_is_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let shared = ProxyShared {
+            ca: Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
+            handler: Arc::new(Forwarding("127.0.0.1", 9)),
+            journal: Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            diag: DiagLog::disabled(),
+        };
+        let (io, _client) = tokio::io::duplex(1 << 16);
+        let started = tokio::time::Instant::now();
+        let served = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT * 2,
+            serve_intercepted(
+                io,
+                shared,
+                "upstream.test".into(),
+                Upstream {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    tls: false,
+                },
+                Destination::new("upstream.test", 443),
+                PathScope::Host,
+                1,
+            ),
+        )
+        .await
+        .expect("a silent client must not hold the tunnel open");
+        assert_eq!(served.unwrap_err().code(), "timed_out");
+        assert!(started.elapsed() >= TLS_HANDSHAKE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_never_answers_the_tls_handshake_times_out() {
+        let (io, mut upstream) = tokio::io::duplex(1 << 16);
+        let started = tokio::time::Instant::now();
+        let handshake =
+            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT * 2, upstream_tls(io, "upstream.test"))
+                .await
+                .expect("the handshake must give up on its own");
+        let Err(error) = handshake else {
+            panic!("a silent upstream cannot complete a handshake");
+        };
+        assert_eq!(error.code(), "timed_out");
+        assert!(started.elapsed() >= TLS_HANDSHAKE_TIMEOUT);
+        let mut hello = [0u8; 1];
+        upstream.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello[0], 0x16, "a ClientHello was sent");
+    }
+
+    async fn host_capturing_upstream() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hosts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = hosts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                if let Some(host) = head.lines().find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+                        .map(|(_, value)| value.trim().to_string())
+                }) {
+                    seen.lock().unwrap().push(host);
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+        (port, hosts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_default_upstream_port_is_named_in_host() {
+        let (port, hosts) = host_capturing_upstream().await;
+        let (addr, ca) = forwarding_proxy_to("localhost", port).await;
+        let mut client = tunnel_client_to(addr, &ca, "localhost").await;
+        let response = exchange_tunnel(
+            &mut client,
+            b"GET /v1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(
+            b"GET https://LocalHost/v1 HTTP/1.1\r\nHost: LocalHost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut absolute = String::new();
+        tcp.read_to_string(&mut absolute).await.unwrap();
+        assert!(absolute.starts_with("HTTP/1.1 200"), "{absolute}");
+
+        let (stand_in, stand_in_hosts) = host_capturing_upstream().await;
+        let (addr, ca) = forwarding_proxy(stand_in).await;
+        let mut client = tunnel_client(addr, &ca).await;
+        let response = exchange_tunnel(
+            &mut client,
+            b"GET /v1 HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        assert_eq!(
+            *hosts.lock().unwrap(),
+            [format!("localhost:{port}"), format!("LocalHost:{port}")]
+        );
+        assert_eq!(
+            *stand_in_hosts.lock().unwrap(),
+            ["upstream.test"],
+            "an upstream on another host stands in for the origin and keeps its port"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dual_stack_upstream_falls_back_to_ipv4() {
+        let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(("localhost", 443))
+            .await
+            .unwrap()
+            .collect();
+        assert!(
+            resolved.iter().any(std::net::SocketAddr::is_ipv4),
+            "{resolved:?}"
+        );
+        let upstream = scripted_upstream(UpstreamMode::KeepAliveThenClose).await;
+        let (addr, ca) = forwarding_proxy_to("localhost", upstream.port).await;
+        let mut client = tunnel_client(addr, &ca).await;
+        let response = exchange_tunnel(
+            &mut client,
+            b"GET /v1/customers HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(upstream.requests.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_fresh_upstream_failure_answers_upstream_unreachable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2988,12 +3211,32 @@ mod tests {
         else {
             panic!("absolute-form expected");
         };
-        assert_eq!(authority(&host, port), "api.stripe.com");
+        assert_eq!(authority_for(Scheme::Https, &host, port), "api.stripe.com");
         let ProxyTarget::Absolute { host, port, .. } =
             parse_proxy_target("GET", "https://api.stripe.com:8443/x").unwrap()
         else {
             panic!("absolute-form expected");
         };
-        assert_eq!(authority(&host, port), "api.stripe.com:8443");
+        assert_eq!(
+            authority_for(Scheme::Https, &host, port),
+            "api.stripe.com:8443"
+        );
+    }
+
+    #[test]
+    fn the_upstream_port_is_named_only_for_the_origin_host() {
+        let origin = Destination::new("s3.example.com", 443);
+        let upstream = |host: &str, port| Upstream {
+            host: host.into(),
+            port,
+            tls: true,
+        };
+        let named = |up: &Upstream| forwarded_authority(Scheme::Https, &origin, up);
+        assert_eq!(
+            named(&upstream("S3.example.com", 8443)),
+            "s3.example.com:8443"
+        );
+        assert_eq!(named(&upstream("s3.example.com", 443)), "s3.example.com");
+        assert_eq!(named(&upstream("10.0.0.5", 8443)), "s3.example.com");
     }
 }

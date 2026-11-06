@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn main() {
+fn main() -> Result<(), &'static str> {
     println!("cargo:rerun-if-env-changed=ZS_BUILD_TEST_ENDPOINTS");
     println!("cargo:rerun-if-env-changed=ZS_BUILD_VERSION");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
@@ -15,7 +15,7 @@ fn main() {
     }
     if std::env::var("ZS_BUILD_TEST_ENDPOINTS").as_deref() == Ok("1") {
         if std::env::var("PROFILE").as_deref() == Ok("release") {
-            panic!("ZS_BUILD_TEST_ENDPOINTS=1 is refused in a release build");
+            return Err("ZS_BUILD_TEST_ENDPOINTS=1 is refused in a release build");
         }
         println!("cargo:rustc-cfg=zs_test_endpoints");
     }
@@ -44,6 +44,7 @@ fn main() {
         "cargo:rustc-env=ZS_BUILD_TARGET={}",
         std::env::var("TARGET").unwrap_or_default()
     );
+    Ok(())
 }
 
 fn git(arguments: &[&str]) -> Option<String> {
