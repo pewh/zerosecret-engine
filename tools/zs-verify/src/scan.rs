@@ -2,7 +2,6 @@ use crate::report::VectorEvidence;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use base64::Engine as _;
 use std::sync::Arc;
@@ -50,7 +49,7 @@ fn child_environ(pid: u32) -> Option<Vec<u8>> {
 
 #[cfg(not(target_os = "linux"))]
 fn child_environ(pid: u32) -> Option<Vec<u8>> {
-    let out = Command::new("ps")
+    let out = std::process::Command::new("ps")
         .args(["-E", "-p", &pid.to_string()])
         .output()
         .ok()?;
