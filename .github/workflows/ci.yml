@@ -84,6 +84,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo useradd --no-create-home zs-other
+          # A fresh keyring directory: the workspace step left a login keyring locked with its
+          # own random password.
+          XDG_DATA_HOME="$(mktemp -d)"
+          export XDG_DATA_HOME
           dbus-run-session -- bash -c '
             set -euo pipefail
             openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
