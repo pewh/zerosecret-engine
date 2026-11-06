@@ -687,7 +687,8 @@ fn through_listener(up: &Upstream, tls_fields: &str) -> TlsRun {
         )
         .await
         .unwrap()
-        .with_diag(diag.clone(), "appdb");
+        .with_diag(diag.clone(), "appdb")
+        .with_caller_check(std::sync::Arc::new(|_, _| true));
         let local = listener.local_addr();
         tokio::spawn(listener.serve());
         local

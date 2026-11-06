@@ -302,7 +302,8 @@ async fn listen_with(server: &Server, auth: ClientAuth, tls: UpstreamTls) -> Soc
     )
     .await
     .unwrap()
-    .with_client_auth(auth);
+    .with_client_auth(auth)
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     local

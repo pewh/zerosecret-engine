@@ -593,6 +593,20 @@ async fn a_node_fetch_from_a_directory_without_undici_goes_through_the_agent() {
     let mut agent = setup_agent(true, true);
     let proxy = agent.agent.as_ref().unwrap().proxy_addr.clone();
     let ca_path = agent.agent.as_ref().unwrap().ca_path.clone();
+    let userinfo = String::from_utf8(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            agent
+                .agent
+                .as_ref()
+                .unwrap()
+                .proxy_authorization
+                .strip_prefix("Basic ")
+                .expect("a Basic authorization"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let (status, _) = proxied_request(
         &proxy,
         &std::fs::read_to_string(&ca_path).unwrap(),
@@ -612,7 +626,7 @@ async fn a_node_fetch_from_a_directory_without_undici_goes_through_the_agent() {
         .current_dir(empty.path())
         .env_remove("NODE_OPTIONS")
         .env_remove("https_proxy")
-        .env("HTTPS_PROXY", format!("http://{proxy}"))
+        .env("HTTPS_PROXY", format!("http://{userinfo}@{proxy}"))
         .env("NODE_EXTRA_CA_CERTS", &ca_path)
         .env("NODE_USE_ENV_PROXY", "1")
         .output()
