@@ -195,6 +195,10 @@ pub fn client_final_message(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    fn admit_all() -> zs_protocol::CallerCheck {
+        Arc::new(|_, _| true)
+    }
+
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -473,7 +477,8 @@ mod tests {
             materialize,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_caller_check(admit_all());
         let local = listener.local_addr();
         tokio::spawn(
             listener
@@ -969,7 +974,8 @@ mod tests {
             materialize_password(PASSWORD),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_caller_check(admit_all());
         let local = listener.local_addr();
         tokio::spawn(listener.serve_with(connect));
 
@@ -1212,6 +1218,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
         let local = listener.local_addr();
         tokio::spawn(listener.serve_with(connect));
@@ -1264,6 +1271,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
         let local = listener.local_addr();
         tokio::spawn(listener.serve_with(connect));
@@ -1330,6 +1338,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
         let local = listener.local_addr();
         tokio::spawn(listener.serve_with(connect));
@@ -1708,6 +1717,7 @@ fn auth_method(code: u32) -> &'static str {
 
 pub struct PostgresListener {
     listener: TcpListener,
+    caller_check: Option<zs_protocol::CallerCheck>,
     upstream: Upstream,
     ssl: SslPolicy,
     materialize: Materialize,
@@ -1719,6 +1729,11 @@ pub struct PostgresListener {
 }
 
 impl PostgresListener {
+    pub fn with_caller_check(mut self, check: zs_protocol::CallerCheck) -> Self {
+        self.caller_check = Some(check);
+        self
+    }
+
     pub async fn bind(
         local: &str,
         upstream: SocketAddr,
@@ -1739,6 +1754,7 @@ impl PostgresListener {
         let upstream = Upstream::new(upstream, tls)?;
         Ok(Self {
             listener: TcpListener::bind(local).await?,
+            caller_check: None,
             upstream,
             ssl,
             materialize,
@@ -1788,7 +1804,25 @@ impl PostgresListener {
         F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
     {
         loop {
-            let (client, _peer) = self.listener.accept().await?;
+            let (client, peer) = self.listener.accept().await?;
+            let admitted = match (&self.caller_check, client.local_addr()) {
+                (Some(check), Ok(local)) => {
+                    let check = check.clone();
+                    tokio::task::spawn_blocking(move || check(peer, local))
+                        .await
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !admitted {
+                self.diag.emit(
+                    Event::new(Component::Postgres, "caller_refused")
+                        .conn(self.diag.next_conn())
+                        .token("listener", "postgres"),
+                );
+                drop(client);
+                continue;
+            }
             let upstream = self.upstream.clone();
             let ssl = self.ssl;
             let materialize = self.materialize.clone();

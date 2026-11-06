@@ -34,12 +34,13 @@ impl EchoAgent {
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
         stream
-            .write_all(
+            .write_all(&common::authorized_for_proxy(
+                &self.agent.proxy_addr,
                 format!(
                     "{method} http://api.stripe.com{path} HTTP/1.1\r\nHost: api.stripe.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
-            )
+            ))
             .unwrap();
         let mut reply = Vec::new();
         let _ = stream.read_to_end(&mut reply);

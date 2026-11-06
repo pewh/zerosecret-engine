@@ -118,6 +118,7 @@ struct Tls {
 pub struct MongoListener {
     listener: TcpListener,
     shared: Shared,
+    caller_check: Option<zs_protocol::CallerCheck>,
 }
 
 #[derive(Clone)]
@@ -153,6 +154,7 @@ impl MongoListener {
         let listener_addr = listener.local_addr()?.to_string();
         Ok(Self {
             listener,
+            caller_check: None,
             shared: Shared {
                 seed,
                 tls,
@@ -190,9 +192,32 @@ impl MongoListener {
             .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
     }
 
+    pub fn with_caller_check(mut self, check: zs_protocol::CallerCheck) -> Self {
+        self.caller_check = Some(check);
+        self
+    }
+
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
-            let (client, _peer) = self.listener.accept().await?;
+            let (client, peer) = self.listener.accept().await?;
+            let admitted = match (&self.caller_check, client.local_addr()) {
+                (Some(check), Ok(local)) => {
+                    let check = check.clone();
+                    tokio::task::spawn_blocking(move || check(peer, local))
+                        .await
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !admitted {
+                self.shared.diag.emit(
+                    Event::new(Component::Mongo, "caller_refused")
+                        .conn(self.shared.diag.next_conn())
+                        .token("listener", "mongo"),
+                );
+                drop(client);
+                continue;
+            }
             let shared = self.shared.clone();
             tokio::spawn(async move { handle_connection(client, shared).await });
         }

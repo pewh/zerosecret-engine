@@ -445,9 +445,12 @@ async fn an_absolute_form_keep_alive_connection_serves_a_second_request() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut agent = setup_agent(true, true);
     let proxy = agent.agent.as_ref().unwrap().proxy_addr.clone();
-    let request = b"GET https://api.stripe.com/v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: keep-alive\r\n\r\n";
+    let request = common::authorized_for_proxy(
+        &proxy,
+        b"GET https://api.stripe.com/v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: keep-alive\r\n\r\n",
+    );
     let mut stream = tokio::net::TcpStream::connect(&proxy).await.unwrap();
-    stream.write_all(request).await.unwrap();
+    stream.write_all(&request).await.unwrap();
     let mut first = Vec::new();
     let mut byte = [0u8; 1];
     while !first.ends_with(b"\r\n\r\n") {
@@ -467,7 +470,7 @@ async fn an_absolute_form_keep_alive_connection_serves_a_second_request() {
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body).await.unwrap();
     let announced_close = head.lines().any(|l| l.trim() == "connection: close");
-    let _ = stream.write_all(request).await;
+    let _ = stream.write_all(&request).await;
     let mut second = [0u8; 12];
     let served = matches!(
         tokio::time::timeout(

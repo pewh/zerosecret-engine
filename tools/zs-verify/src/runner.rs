@@ -62,7 +62,12 @@ pub(crate) fn run(args: VerifyArgs) -> i32 {
         Ok(agent) => agent,
         Err(_) => return refuse(ERR_SPAWN),
     };
-    let captured = capture(agent, &credential, args.proxy_addr.as_deref());
+    let captured = capture(
+        agent,
+        &credential,
+        args.proxy_addr.as_deref(),
+        prepared.env_report_path(),
+    );
     let vectors = BTreeMap::from([
         (
             report::CHILD_ENVIRONMENT,
@@ -119,6 +124,28 @@ pub(crate) fn run(args: VerifyArgs) -> i32 {
     }
 }
 
+fn combine_listener(tokenless: VectorEvidence, authenticated: VectorEvidence) -> VectorEvidence {
+    if tokenless.found == Some(true) || authenticated.found == Some(true) {
+        return VectorEvidence::complete(true);
+    }
+    if tokenless.found.is_some() && authenticated.found.is_some() {
+        return VectorEvidence::complete(false);
+    }
+    VectorEvidence::incomplete(
+        tokenless
+            .reason
+            .or(authenticated.reason)
+            .unwrap_or(scan::REASON_LISTENER),
+    )
+}
+
+fn without_run_token(tokenless: VectorEvidence) -> VectorEvidence {
+    if tokenless.found == Some(true) {
+        return tokenless;
+    }
+    VectorEvidence::incomplete(tokenless.reason.unwrap_or(scan::REASON_NO_RUN_TOKEN))
+}
+
 struct Captured {
     stdout: Zeroizing<Vec<u8>>,
     stderr: Zeroizing<Vec<u8>>,
@@ -127,7 +154,12 @@ struct Captured {
     listener: VectorEvidence,
 }
 
-fn capture(mut agent: Child, credential: &Zeroizing<String>, proxy_addr: Option<&str>) -> Captured {
+fn capture(
+    mut agent: Child,
+    credential: &Zeroizing<String>,
+    proxy_addr: Option<&str>,
+    env_report: &std::path::Path,
+) -> Captured {
     let stderr_drain = agent.stderr.take().map(|mut stderr| {
         std::thread::spawn(move || {
             let mut buf = Zeroizing::new(Vec::new());
@@ -140,6 +172,8 @@ fn capture(mut agent: Child, credential: &Zeroizing<String>, proxy_addr: Option<
     let stop = Arc::new(AtomicBool::new(false));
     let mut environ_polls = Vec::new();
     let mut listener_probe = None;
+    let mut token_probe = None;
+    let announced: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     match agent.stdout.take() {
         Some(stdout) => {
             let mut reader = std::io::BufReader::new(stdout);
@@ -163,16 +197,32 @@ fn capture(mut agent: Child, credential: &Zeroizing<String>, proxy_addr: Option<
                             environ_polls.push(std::thread::spawn(move || {
                                 scan::poll_child_environ(pid, &needle, stop)
                             }));
+                            if token_probe.is_none() {
+                                let announced = announced.clone();
+                                let needle = credential.clone();
+                                let env_report = env_report.to_path_buf();
+                                token_probe = Some(std::thread::spawn(move || {
+                                    scan::authenticated_listener(
+                                        pid,
+                                        &env_report,
+                                        announced,
+                                        &needle,
+                                    )
+                                }));
+                            }
                         }
-                        if let Some(announced) = text.strip_prefix("zs: proxy ")
+                        if let Some(printed) = text.strip_prefix("zs: proxy ")
                             && listener_probe.is_none()
                         {
                             let addr = proxy_addr
                                 .map(str::to_string)
-                                .unwrap_or_else(|| announced.trim().to_string());
+                                .unwrap_or_else(|| printed.trim().to_string());
+                            if let Ok(mut slot) = announced.lock() {
+                                *slot = Some(addr.clone());
+                            }
                             let needle = credential.clone();
                             listener_probe = Some(std::thread::spawn(move || {
-                                scan::listener(Some(&addr), &needle)
+                                scan::listener(Some(&addr), &needle, None)
                             }));
                         }
                         stdout_buf.extend_from_slice(&line);
@@ -202,11 +252,16 @@ fn capture(mut agent: Child, credential: &Zeroizing<String>, proxy_addr: Option<
         .map(|poll| poll.join().unwrap_or(false))
         .collect::<Vec<_>>()
         .contains(&true);
-    let listener = match listener_probe {
+    let tokenless = match listener_probe {
         Some(probe) => probe
             .join()
             .unwrap_or_else(|_| VectorEvidence::incomplete(scan::REASON_LISTENER)),
-        None => scan::listener(proxy_addr, credential),
+        None => scan::listener(proxy_addr, credential, None),
+    };
+    let authenticated = token_probe.and_then(|probe| probe.join().ok().flatten());
+    let listener = match authenticated {
+        Some(authenticated) => combine_listener(tokenless, authenticated),
+        None => without_run_token(tokenless),
     };
     Captured {
         stdout: stdout_buf,
@@ -214,5 +269,29 @@ fn capture(mut agent: Child, credential: &Zeroizing<String>, proxy_addr: Option<
         complete,
         observed_live,
         listener,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_listener_probed_only_without_the_token_is_incomplete() {
+        let gated = without_run_token(VectorEvidence::complete(false));
+        assert_eq!(gated.status, "incomplete");
+        assert_eq!(gated.found, None);
+        assert_eq!(gated.reason, Some(scan::REASON_NO_RUN_TOKEN));
+
+        let leaked = without_run_token(VectorEvidence::complete(true));
+        assert_eq!(leaked.status, "complete");
+        assert_eq!(leaked.found, Some(true));
+
+        let both = combine_listener(
+            VectorEvidence::complete(false),
+            VectorEvidence::complete(false),
+        );
+        assert_eq!(both.status, "complete");
+        assert_eq!(both.found, Some(false));
     }
 }

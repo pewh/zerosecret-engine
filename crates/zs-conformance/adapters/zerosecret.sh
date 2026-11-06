@@ -42,9 +42,9 @@ if [ "${1:-}" = "presign" ]; then
   [ -n "$handle" ] || { echo "presign needs --handle" >&2; exit 2; }
   [ -n "$url" ] || { echo "presign needs --url" >&2; exit 2; }
   home=${handle%%|*}
-  endpoint=$(sed -n 's/^zs: endpoint conformance -> //p' "$home/stdout" | head -n 1)
-  [ -n "$endpoint" ] || endpoint=$(sed -n 's/^zs: proxy //p' "$home/stdout" | head -n 1)
-  [ -n "$endpoint" ] || { echo "no listener to presign against" >&2; exit 1; }
+  endpoint=
+  [ -f "$home/child.env" ] && endpoint=$(sed -n 's/^ZS_CONFORMANCE_URL=//p' "$home/child.env" | head -n 1)
+  [ -n "$endpoint" ] || { echo "no endpoint URL in the child environment" >&2; exit 1; }
   now=$(date -u +%Y%m%dT%H%M%SZ)
   date8=${now%%T*}
   case "$url" in
@@ -54,7 +54,7 @@ if [ "${1:-}" = "presign" ]; then
   url="${url}${separator}X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=placeholder%2F${date8}%2F${ZS_CONFORMANCE_AWS_REGION:-us-east-1}%2F${ZS_CONFORMANCE_AWS_SERVICE:-service}%2Faws4_request&X-Amz-Date=${now}&X-Amz-Expires=${expires}&X-Amz-SignedHeaders=host&X-Amz-Signature=0"
   body=$(printf '{"url":"%s","method":"%s"}' "$url" "$method")
   signed=$(curl -sS --max-time 15 --header 'Content-Type: application/json' \
-    --data "$body" "http://$endpoint/.zs/presign") || exit 1
+    --data "$body" "$endpoint/.zs/presign") || exit 1
   case "$signed" in
     http://*|https://*) printf '{"url":"%s"}\n' "$signed" ;;
     *) echo "presign returned: $signed" >&2; exit 1 ;;
@@ -211,12 +211,13 @@ policy=$(printf '{"bindings":[{"resource":"conformance","host":"%s","protocol":"
 
 printf '%s\n' "$policy" > "$home/zs-policy.json"
 
-USER=conformance ZS_HOME="$home" "$zs_bin" run \
+USER=conformance ZS_HOME="$home" ZS_TEST_ENV_FILE="$home/child.env" "$zs_bin" run \
   --policy "$home/zs-policy.json" \
   --credentials-dir "$home/.zs-credentials" \
   --audit "$home/audit.jsonl" \
   --ca-dir "$home/.zs-ca" \
-  --as default -- sleep 86400 > "$home/stdout" 2> "$home/stderr" &
+  --as default -- sh -c 'env | grep -E "^(HTTPS_PROXY|ZS_[A-Z0-9_]+_URL)=" > "$ZS_TEST_ENV_FILE.tmp"; mv "$ZS_TEST_ENV_FILE.tmp" "$ZS_TEST_ENV_FILE"; exec sleep 86400' \
+  > "$home/stdout" 2> "$home/stderr" &
 pid=$!
 echo "$home|$pid" > "$home/handle"
 
@@ -235,7 +236,7 @@ while [ "$attempts" -lt 400 ]; do
   else
     listener=$(sed -n "s/^zs: $kind conformance -> //p" "$home/stdout" | head -n 1)
   fi
-  [ -n "$listener" ] && break
+  [ -n "$listener" ] && [ -f "$home/child.env" ] && break
   attempts=$((attempts + 1))
   sleep 0.05
 done
@@ -244,11 +245,20 @@ if [ -z "$listener" ]; then
   cat "$home/stderr" >&2
   exit 1
 fi
+if [ ! -f "$home/child.env" ]; then
+  echo "the child of zs run never wrote its environment for case $case_id" >&2
+  exit 1
+fi
 trap - EXIT
 
 prefix=CONFORMANCE
 port=${listener##*:}
 listener_host=${listener%:*}
-printf '{"handle":"%s","endpoint":"%s","env":{"%s_HOST":"%s","%s_PORT":"%s"%s}}\n' \
+proxy_userinfo=
+if [ -f "$home/child.env" ]; then
+  proxy_userinfo=$(sed -n 's|^HTTPS_PROXY=http://||p' "$home/child.env" | head -n 1 | sed 's|@.*||')
+fi
+printf '{"handle":"%s","endpoint":"%s","env":{"%s_HOST":"%s","%s_PORT":"%s"%s%s}}\n' \
   "$(cat "$home/handle")" "$listener" "$prefix" "$listener_host" "$prefix" "$port" \
+  "$(if [ -n "$proxy_userinfo" ]; then printf ',"CONFORMANCE_PROXY_USERINFO":"%s"' "$proxy_userinfo"; fi)" \
   "$(if [ "$kind" = "http" ]; then printf ',"CONFORMANCE_HTTP_HOST":"%s"' "$host_label"; fi)"

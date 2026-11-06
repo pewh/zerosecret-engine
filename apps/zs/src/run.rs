@@ -8,7 +8,7 @@ use zs::{AgentFile, AgentHandler, GrantCache};
 use zs_audit::Journal;
 use zs_diag::{Component, DiagLog, Event};
 use zs_identity::{Subject, WorkloadLabel};
-use zs_mitm::{LocalCa, ProxyServer};
+use zs_mitm::{LocalCa, ProxyServer, RunToken};
 
 struct UnconfiguredExchange;
 
@@ -563,6 +563,7 @@ impl Drop for BackgroundTasks {
 
 struct RunningServices {
     proxy_addr: std::net::SocketAddr,
+    token: std::sync::Arc<RunToken>,
     http_proxy: bool,
     postgres_addr: Option<std::net::SocketAddr>,
     mysql_addr: Option<std::net::SocketAddr>,
@@ -879,6 +880,7 @@ async fn start_services(
         return Err(refuse_run(&prepared.diag, "listen", 2));
     }
     let mut tasks = BackgroundTasks::new();
+    let token = std::sync::Arc::new(RunToken::generate());
     let handler: std::sync::Arc<dyn zs_mitm::FlowHandler> = prepared.agent.clone();
     let l3_handler = handler.clone();
     let server = match ProxyServer::bind(
@@ -886,6 +888,7 @@ async fn start_services(
         prepared.ca.clone(),
         handler,
         prepared.journal.clone(),
+        token.clone(),
     )
     .await
     {
@@ -950,7 +953,8 @@ async fn start_services(
                 .with_diag(prepared.diag.clone(), &binding.resource)
                 .with_refusal_audit(refusal_audit)
                 .with_cancel_authorize(cancel_authorize)
-                .with_expected_user(binding.user.clone()),
+                .with_expected_user(binding.user.clone())
+                .with_caller_check(crate::peer::caller_check()),
             Err(e) => {
                 stderr_line!("zs: postgres listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
@@ -1007,7 +1011,8 @@ async fn start_services(
                 .with_diag(prepared.diag.clone(), &binding.resource)
                 .with_refusal_audit(refusal_audit)
                 .with_expected_user(binding.user.clone())
-                .with_client_auth(client_auth),
+                .with_client_auth(client_auth)
+                .with_caller_check(crate::peer::caller_check()),
             Err(e) => {
                 stderr_line!("zs: mysql listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
@@ -1070,7 +1075,8 @@ async fn start_services(
         {
             Ok(listener) => listener
                 .with_diag(prepared.diag.clone(), &binding.resource)
-                .with_refusal_audit(refusal_audit),
+                .with_refusal_audit(refusal_audit)
+                .with_caller_check(crate::peer::caller_check()),
             Err(e) => {
                 stderr_line!("zs: mongo listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
@@ -1093,6 +1099,7 @@ async fn start_services(
             prepared.journal.clone(),
             prepared.diag.clone(),
             binding.host.clone(),
+            token.clone(),
         )
         .await
         {
@@ -1180,6 +1187,7 @@ async fn start_services(
 
     Ok(RunningServices {
         proxy_addr: addr,
+        token,
         http_proxy: prepared.file.bindings.iter().any(|b| b.is_http()),
         postgres_addr: pg_endpoint,
         mysql_addr: mysql_endpoint,
@@ -1391,10 +1399,11 @@ fn build_child(
         ca_path.to_path_buf()
     });
     let no_proxy = no_proxy();
+    let proxy_url = services.token.proxy_url(addr);
     let mut cmd = Command::new(&args.rest[0]);
     cmd.args(&args.rest[1..])
-        .env("HTTPS_PROXY", format!("http://{addr}"))
-        .env("https_proxy", format!("http://{addr}"))
+        .env("HTTPS_PROXY", proxy_url.as_str())
+        .env("https_proxy", proxy_url.as_str())
         .env("NO_PROXY", &no_proxy)
         .env("no_proxy", &no_proxy)
         .env("NODE_EXTRA_CA_CERTS", ca_path)
@@ -1403,8 +1412,8 @@ fn build_child(
         .env("CURL_CA_BUNDLE", &bundle)
         .env("NODE_USE_ENV_PROXY", "1");
     if services.http_proxy {
-        cmd.env("HTTP_PROXY", format!("http://{addr}"))
-            .env("http_proxy", format!("http://{addr}"));
+        cmd.env("HTTP_PROXY", proxy_url.as_str())
+            .env("http_proxy", proxy_url.as_str());
     }
     let ca_dir = std::fs::canonicalize(&args.ca_dir).unwrap_or_else(|_| args.ca_dir.clone());
     match bun_preload_dir(&ca_dir) {
@@ -1454,7 +1463,10 @@ fn build_child(
             .env(format!("{prefix}_PORT"), addr.port().to_string());
     }
     for (prefix, addr) in &services.endpoints {
-        cmd.env(format!("{prefix}_URL"), format!("http://{addr}"));
+        cmd.env(
+            format!("{prefix}_URL"),
+            services.token.endpoint_url(*addr).as_str(),
+        );
     }
     cmd
 }
@@ -2134,6 +2146,7 @@ mod tests {
         tasks.push(runtime.spawn(async move { while listener.accept().await.is_ok() {} }));
         let services = RunningServices {
             proxy_addr: addr,
+            token: std::sync::Arc::new(RunToken::generate()),
             http_proxy: false,
             postgres_addr: None,
             mysql_addr: None,

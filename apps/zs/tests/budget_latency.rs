@@ -52,9 +52,12 @@ async fn connect_proxied_tls(
         }
     };
     let mut tcp = tcp;
-    tcp.write_all(b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n")
-        .await
-        .unwrap();
+    tcp.write_all(&common::authorized_for_proxy(
+        proxy,
+        b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
+    ))
+    .await
+    .unwrap();
     let mut connect_response = Vec::new();
     let mut byte = [0u8; 1];
     loop {

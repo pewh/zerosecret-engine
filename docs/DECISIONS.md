@@ -7,6 +7,58 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0052 — Local callers authenticate to `zs run`
+
+**2026-11-06 · Accepted** · owner request 2026-11-06 (accepts CA1-CA4 of the local caller
+authentication spec)
+
+Every listener of `zs run` accepts any process that can open a loopback socket, of any OS
+account, and serves it the developer's grants. The HTTP proxy and the local endpoint never read
+the peer; the database relays never challenge the client for a password, so a local client is
+relayed to the upstream under the developer's authorization. Loopback bounds the interface, not
+the callers.
+
+**Decision.**
+- **Proxy token (P1).** Each run makes 32 random bytes as 64 lowercase hex characters and puts
+  them in the userinfo of `HTTPS_PROXY`, and of `HTTP_PROXY` when the run has an http binding,
+  as `http://zs:<hex>@<addr>`. The proxy checks `Proxy-Authorization` on every CONNECT and
+  every absolute-URI request, keep-alive included, in constant time, before grant lookup,
+  materialization or audit. It removes the header before it forwards.
+- **Endpoint token (E1).** The token is the first path segment of every `ZS_<RESOURCE>_URL`:
+  the URL is `http://<addr>/<hex>` and the presign URL is `<that URL>/.zs/presign`. The agent
+  strips the segment before it matches, signs, audits or logs. A percent-encoded or upper-case
+  segment is refused.
+- **Database peer check (D2).** On accept, each relay asks one injected check whether the peer
+  socket belongs to the agent's OS user: `NETLINK_SOCK_DIAG` on Linux, a walk of the user's
+  processes on macOS. A listener built without a check refuses every caller, so a missing
+  wiring fails closed. Windows allows, and
+  [SECURITY.md §3](SECURITY.md#3-what-zerosecret-does-not-defend-against) states the gap:
+  Windows database listeners stay loopback-only.
+- **Fail closed.** A lookup error, a socket that is not found and an unknown platform deny.
+  Windows is the one exception, above.
+- **Refusals.** Proxy `407` with the reason phrase `ZeroSecret needs the run token` and
+  `Proxy-Authenticate: Basic realm="zs"`, then the connection closes; endpoint `403` with the
+  same phrase, then the connection closes; a database listener closes before it reads a byte.
+  Each refusal emits one diag event `caller_refused` with its listener kind and writes no audit
+  record. No refusal echoes the token or the sent value.
+- **The token (CA4).** A new token for every `zs run`, never written to disk, never printed. It
+  is a credential: held in `Zeroizing`, with no `Debug`, `Display`, `Clone` or `Serialize`.
+- There is no opt-out flag.
+
+**Consequence.** A client that drops the proxy userinfo stops working, and every refusal is a
+row in [SECURITY.md §7](SECURITY.md#7-fail-closed-matrix). The boundary moves from any local
+account to the OS user, and no further:
+
+> Caller authentication narrows a local listener from any local account to processes of the OS
+> user that runs `zs run`. A process of that user can still read the run token from the child's
+> environment and passes the peer check. It is not isolation.
+
+**Reverse it if** a measured, supported client cannot carry the proxy userinfo or the path
+segment and cannot be configured to. Then review the proxy token against the peer lookup, or
+Unix sockets in a 0700 directory, rather than adding an opt-out.
+
+---
+
 ## ADR-0051 — The commercial suite is Go; tests that need engine internals live here
 
 **2026-11-04 · Accepted** · owner request 2026-11-03 ("port suite to go") · amends ADR-0050

@@ -461,6 +461,14 @@ never a global mode.
 
 Always use the least invasive mechanism that satisfies the invariant.
 
+The child's environment carries the run's credential (ADR-0052). `HTTPS_PROXY`, and
+`HTTP_PROXY` when the run has an http binding, is `http://zs:<run token>@<addr>`, and
+`ZS_<RESOURCE>_URL` is `http://<addr>/<run token>`. The proxy checks `Proxy-Authorization` on
+every request, and the endpoint strips the first path segment before it matches, signs or audits.
+`/.zs/presign` strips the token from the URL it re-signs too, so a URL a client presigned on
+`ZS_<RESOURCE>_URL` comes back without it. No line on stdout and no `listener_bound` event
+carries the token.
+
 This is not a system-wide proxy. Browsers, banking sites, and unrelated applications are
 untouched. ZeroSecret is not Zscaler and must never be described as though it were.
 

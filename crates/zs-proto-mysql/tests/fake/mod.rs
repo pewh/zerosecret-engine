@@ -366,6 +366,10 @@ pub fn pki(san: &str) -> Pki {
     }
 }
 
+pub fn admit_all() -> zs_protocol::CallerCheck {
+    Arc::new(|_, _| true)
+}
+
 pub async fn listen(
     host: &str,
     port: u16,
@@ -373,6 +377,19 @@ pub async fn listen(
     materialize: Materialize,
     diag: DiagLog,
     audit: Option<AuditRefusal>,
+) -> SocketAddr {
+    listen_gated(host, port, tls, materialize, diag, audit, Some(admit_all())).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_gated(
+    host: &str,
+    port: u16,
+    tls: UpstreamTls,
+    materialize: Materialize,
+    diag: DiagLog,
+    audit: Option<AuditRefusal>,
+    caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
     let endpoint = UpstreamEndpoint::new(host, port).unwrap();
     let mut listener = MysqlListener::bind_endpoint("127.0.0.1:0", endpoint, tls, materialize)
@@ -382,6 +399,10 @@ pub async fn listen(
     if let Some(audit) = audit {
         listener = listener.with_refusal_audit(audit);
     }
+    let listener = match caller_check {
+        Some(check) => listener.with_caller_check(check),
+        None => listener,
+    };
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     local

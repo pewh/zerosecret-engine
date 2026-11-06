@@ -61,16 +61,16 @@ fn setup(auth: &str, operations: &[&str]) -> Agent {
     }
 }
 
-fn endpoint(agent: &Agent) -> String {
+fn endpoint(agent: &Agent) -> (String, String) {
     let file = agent.dir.join("endpoint");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !file.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let url = std::fs::read_to_string(file).unwrap();
-    url.strip_prefix("http://")
-        .expect("an http endpoint")
-        .to_string()
+    let rest = url.strip_prefix("http://").expect("an http endpoint");
+    let (host, token) = rest.split_once('/').expect("the path token");
+    (host.to_string(), format!("/{token}"))
 }
 
 fn send(addr: &str, raw: &str) -> (String, String) {
@@ -87,11 +87,11 @@ fn send(addr: &str, raw: &str) -> (String, String) {
 #[test]
 fn the_endpoint_re_signs_sigv4_for_the_real_host_and_scope() {
     let agent = setup(SIGV4, &["GET", "PUT"]);
-    let addr = endpoint(&agent);
+    let (addr, prefix) = endpoint(&agent);
     let (status, _) = send(
         &addr,
         &format!(
-            "GET /bucket/dir/a%20b.txt?list-type=2 HTTP/1.1\r\nHost: {addr}\r\nx-amz-date: 20261016T120000Z\r\nx-amz-content-sha256: UNSIGNED-PAYLOAD\r\nAuthorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261016/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=placeholder\r\nConnection: close\r\n\r\n"
+            "GET {prefix}/bucket/dir/a%20b.txt?list-type=2 HTTP/1.1\r\nHost: {addr}\r\nx-amz-date: 20261016T120000Z\r\nx-amz-content-sha256: UNSIGNED-PAYLOAD\r\nAuthorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261016/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=placeholder\r\nConnection: close\r\n\r\n"
         ),
     );
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
@@ -116,11 +116,11 @@ fn the_endpoint_re_signs_sigv4_for_the_real_host_and_scope() {
 #[test]
 fn a_signed_request_without_sigv4_headers_is_denied_and_not_forwarded() {
     let agent = setup(SIGV4, &["GET"]);
-    let addr = endpoint(&agent);
+    let (addr, prefix) = endpoint(&agent);
     let (status, _) = send(
         &addr,
         &format!(
-            "GET /bucket/k HTTP/1.1\r\nHost: {addr}\r\nAuthorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261016/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=placeholder\r\nConnection: close\r\n\r\n"
+            "GET {prefix}/bucket/k HTTP/1.1\r\nHost: {addr}\r\nAuthorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261016/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=placeholder\r\nConnection: close\r\n\r\n"
         ),
     );
     assert!(status.contains("502"), "{status}");
@@ -130,10 +130,12 @@ fn a_signed_request_without_sigv4_headers_is_denied_and_not_forwarded() {
 #[test]
 fn an_anonymous_request_is_forwarded_without_a_credential() {
     let agent = setup(SIGV4, &["GET"]);
-    let addr = endpoint(&agent);
+    let (addr, prefix) = endpoint(&agent);
     let (status, _) = send(
         &addr,
-        &format!("GET /bucket/public.png HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "GET {prefix}/bucket/public.png HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     assert_eq!(agent.upstream.requests.load(Ordering::SeqCst), 1);
@@ -149,7 +151,7 @@ fn an_anonymous_request_is_forwarded_without_a_credential() {
     assert!(!head.contains(SECRET), "{head}");
 }
 
-fn presign(addr: &str, method: &str) -> (String, String) {
+fn presign(addr: &str, prefix: &str, method: &str) -> (String, String) {
     let date = common::amz_now();
     let day = &date[..8];
     let body = format!(
@@ -158,7 +160,7 @@ fn presign(addr: &str, method: &str) -> (String, String) {
     send(
         addr,
         &format!(
-            "POST /.zs/presign HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {prefix}/.zs/presign HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     )
@@ -167,8 +169,8 @@ fn presign(addr: &str, method: &str) -> (String, String) {
 #[test]
 fn a_presigned_url_is_re_signed_for_the_public_origin() {
     let agent = setup(SIGV4, &["GET", "PUT"]);
-    let addr = endpoint(&agent);
-    let (status, body) = presign(&addr, "GET");
+    let (addr, prefix) = endpoint(&agent);
+    let (status, body) = presign(&addr, &prefix, "GET");
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     let url = body.rsplit("\r\n\r\n").next().unwrap();
     assert!(
@@ -199,8 +201,8 @@ fn a_presigned_url_is_re_signed_for_the_public_origin() {
 #[test]
 fn a_presign_for_an_ungranted_method_is_denied() {
     let agent = setup(SIGV4, &["GET"]);
-    let addr = endpoint(&agent);
-    let (status, _) = presign(&addr, "DELETE");
+    let (addr, prefix) = endpoint(&agent);
+    let (status, _) = presign(&addr, &prefix, "DELETE");
     assert!(status.contains("502"), "{status}");
 }
 
@@ -211,12 +213,17 @@ fn the_hmac_body_signature_is_computed_by_the_agent() {
         &["POST"],
     );
     let body = r#"{"account":"0000001234567890"}"#;
+    let request = format!(
+        "POST https://api.stripe.com/api/v2/balance HTTP/1.1\r\nHost: api.stripe.com\r\nva: 0000001234567890\r\nsignature: placeholder\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     let (status, _) = send(
         &agent.agent.proxy_addr,
-        &format!(
-            "POST https://api.stripe.com/api/v2/balance HTTP/1.1\r\nHost: api.stripe.com\r\nva: 0000001234567890\r\nsignature: placeholder\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        ),
+        &String::from_utf8(common::authorized_for_proxy(
+            &agent.agent.proxy_addr,
+            request.as_bytes(),
+        ))
+        .unwrap(),
     );
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     let head = agent.upstream.last_head.lock().unwrap().clone();

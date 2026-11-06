@@ -40,6 +40,16 @@ fn child_writes_marker() {
     let Some(path) = std::env::var_os(MARKER) else {
         return;
     };
+    if let Some(proxy) = std::env::var_os("HTTPS_PROXY") {
+        let proxy_file = PathBuf::from(&path).with_extension("proxy");
+        let pending = proxy_file.with_extension("pending");
+        std::fs::write(
+            &pending,
+            format!("HTTPS_PROXY={}\n", proxy.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::rename(&pending, &proxy_file).unwrap();
+    }
     std::fs::write(path, STARTED).unwrap();
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
 }
@@ -112,6 +122,7 @@ impl Workspace {
     fn marker(&self, name: &str) -> PathBuf {
         let marker = self.path().join(name);
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(marker.with_extension("proxy"));
         marker
     }
 
@@ -276,6 +287,22 @@ impl RunningAgent {
                 break addr.to_owned();
             }
         };
+        let proxy_file = marker.with_extension("proxy");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !proxy_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never wrote its HTTPS_PROXY"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (authorization, _) =
+            common::parse_child_env(&std::fs::read_to_string(&proxy_file).unwrap());
+        assert!(
+            !authorization.is_empty(),
+            "the child's HTTPS_PROXY carries no run token"
+        );
+        common::register_proxy_authorization(&proxy, &authorization);
         Self {
             child,
             stdin,

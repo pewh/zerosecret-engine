@@ -270,13 +270,21 @@ An `https` binding (the default) or an `http` binding names its `host`, its `ope
   With a control plane, a binding whose host or protocol differs from its grant stops the run at
   startup. In local mode the request is denied instead (ADR-0037).
 - `local_endpoint: true` opens a loopback listener and sets `ZS_<RESOURCE>_URL`, for clients
-  that ignore proxy variables. It accepts only `Host: 127.0.0.1:<port>` or
-  `localhost:<port>` and refuses a request with `Origin`. `POST <url>/.zs/presign` with
+  that ignore proxy variables. The URL carries the run token as its first path segment:
+  `http://127.0.0.1:<port>/<token>`, so `POST <that url>/.zs/presign` needs no header. A request
+  whose path does not start with the token gets `403`. It accepts only `Host: 127.0.0.1:<port>`
+  or `localhost:<port>` and refuses a request with `Origin`. `POST <url>/.zs/presign` with
   `{"url": ..., "method": ...}` answers with the presigned URL signed by the real secret, on
-  the public origin; `X-Amz-Date` must be within 15 minutes of now (ADR-0035).
+  the public origin; `X-Amz-Date` must be within 15 minutes of now (ADR-0035). A `url` that a
+  client presigned on `ZS_<RESOURCE>_URL` keeps the token as its first path segment; the agent
+  removes it before it signs, so the answer never carries the token.
 - `zs run` adds `127.0.0.1,localhost,::1` to `NO_PROXY`, and points `SSL_CERT_FILE`,
   `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` at `ca-bundle.crt` (the agent CA and the system
   roots).
+- `HTTPS_PROXY` carries the run token as the proxy user name and password:
+  `http://zs:<64 hex>@127.0.0.1:<port>`. A client that drops the userinfo is refused with `407`
+  and never reaches a grant, a credential or the audit journal. There is no opt-out flag, and the
+  token changes on every run; it is never written to disk or printed (ADR-0052).
 
 ## Database upstream TLS
 

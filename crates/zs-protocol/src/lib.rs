@@ -1,6 +1,9 @@
 use zs_credential::Credential;
 use zs_identity::{Subject, WorkloadLabel};
 
+pub type CallerCheck =
+    std::sync::Arc<dyn Fn(std::net::SocketAddr, std::net::SocketAddr) -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     pub host: String,

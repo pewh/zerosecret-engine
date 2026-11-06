@@ -21,6 +21,7 @@ use crate::ca::LocalCa;
 use crate::echo::{self, EchoNeedles, RequestSnapshot};
 use crate::http1::{self, Guarded, TargetGuard};
 use crate::pipeline;
+use crate::run_token::RunToken;
 use crate::scope::{PathScope, Refusal, ScopeDecision};
 use crate::websocket;
 
@@ -104,6 +105,7 @@ pub struct ProxyServer {
     ca: Arc<LocalCa>,
     handler: Arc<dyn FlowHandler>,
     journal: Arc<Journal>,
+    token: Arc<RunToken>,
     diag: DiagLog,
 }
 
@@ -232,6 +234,10 @@ fn proxy_event(conn: u64, name: &'static str) -> Event {
     Event::new(Component::Proxy, name).conn(conn)
 }
 
+fn caller_refused(conn: u64, listener: &'static str) -> Event {
+    proxy_event(conn, "caller_refused").token("listener", listener)
+}
+
 fn with_seq(event: Event, seq: Option<u64>) -> Event {
     match seq {
         Some(seq) => event.audit_seq(seq),
@@ -271,6 +277,7 @@ impl ProxyServer {
         ca: Arc<LocalCa>,
         handler: Arc<dyn FlowHandler>,
         journal: Arc<Journal>,
+        token: Arc<RunToken>,
     ) -> Result<Self, ProxyError> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
@@ -278,6 +285,7 @@ impl ProxyServer {
             ca,
             handler,
             journal,
+            token,
             diag: DiagLog::disabled(),
         })
     }
@@ -300,6 +308,7 @@ impl ProxyServer {
                 ca: self.ca.clone(),
                 handler: self.handler.clone(),
                 journal: self.journal.clone(),
+                token: self.token.clone(),
                 diag: self.diag.clone(),
             };
             let state = ConnectionState::default();
@@ -341,6 +350,7 @@ impl EndpointServer {
         journal: Arc<Journal>,
         diag: DiagLog,
         origin_host: String,
+        token: Arc<RunToken>,
     ) -> Result<Self, ProxyError> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
@@ -349,6 +359,7 @@ impl EndpointServer {
                 ca,
                 handler,
                 journal,
+                token,
                 diag,
             },
             origin_host,
@@ -368,6 +379,7 @@ impl EndpointServer {
                 ca: self.shared.ca.clone(),
                 handler: self.shared.handler.clone(),
                 journal: self.shared.journal.clone(),
+                token: self.shared.token.clone(),
                 diag: self.shared.diag.clone(),
             };
             let host = self.origin_host.clone();
@@ -435,7 +447,7 @@ async fn serve_endpoint_connection(
 
 #[allow(clippy::too_many_arguments)]
 async fn endpoint_request(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     shared: ProxyShared,
     state: &ConnectionState,
     guard: &TargetGuard,
@@ -445,6 +457,24 @@ async fn endpoint_request(
     conn: u64,
     loopback_hosts: &[String; 2],
 ) -> Response<http1::Body> {
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_default();
+    let Some(stripped) = shared.token.strip_endpoint_prefix(path_and_query) else {
+        shared.diag.emit(caller_refused(conn, "endpoint"));
+        return http1::reply(http1::Reply::RunTokenForbidden);
+    };
+    let Ok(stripped) = stripped.as_ref().parse::<hyper::http::uri::PathAndQuery>() else {
+        return http1::reply(http1::Reply::Refused);
+    };
+    let mut parts = request.uri().clone().into_parts();
+    parts.path_and_query = Some(stripped);
+    let Ok(uri) = hyper::Uri::from_parts(parts) else {
+        return http1::reply(http1::Reply::Refused);
+    };
+    *request.uri_mut() = uri;
     let origin_form = request.uri().scheme().is_none()
         && request.uri().authority().is_none()
         && request.uri().path().starts_with('/');
@@ -518,7 +548,11 @@ async fn handle_presign(
     let operation = format!("presign {method}");
     let path_and_query = url
         .split_once("://")
-        .and_then(|(_, rest)| rest.find('/').map(|at| rest[at..].to_string()));
+        .and_then(|(_, rest)| rest.find('/').map(|at| &rest[at..]))
+        .map(|path| match shared.token.strip_endpoint_prefix(path) {
+            Some(stripped) => stripped.into_owned(),
+            None => path.to_string(),
+        });
     let signed = (|| {
         let path_and_query = path_and_query.ok_or_else(|| zs_protocol::Denied::new("no path"))?;
         let Flow::Intercept {
@@ -646,6 +680,7 @@ struct ProxyShared {
     ca: Arc<LocalCa>,
     handler: Arc<dyn FlowHandler>,
     journal: Arc<Journal>,
+    token: Arc<RunToken>,
     diag: DiagLog,
 }
 
@@ -698,7 +733,7 @@ async fn handle_connection(
 }
 
 async fn front_door(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     shared: ProxyShared,
     conn: u64,
     req: &AtomicU64,
@@ -706,6 +741,13 @@ async fn front_door(
     guard: &TargetGuard,
 ) -> Response<http1::Body> {
     let method = request.method().as_str().to_string();
+    if !shared.token.admits(request.headers()) {
+        shared.diag.emit(caller_refused(conn, "proxy"));
+        return http1::reply(http1::Reply::RunTokenRequired);
+    }
+    request
+        .headers_mut()
+        .remove(hyper::header::PROXY_AUTHORIZATION);
     let target = request.uri().to_string();
     let withheld = holds_userinfo(&method, &target);
     let number = req.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1890,8 +1932,18 @@ impl rustls::server::ResolvesServerCert for StaticResolver {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use base64::Engine as _;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn authorized(token: &RunToken, request: &str) -> Vec<u8> {
+        let (line, rest) = request.split_once("\r\n").expect("a request line");
+        format!(
+            "{line}\r\nProxy-Authorization: {}\r\n{rest}",
+            token.proxy_authorization().as_str()
+        )
+        .into_bytes()
+    }
 
     #[tokio::test]
     async fn server_config_negotiates_h2_client_down_to_http11() {
@@ -2247,11 +2299,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let log_path = home.path().join("diag.jsonl");
         let diag = zs_diag::DiagLog::open_with_cap(&log_path, "t-1", 1 << 20).unwrap();
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
             Arc::new(Scoped),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap()
@@ -2260,7 +2314,10 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
-            .write_all(b"GET https://api.stripe.com/a/../oauth/token HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n")
+            .write_all(&authorized(
+                &token,
+                "GET https://api.stripe.com/a/../oauth/token HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n",
+            ))
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -2361,11 +2418,13 @@ mod tests {
             }
         }
         let home = tempfile::tempdir().unwrap();
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
             Arc::new(Scoped),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap();
@@ -2373,7 +2432,10 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
-            .write_all(b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n")
+            .write_all(&authorized(
+                &token,
+                "CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
+            ))
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -2454,11 +2516,13 @@ mod tests {
         let log_path = home.path().join("diag.jsonl");
         let diag = zs_diag::DiagLog::open_with_cap(&log_path, "t-2", 1 << 20).unwrap();
         let ca = Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap());
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ca.clone(),
             Arc::new(Scoped),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap()
@@ -2486,9 +2550,10 @@ mod tests {
             "GET /oauth/authenticate HTTP/1.1",
         ] {
             let mut tcp = TcpStream::connect(addr).await.unwrap();
-            tcp.write_all(
-                b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
-            )
+            tcp.write_all(&authorized(
+                &token,
+                "CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
+            ))
             .await
             .unwrap();
             let mut established = [0u8; 39];
@@ -2565,11 +2630,13 @@ mod tests {
         let log_path = home.path().join("diag.jsonl");
         let diag = zs_diag::DiagLog::open_with_cap(&log_path, "t-conn", 1 << 20).unwrap();
         let ca = Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap());
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ca.clone(),
             Arc::new(Scoped),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap()
@@ -2579,9 +2646,12 @@ mod tests {
 
         use rustls::pki_types::pem::PemObject;
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.write_all(b"CONNECT scoped.test:443 HTTP/1.1\r\nHost: scoped.test:443\r\n\r\n")
-            .await
-            .unwrap();
+        tcp.write_all(&authorized(
+            &token,
+            "CONNECT scoped.test:443 HTTP/1.1\r\nHost: scoped.test:443\r\n\r\n",
+        ))
+        .await
+        .unwrap();
         let mut established = vec![0u8; 39];
         tcp.read_exact(&mut established).await.unwrap();
         assert!(established.starts_with(b"HTTP/1.1 200"));
@@ -2681,11 +2751,13 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         let ca = Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap());
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ca.clone(),
             Arc::new(Pipelined),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap();
@@ -2715,8 +2787,10 @@ mod tests {
             use std::io::Read as _;
             let mut tcp = std::net::TcpStream::connect(addr).unwrap();
             tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            let mut request =
-                b"CONNECT pipelined.test:443 HTTP/1.1\r\nHost: pipelined.test:443\r\n\r\n".to_vec();
+            let mut request = authorized(
+                &token,
+                "CONNECT pipelined.test:443 HTTP/1.1\r\nHost: pipelined.test:443\r\n\r\n",
+            );
             request.extend_from_slice(&hello);
             tcp.write_all(&request).unwrap();
             let mut head = Vec::new();
@@ -2878,46 +2952,657 @@ mod tests {
 
     async fn forwarding_proxy(
         upstream_port: u16,
-    ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>) {
+    ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>, Arc<RunToken>) {
         forwarding_proxy_to("127.0.0.1", upstream_port).await
     }
 
     async fn forwarding_proxy_to(
         upstream_host: &'static str,
         upstream_port: u16,
-    ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>) {
+    ) -> (std::net::SocketAddr, Arc<crate::ca::LocalCa>, Arc<RunToken>) {
         let home = tempfile::tempdir().unwrap();
         let ca = Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap());
+        let token = Arc::new(RunToken::generate());
         let server = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ca.clone(),
             Arc::new(Forwarding(upstream_host, upstream_port)),
             Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
         )
         .await
         .unwrap();
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move { server.serve().await });
-        (addr, ca)
+        (addr, ca, token)
+    }
+
+    struct RecordingUpstream {
+        port: u16,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn recording_upstream() -> RecordingUpstream {
+        use std::sync::atomic::AtomicUsize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepts_t = accepts.clone();
+        let heads_t = heads.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                accepts_t.fetch_add(1, Ordering::SeqCst);
+                let heads = heads_t.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).await.unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    heads
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        RecordingUpstream {
+            port,
+            accepts,
+            heads,
+        }
+    }
+
+    struct PlainForwarding(u16);
+
+    impl FlowHandler for PlainForwarding {
+        fn classify(&self, _destination: &Destination) -> Flow {
+            Flow::Intercept {
+                resource: "plain.test".into(),
+                upstream_host: "127.0.0.1".into(),
+                upstream_port: self.0,
+                upstream_tls: false,
+                scheme: Scheme::Http,
+                scope: PathScope::Host,
+            }
+        }
+        fn subject(&self) -> String {
+            "alice".into()
+        }
+        fn workload(&self) -> String {
+            "w".into()
+        }
+        fn protocol_for(&self, _resource: &str) -> Option<Arc<dyn Protocol>> {
+            Some(Arc::new(Allow))
+        }
+        fn materialize(
+            &self,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<zs_credential::Credential, zs_protocol::Denied> {
+            zs_credential::Credential::from_bytes(b"test-credential".to_vec())
+                .map_err(|_| zs_protocol::Denied::new("test credential"))
+        }
+        fn authorize_message(
+            &self,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<(), zs_protocol::Denied> {
+            Err(zs_protocol::Denied::new("not in this test"))
+        }
+    }
+
+    struct Gate {
+        addr: std::net::SocketAddr,
+        token: Arc<RunToken>,
+        home: tempfile::TempDir,
+        diag: zs_diag::DiagLog,
+    }
+
+    async fn gate(handler: Arc<dyn FlowHandler>) -> Gate {
+        let home = tempfile::tempdir().unwrap();
+        let diag =
+            zs_diag::DiagLog::open_with_cap(&home.path().join("diag.jsonl"), "t-gate", 1 << 20)
+                .unwrap();
+        let token = Arc::new(RunToken::generate());
+        let server = ProxyServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
+            handler,
+            Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token.clone(),
+        )
+        .await
+        .unwrap()
+        .with_diag(diag.clone());
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move { server.serve().await });
+        Gate {
+            addr,
+            token,
+            home,
+            diag,
+        }
+    }
+
+    impl Gate {
+        fn journal(&self) -> Vec<serde_json::Value> {
+            let text = std::fs::read_to_string(self.home.path().join("audit.jsonl")).unwrap();
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn events(&self) -> Vec<serde_json::Value> {
+            self.diag.close();
+            let text = std::fs::read_to_string(self.home.path().join("diag.jsonl")).unwrap();
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    async fn reply_text(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proxy_request_with_the_run_token_reaches_the_upstream() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+        let response = reply_text(
+            gate.addr,
+            &authorized(
+                &gate.token,
+                "GET http://plain.test/direct HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.heads.lock().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let journal = gate.journal();
+        assert!(
+            journal.iter().any(|record| record["decision"] == "allow"),
+            "{journal:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proxy_request_without_the_run_token_is_refused() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+        let allowed = reply_text(
+            gate.addr,
+            &authorized(
+                &gate.token,
+                "GET http://plain.test/direct HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let journal_before = gate.journal().len();
+
+        let refused = reply_text(
+            gate.addr,
+            b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            refused.starts_with("HTTP/1.1 407 ZeroSecret needs the run token"),
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_ascii_lowercase()
+                .contains("proxy-authenticate: basic realm=\"zs\""),
+            "{refused}"
+        );
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(gate.journal().len(), journal_before);
+        let events = gate.events();
+        assert!(!events.iter().any(|event| event["event"] == "materialized"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "caller_refused"
+                    && event["fields"]["listener"] == "proxy")
+                .count(),
+            1,
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proxy_request_with_a_wrong_token_is_refused() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+        let sent =
+            base64::engine::general_purpose::STANDARD.encode(format!("zs:{}", "0".repeat(64)));
+
+        let refused = reply_text(
+            gate.addr,
+            format!("CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\nProxy-Authorization: Basic {sent}\r\n\r\n").as_bytes(),
+        )
+        .await;
+
+        assert!(
+            refused.starts_with("HTTP/1.1 407 ZeroSecret needs the run token"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains(&sent),
+            "the refusal echoes the sent value"
+        );
+        let events = gate.events();
+        assert!(!events.iter().any(|event| event["event"] == "materialized"));
+        let log = std::fs::read_to_string(gate.home.path().join("diag.jsonl")).unwrap();
+        assert!(!log.contains(&sent), "the diag log echoes the sent value");
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_from_another_run_is_refused() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+        let other = RunToken::generate();
+
+        let refused = reply_text(
+            gate.addr,
+            &authorized(
+                &other,
+                "CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n",
+            ),
+        )
+        .await;
+
+        assert!(
+            refused.starts_with("HTTP/1.1 407 ZeroSecret needs the run token"),
+            "{refused}"
+        );
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_request_on_a_kept_alive_connection_is_checked() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+        let mut client = TcpStream::connect(gate.addr).await.unwrap();
+        client
+            .write_all(&authorized(
+                &gate.token,
+                "GET http://plain.test/one HTTP/1.1\r\nHost: plain.test\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        let mut first = Vec::new();
+        let mut byte = [0u8; 1];
+        while client.read(&mut byte).await.unwrap_or(0) == 1 {
+            first.push(byte[0]);
+            if first.ends_with(b"\r\n\r\nok") {
+                break;
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&first).starts_with("HTTP/1.1 200"),
+            "{:?}",
+            String::from_utf8_lossy(&first)
+        );
+
+        client
+            .write_all(
+                b"GET http://plain.test/two HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut second = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut second)).await;
+        let second = String::from_utf8_lossy(&second);
+        assert!(
+            second.starts_with("HTTP/1.1 407 ZeroSecret needs the run token"),
+            "{second}"
+        );
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_run_token_is_not_forwarded_upstream() {
+        let upstream = recording_upstream().await;
+        let gate = gate(Arc::new(PlainForwarding(upstream.port))).await;
+
+        let response = reply_text(
+            gate.addr,
+            &authorized(
+                &gate.token,
+                "GET http://plain.test/direct HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let heads = upstream.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "the upstream must have been reached");
+        assert!(
+            !heads[0]
+                .to_ascii_lowercase()
+                .contains("proxy-authorization"),
+            "{}",
+            heads[0]
+        );
+    }
+
+    fn token_hex(token: &RunToken) -> String {
+        let url = token.endpoint_url("127.0.0.1:9".parse().unwrap());
+        url.rsplit('/').next().unwrap().to_string()
+    }
+
+    struct Presigning;
+
+    impl Protocol for Presigning {
+        fn matches(&self, _destination: &Destination) -> bool {
+            true
+        }
+        fn authorize(&self, _context: &Context) -> Result<(), zs_protocol::Denied> {
+            Ok(())
+        }
+        fn inject(
+            &self,
+            _request: &mut InjectedRequest,
+            _credential: &zs_credential::Credential,
+        ) -> Result<(), zs_protocol::Denied> {
+            Ok(())
+        }
+        fn resign_url(
+            &self,
+            authority: &str,
+            path_and_query: &str,
+            method: &str,
+            _credential: &zs_credential::Credential,
+        ) -> Result<String, zs_protocol::Denied> {
+            Ok(format!(
+                "{path_and_query}?X-Signed=1&X-Authority={authority}&X-Method={method}"
+            ))
+        }
+    }
+
+    struct EndpointForwarding(u16);
+
+    impl FlowHandler for EndpointForwarding {
+        fn classify(&self, _destination: &Destination) -> Flow {
+            Flow::Intercept {
+                resource: "endpoint.test".into(),
+                upstream_host: "127.0.0.1".into(),
+                upstream_port: self.0,
+                upstream_tls: false,
+                scheme: Scheme::Https,
+                scope: PathScope::Host,
+            }
+        }
+        fn subject(&self) -> String {
+            "alice".into()
+        }
+        fn workload(&self) -> String {
+            "w".into()
+        }
+        fn protocol_for(&self, _resource: &str) -> Option<Arc<dyn Protocol>> {
+            Some(Arc::new(Presigning))
+        }
+        fn materialize(
+            &self,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<zs_credential::Credential, zs_protocol::Denied> {
+            zs_credential::Credential::from_bytes(b"test-credential".to_vec())
+                .map_err(|_| zs_protocol::Denied::new("test credential"))
+        }
+        fn authorize_message(
+            &self,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<(), zs_protocol::Denied> {
+            Err(zs_protocol::Denied::new("not in this test"))
+        }
+    }
+
+    async fn endpoint_gate(upstream_port: u16) -> Gate {
+        let home = tempfile::tempdir().unwrap();
+        let diag =
+            zs_diag::DiagLog::open_with_cap(&home.path().join("diag.jsonl"), "t-ep", 1 << 20)
+                .unwrap();
+        let token = Arc::new(RunToken::generate());
+        let server = EndpointServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
+            Arc::new(EndpointForwarding(upstream_port)),
+            Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            diag.clone(),
+            "endpoint.test".into(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move { server.serve().await });
+        Gate {
+            addr,
+            token,
+            home,
+            diag,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_request_with_the_path_token_is_served() {
+        let upstream = recording_upstream().await;
+        let gate = endpoint_gate(upstream.port).await;
+        let hex = token_hex(&gate.token);
+        let port = gate.addr.port();
+
+        let response = reply_text(
+            gate.addr,
+            format!(
+                "GET /{hex}/b/k HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        {
+            let heads = upstream.heads.lock().unwrap();
+            assert_eq!(heads.len(), 1, "the upstream must be reached");
+            assert!(heads[0].starts_with("GET /b/k HTTP/1.1"), "{}", heads[0]);
+            assert!(!heads[0].contains(&hex), "the token reached the upstream");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let journal = gate.journal();
+        assert!(
+            journal.iter().any(|record| record["decision"] == "allow"),
+            "{journal:?}"
+        );
+        assert!(
+            !std::fs::read_to_string(gate.home.path().join("audit.jsonl"))
+                .unwrap()
+                .contains(&hex)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_request_without_the_path_token_is_refused() {
+        let upstream = recording_upstream().await;
+        let gate = endpoint_gate(upstream.port).await;
+        let hex = token_hex(&gate.token);
+        let port = gate.addr.port();
+        let allowed = reply_text(
+            gate.addr,
+            format!(
+                "GET /{hex}/b/k HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let journal_before = gate.journal().len();
+
+        let refused = reply_text(
+            gate.addr,
+            format!("GET /b/k HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+
+        assert!(
+            refused.starts_with("HTTP/1.1 403 ZeroSecret needs the run token"),
+            "{refused}"
+        );
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(gate.journal().len(), journal_before);
+        let events = gate.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "caller_refused"
+                    && event["fields"]["listener"] == "endpoint")
+                .count(),
+            1,
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presign_with_the_path_token_answers_and_without_it_is_refused() {
+        let upstream = recording_upstream().await;
+        let gate = endpoint_gate(upstream.port).await;
+        let hex = token_hex(&gate.token);
+        let port = gate.addr.port();
+        let body = r#"{"url":"https://endpoint.test/b/k?x=1","method":"GET"}"#;
+
+        let answered = reply_text(
+            gate.addr,
+            format!(
+                "POST /{hex}/.zs/presign HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
+        assert!(answered.contains("https://endpoint.test/b/k"), "{answered}");
+
+        let refused = reply_text(
+            gate.addr,
+            format!(
+                "POST /.zs/presign HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403 ZeroSecret needs the run token"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presign_url_built_on_the_endpoint_url_is_signed_without_the_token() {
+        let upstream = recording_upstream().await;
+        let gate = endpoint_gate(upstream.port).await;
+        let hex = token_hex(&gate.token);
+        let port = gate.addr.port();
+        let body = format!(r#"{{"url":"http://127.0.0.1:{port}/{hex}/b/k?x=1","method":"GET"}}"#);
+        assert!(
+            body.contains(&hex),
+            "control: the posted url carries the token"
+        );
+
+        let answered = reply_text(
+            gate.addr,
+            format!(
+                "POST /{hex}/.zs/presign HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
+        assert!(
+            answered.contains("https://endpoint.test/b/k?x=1"),
+            "{answered}"
+        );
+        assert!(!answered.contains(&hex), "the signed url carries the token");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_endpoint_token_never_reaches_diag_or_audit() {
+        let upstream = recording_upstream().await;
+        let gate = endpoint_gate(upstream.port).await;
+        let hex = token_hex(&gate.token);
+        let port = gate.addr.port();
+        let request = format!(
+            "GET /{hex}/b/k HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        assert!(request.contains(&hex), "control: the request carries it");
+
+        let response = reply_text(gate.addr, request.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let journal = std::fs::read_to_string(gate.home.path().join("audit.jsonl")).unwrap();
+        assert!(journal.contains("\"decision\":\"allow\""), "{journal}");
+        assert!(
+            !journal.contains(&hex),
+            "the audit journal carries the token"
+        );
+        let events = gate.events();
+        assert!(!events.is_empty(), "the diag log must have events");
+        let diag = std::fs::read_to_string(gate.home.path().join("diag.jsonl")).unwrap();
+        assert!(!diag.contains(&hex), "the diag log carries the token");
     }
 
     async fn tunnel_client(
         addr: std::net::SocketAddr,
         ca: &crate::ca::LocalCa,
+        token: &RunToken,
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
-        tunnel_client_to(addr, ca, "upstream.test").await
+        tunnel_client_to(addr, ca, token, "upstream.test").await
     }
 
     async fn tunnel_client_to(
         addr: std::net::SocketAddr,
         ca: &crate::ca::LocalCa,
+        token: &RunToken,
         host: &str,
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
         use rustls::pki_types::pem::PemObject;
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.write_all(
-            format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
-        )
+        tcp.write_all(&authorized(
+            token,
+            &format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n"),
+        ))
         .await
         .unwrap();
         let mut established = vec![0u8; 39];
@@ -2970,8 +3655,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reused_upstream_that_closed_is_retried_once() {
         let upstream = scripted_upstream(UpstreamMode::KeepAliveThenClose).await;
-        let (addr, ca) = forwarding_proxy(upstream.port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(upstream.port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let request = b"GET /v1/customers HTTP/1.1\r\nHost: upstream.test\r\n\r\n";
         let first = exchange_tunnel(&mut client, request).await;
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
@@ -2988,8 +3673,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_idempotent_request_lost_on_a_reused_upstream_is_retried_once() {
         let upstream = scripted_upstream(UpstreamMode::DropSecondOnFirst).await;
-        let (addr, ca) = forwarding_proxy(upstream.port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(upstream.port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let request = b"GET /v1/customers HTTP/1.1\r\nHost: upstream.test\r\n\r\n";
         let first = exchange_tunnel(&mut client, request).await;
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
@@ -3003,8 +3688,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_written_post_lost_on_a_reused_upstream_is_not_sent_again() {
         let upstream = scripted_upstream(UpstreamMode::DropSecondOnFirst).await;
-        let (addr, ca) = forwarding_proxy(upstream.port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(upstream.port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let request =
             b"POST /v1/customers HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 0\r\n\r\n";
         let first = exchange_tunnel(&mut client, request).await;
@@ -3023,8 +3708,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_that_got_a_response_head_is_never_sent_twice() {
         let upstream = scripted_upstream(UpstreamMode::HeadThenClose).await;
-        let (addr, ca) = forwarding_proxy(upstream.port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(upstream.port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let response = exchange_tunnel(
             &mut client,
             b"POST /v1/customers HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 0\r\n\r\n",
@@ -3043,6 +3728,7 @@ mod tests {
             ca: Arc::new(crate::ca::LocalCa::load_or_create(home.path().join("ca")).unwrap()),
             handler: Arc::new(Forwarding("127.0.0.1", 9)),
             journal: Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            token: Arc::new(RunToken::generate()),
             diag: DiagLog::disabled(),
         };
         let (io, _client) = tokio::io::duplex(1 << 16);
@@ -3123,8 +3809,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_non_default_upstream_port_is_named_in_host() {
         let (port, hosts) = host_capturing_upstream().await;
-        let (addr, ca) = forwarding_proxy_to("localhost", port).await;
-        let mut client = tunnel_client_to(addr, &ca, "localhost").await;
+        let (addr, ca, token) = forwarding_proxy_to("localhost", port).await;
+        let mut client = tunnel_client_to(addr, &ca, &token, "localhost").await;
         let response = exchange_tunnel(
             &mut client,
             b"GET /v1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -3133,9 +3819,10 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.write_all(
-            b"GET https://LocalHost/v1 HTTP/1.1\r\nHost: LocalHost\r\nConnection: close\r\n\r\n",
-        )
+        tcp.write_all(&authorized(
+            &token,
+            "GET https://LocalHost/v1 HTTP/1.1\r\nHost: LocalHost\r\nConnection: close\r\n\r\n",
+        ))
         .await
         .unwrap();
         let mut absolute = String::new();
@@ -3143,8 +3830,8 @@ mod tests {
         assert!(absolute.starts_with("HTTP/1.1 200"), "{absolute}");
 
         let (stand_in, stand_in_hosts) = host_capturing_upstream().await;
-        let (addr, ca) = forwarding_proxy(stand_in).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(stand_in).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let response = exchange_tunnel(
             &mut client,
             b"GET /v1 HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
@@ -3174,8 +3861,8 @@ mod tests {
             "{resolved:?}"
         );
         let upstream = scripted_upstream(UpstreamMode::KeepAliveThenClose).await;
-        let (addr, ca) = forwarding_proxy_to("localhost", upstream.port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy_to("localhost", upstream.port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let response = exchange_tunnel(
             &mut client,
             b"GET /v1/customers HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
@@ -3190,8 +3877,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let (addr, ca) = forwarding_proxy(port).await;
-        let mut client = tunnel_client(addr, &ca).await;
+        let (addr, ca, token) = forwarding_proxy(port).await;
+        let mut client = tunnel_client(addr, &ca, &token).await;
         let response = exchange_tunnel(
             &mut client,
             b"GET /v1/customers HTTP/1.1\r\nHost: upstream.test\r\n\r\n",

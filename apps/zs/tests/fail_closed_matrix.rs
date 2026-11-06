@@ -450,16 +450,19 @@ async fn row_15_an_ambiguous_request_body_is_refused_before_the_upstream() {
     );
     let handler = Arc::new(agent_with_binding(loopback, grants, &key));
     let home = tempfile::tempdir().unwrap();
+    let token = Arc::new(zs_mitm::RunToken::generate());
     let proxy = zs_mitm::ProxyServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(zs_mitm::LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap()),
         handler,
         Arc::new(zs_audit::Journal::open(home.path().join("audit.jsonl")).unwrap()),
+        token.clone(),
     )
     .await
     .unwrap();
     let addr = proxy.local_addr().unwrap();
     tokio::spawn(async move { proxy.serve().await });
+    common::register_proxy_authorization(&addr.to_string(), token.proxy_authorization().as_str());
 
     for request in [
         &b"POST https://api.stripe.com/v1/x HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxy"[..],
@@ -644,16 +647,19 @@ async fn serve_with_upstream(
     let ca = Arc::new(zs_mitm::LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap());
     let ca_pem = ca.certificate_pem();
     let journal = home.path().join("audit.jsonl");
+    let token = Arc::new(zs_mitm::RunToken::generate());
     let proxy = zs_mitm::ProxyServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         ca,
         handler.clone(),
         Arc::new(zs_audit::Journal::open(&journal).unwrap()),
+        token.clone(),
     )
     .await
     .unwrap();
     let addr = proxy.local_addr().unwrap();
     tokio::spawn(async move { proxy.serve().await });
+    common::register_proxy_authorization(&addr.to_string(), token.proxy_authorization().as_str());
     Served {
         addr,
         handler,
@@ -2199,6 +2205,15 @@ async fn presign_endpoint(
     let grants = signed_for(&binding, granted(&key, &["GET"], protocol), &key);
     let handler = Arc::new(agent_in(binding, grants, &key, &store));
     let journal = home.path().join("audit.jsonl");
+    let token = Arc::new(zs_mitm::RunToken::generate());
+    let prefix = format!(
+        "/{}",
+        token
+            .endpoint_url("127.0.0.1:0".parse().unwrap())
+            .rsplit('/')
+            .next()
+            .unwrap()
+    );
     let endpoint = zs_mitm::EndpointServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(zs_mitm::LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap()),
@@ -2206,11 +2221,13 @@ async fn presign_endpoint(
         Arc::new(zs_audit::Journal::open(&journal).unwrap()),
         zs_diag::DiagLog::disabled(),
         HOST.to_string(),
+        token,
     )
     .await
     .unwrap();
     let addr = endpoint.local_addr().unwrap().to_string();
     tokio::spawn(async move { endpoint.serve().await });
+    common::register_endpoint_prefix(&addr, &prefix);
     (addr, upstream, journal, home)
 }
 
@@ -2232,7 +2249,8 @@ async fn presign_dated(
     common::raw_exchange(
         endpoint,
         format!(
-            "POST /.zs/presign HTTP/1.1\r\nHost: {endpoint}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {}/.zs/presign HTTP/1.1\r\nHost: {endpoint}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            common::endpoint_prefix(endpoint),
             body.len()
         )
         .as_bytes(),
@@ -2314,9 +2332,10 @@ async fn row_42_a_presign_outside_the_grant_or_the_limits_is_denied_and_never_se
 async fn row_43_a_local_endpoint_request_for_another_host_or_with_an_origin_is_refused() {
     let (endpoint, upstream, _journal, _home) = presign_endpoint(with_auth(sigv4())).await;
     let port = endpoint.rsplit(':').next().unwrap();
+    let prefix = common::endpoint_prefix(&endpoint);
     let request = |host: &str, extra: &str| {
         format!(
-            "GET /bucket/public.png HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"
+            "GET {prefix}/bucket/public.png HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"
         )
     };
     for host in [endpoint.clone(), format!("localhost:{port}")] {
@@ -3423,11 +3442,14 @@ fn token_run_request(home: &PlainHome, ssm: &Ssm, request: &[u8]) -> (String, St
     std::fs::write(&root, ssm.aws.root_pem()).unwrap();
     let stop = dir.join("stop");
     let _ = std::fs::remove_file(&stop);
+    let child_env = dir.join("child.env");
+    let _ = std::fs::remove_file(&child_env);
     let mut child = std::process::Command::new(common::bin_path())
         .args(["run", "--enrollment-token", "enr-fake", "--", "sh", "-c"])
         .arg(format!(
-            "while [ ! -f '{}' ]; do sleep 0.05; done",
-            stop.display()
+            "env | grep '^HTTPS_PROXY=' > '{env}.tmp'; mv '{env}.tmp' '{env}'; while [ ! -f '{}' ]; do sleep 0.05; done",
+            stop.display(),
+            env = child_env.display()
         ))
         .env("ZS_HOME", dir)
         .env("USER", "localuser")
@@ -3462,6 +3484,20 @@ fn token_run_request(home: &PlainHome, ssm: &Ssm, request: &[u8]) -> (String, St
         seen.extend_from_slice(&chunk[..n]);
     };
     let ca_pem = std::fs::read_to_string(dir.join(&ca)).unwrap();
+    while !child_env.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote its HTTPS_PROXY"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (authorization, _) = common::parse_child_env(&std::fs::read_to_string(&child_env).unwrap());
+    std::fs::remove_file(&child_env).unwrap();
+    assert!(
+        !authorization.is_empty(),
+        "the child's HTTPS_PROXY carries no run token"
+    );
+    common::register_proxy_authorization(&proxy, &authorization);
     let response = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(common::tunneled_exchange(
@@ -4172,7 +4208,8 @@ async fn bound_pg_listener(
     .await
     .unwrap()
     .with_expected_user(user.map(str::to_string))
-    .with_refusal_audit(audit);
+    .with_refusal_audit(audit)
+    .with_caller_check(pg_fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     (local, calls, refusals)
@@ -4222,7 +4259,8 @@ async fn row_95_a_database_user_other_than_the_bound_user_is_refused() {
     .await
     .unwrap()
     .with_expected_user(Some("app".to_string()))
-    .with_refusal_audit(audit);
+    .with_refusal_audit(audit)
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     let refused = fake::login_as(local, fake::CLIENT_CAPS, INTRUDER.as_bytes(), None).await;
@@ -4278,4 +4316,469 @@ async fn row_96_a_postgres_replication_startup_is_refused() {
         .await
         .expect("row 96 positive control: a startup without replication logs in");
     assert_eq!(pg.seen(|s| s.accepts), 1, "row 96");
+}
+
+struct ServedAgent {
+    agent: common::AgentProcess,
+    upstream: common::FakeUpstream,
+    journal: std::path::PathBuf,
+    home: common::TestHome,
+}
+
+impl Drop for ServedAgent {
+    fn drop(&mut self) {
+        let _ = self.agent.child.kill();
+        let _ = self.agent.child.wait();
+    }
+}
+
+fn proxy_agent(child: &[&str]) -> ServedAgent {
+    let home = common::TestHome::new(".zs-ca");
+    let upstream = common::spawn_fake_upstream();
+    let (policy, creds, journal, ca_dir, _) =
+        common::write_test_setup(home.path(), upstream.addr.port(), true, true);
+    let agent = common::spawn_agent(
+        common::bin_path().as_path(),
+        &policy,
+        &creds,
+        &journal,
+        &ca_dir,
+        child,
+        true,
+    )
+    .expect("agent spawn");
+    ServedAgent {
+        agent,
+        upstream,
+        journal,
+        home,
+    }
+}
+
+fn endpoint_agent() -> (ServedAgent, String, String) {
+    let home = common::TestHome::new(".zs-ca");
+    let upstream = common::spawn_fake_upstream();
+    let mut connection = common::loopback_connection(upstream.addr.port(), true);
+    connection.local_endpoint = true;
+    let (policy, creds, journal, ca_dir, _) =
+        common::write_test_setup_signing(home.path(), upstream.addr.port(), &["GET"], connection);
+    let text = std::fs::read_to_string(&policy)
+        .unwrap()
+        .replace(
+            r#""operations": "#,
+            r#""auth": {"scheme": "aws-sigv4", "access_key_id": "AKIDTEST", "region": "eu-central-003", "service": "s3"}, "local_endpoint": true, "operations": "#,
+        );
+    std::fs::write(&policy, text).unwrap();
+    let probe = format!(
+        "printf %s \"${{ZS_STRIPE_PRODUCTION_URL:-unset}}\" > {}/endpoint; sleep 20",
+        home.path().display()
+    );
+    let agent = common::spawn_agent(
+        common::bin_path().as_path(),
+        &policy,
+        &creds,
+        &journal,
+        &ca_dir,
+        &["sh", "-c", &probe],
+        true,
+    )
+    .expect("agent spawn");
+    let file = home.path().join("endpoint");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let url = std::fs::read_to_string(&file).unwrap();
+    let rest = url
+        .strip_prefix("http://")
+        .expect("an http endpoint")
+        .to_string();
+    let (host, token) = rest.split_once('/').expect("the path token");
+    (
+        ServedAgent {
+            agent,
+            upstream,
+            journal,
+            home,
+        },
+        host.to_string(),
+        format!("/{token}"),
+    )
+}
+
+fn records(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn diag_records(home: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![home.join(".zs-log")];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.extend(records(&path));
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_98_a_proxy_request_without_the_run_token_is_refused() {
+    let served = proxy_agent(&["sleep", "20"]);
+    let ca = std::fs::read_to_string(&served.agent.ca_path).unwrap();
+
+    let (status, _) =
+        common::proxied_request(&served.agent.proxy_addr, &ca, HOST, 443, "/v1/customers")
+            .await
+            .unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "row 98 positive control: {status}"
+    );
+    assert_eq!(
+        served
+            .upstream
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "row 98 positive control"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let audit_before = records(&served.journal).len();
+
+    let other = zs_mitm::RunToken::generate()
+        .proxy_authorization()
+        .as_str()
+        .to_string();
+    let mut refused = Vec::new();
+    for request in [
+        b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n".to_vec(),
+        format!(
+            "CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\nProxy-Authorization: {other}\r\n\r\n"
+        )
+        .into_bytes(),
+    ] {
+        refused.push(common::raw_exchange_without_token(&served.agent.proxy_addr, &request).await);
+    }
+    for response in &refused {
+        assert!(
+            response.starts_with("HTTP/1.1 407 ZeroSecret needs the run token"),
+            "row 98: {response}"
+        );
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("proxy-authenticate: basic realm=\"zs\""),
+            "row 98: {response}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        served
+            .upstream
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "row 98: no upstream contact"
+    );
+    assert_eq!(
+        records(&served.journal).len(),
+        audit_before,
+        "row 98: a refusal writes no audit record"
+    );
+    assert!(
+        diag_records(served.home.path())
+            .iter()
+            .any(|line| line.contains("\"caller_refused\"") && line.contains("\"proxy\"")),
+        "row 98: a refusal emits caller_refused"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_99_the_run_token_is_not_forwarded_upstream() {
+    let served = proxy_agent(&["sleep", "20"]);
+    let ca = std::fs::read_to_string(&served.agent.ca_path).unwrap();
+
+    let (status, _) =
+        common::proxied_request(&served.agent.proxy_addr, &ca, HOST, 443, "/v1/customers")
+            .await
+            .unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "row 99 positive control: {status}"
+    );
+    let head = served.upstream.last_head.lock().unwrap().clone();
+    assert!(
+        head.starts_with("GET /v1/customers HTTP/1.1"),
+        "row 99 positive control: {head}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("proxy-authorization"),
+        "row 99: {head}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_100_an_endpoint_request_without_the_path_token_is_refused() {
+    let (served, host, prefix) = endpoint_agent();
+
+    let allowed = common::raw_exchange(
+        &host,
+        format!(
+            "GET {prefix}/bucket/public.png HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(
+        allowed.starts_with("HTTP/1.1 200"),
+        "row 100 positive control: {allowed}"
+    );
+    assert_eq!(
+        served
+            .upstream
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "row 100 positive control"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let audit_before = records(&served.journal).len();
+
+    let refused = common::raw_exchange(
+        &host,
+        format!("GET /bucket/public.png HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    assert!(
+        refused.starts_with("HTTP/1.1 403 ZeroSecret needs the run token"),
+        "row 100: {refused}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        served
+            .upstream
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "row 100: no upstream contact"
+    );
+    assert_eq!(
+        records(&served.journal).len(),
+        audit_before,
+        "row 100: a refusal writes no audit record"
+    );
+    assert!(
+        diag_records(served.home.path())
+            .iter()
+            .any(|line| line.contains("\"caller_refused\"") && line.contains("\"endpoint\"")),
+        "row 100: a refusal emits caller_refused"
+    );
+}
+
+fn peer_setup(
+    home: &std::path::Path,
+    port: u16,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let policy_path = home.join("zs-peer-policy.json");
+    let creds = home.join(".zs-peer-credentials");
+    let audit = home.join(".zs-peer-audit").join("audit.jsonl");
+    std::fs::create_dir_all(&creds).unwrap();
+    std::fs::create_dir_all(home.join(".zs-peer-audit")).unwrap();
+    std::fs::write(creds.join("pg-cred"), pg_fake::PASSWORD).unwrap();
+    let signing = ControlSigningKey::generate("test-k1");
+    let verifying: String = signing
+        .verifying_key_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let connection = common::loopback_connection(port, false);
+    let signed = signing
+        .sign(zs_grant::Grant {
+            subject: common::default_subject(),
+            workload: "default".into(),
+            resource: "pg-db".into(),
+            host: "pg.internal".into(),
+            protocol: "postgres".into(),
+            source: zs_policy::CredentialSource::file("pg-cred"),
+            operations: vec!["connect".into()],
+            environment: "development".into(),
+            expires_at_ms: now_ms() + 3_600_000,
+            grant_id: "g-peer".into(),
+            materialization: zs_policy::Materialization::Retrieve,
+            upstream_host: connection.upstream_host,
+            upstream_port: connection.upstream_port,
+            upstream_tls: connection.upstream_tls,
+            local_endpoint: connection.local_endpoint,
+        })
+        .unwrap();
+    let policy = format!(
+        r#"{{"bindings":[{{"resource":"pg-db","host":"pg.internal","protocol":"postgres","upstream_host":"127.0.0.1","upstream_port":{port}}}],"signing_keys":[{{"key_id":"test-k1","verifying_key_hex":"{verifying}"}}],"grants":[{}]}}"#,
+        serde_json::to_string(&signed).unwrap()
+    );
+    std::fs::write(&policy_path, policy).unwrap();
+    (policy_path, creds, audit)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_101_a_failed_peer_lookup_denies() {
+    if option_env!("ZS_BUILD_TEST_ENDPOINTS") != Some("1") {
+        eprintln!("skipped: the agent was built without ZS_BUILD_TEST_ENDPOINTS=1");
+        return;
+    }
+    let home = common::TestHome::new(".zs-ca");
+    let pg = pg_fake::start(pg_fake::Script::new(pg_fake::Answer::N)).await;
+    let ca_dir = home.path().join(".zs-ca");
+    let (policy, creds, audit) = peer_setup(home.path(), pg.addr.port());
+
+    let mut control = common::spawn_agent(
+        common::bin_path().as_path(),
+        &policy,
+        &creds,
+        &audit,
+        &ca_dir,
+        &["sleep", "20"],
+        true,
+    )
+    .expect("agent spawn");
+    let control_port = control.postgres_port.expect("a postgres listener");
+    pg_fake::login(std::net::SocketAddr::from(([127, 0, 0, 1], control_port)))
+        .await
+        .expect("row 101 positive control: a same-user client is relayed");
+    assert_eq!(pg.seen(|s| s.accepts), 1);
+    let _ = control.child.kill();
+    let _ = control.child.wait();
+
+    let mut failed = common::spawn_agent_with_env(
+        common::bin_path().as_path(),
+        &policy,
+        &creds,
+        &audit,
+        &ca_dir,
+        &["sleep", "20"],
+        true,
+        &[("ZS_TEST_PEER_LOOKUP", "fail")],
+    )
+    .expect("agent spawn");
+    let failed_port = failed.postgres_port.expect("a postgres listener");
+    let mut client =
+        tokio::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], failed_port)))
+            .await
+            .unwrap();
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("row 101: the refusal is prompt")
+        .expect("row 101: the refusal is readable");
+    assert_eq!(read, 0, "row 101: the client sees EOF with zero bytes");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        pg.seen(|s| s.accepts),
+        1,
+        "row 101: no new upstream contact"
+    );
+    let _ = failed.child.kill();
+    let _ = failed.child.wait();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ZS_OTHER_USER"]
+async fn row_102_a_database_client_of_another_os_user_is_refused() {
+    let other = std::env::var("ZS_OTHER_USER").expect("ZS_OTHER_USER");
+    let home = common::TestHome::new(".zs-ca");
+    let pg = pg_fake::start(pg_fake::Script::new(pg_fake::Answer::N)).await;
+    let ca_dir = home.path().join(".zs-ca");
+    let (policy, creds, audit) = peer_setup(home.path(), pg.addr.port());
+    let mut agent = common::spawn_agent(
+        common::bin_path().as_path(),
+        &policy,
+        &creds,
+        &audit,
+        &ca_dir,
+        &["sleep", "20"],
+        true,
+    )
+    .expect("agent spawn");
+    let port = agent.postgres_port.expect("a postgres listener");
+    let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; cat <&3");
+
+    pg_fake::login(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .expect("row 102 positive control: a same-user client is relayed");
+    assert_eq!(pg.seen(|s| s.accepts), 1, "row 102 positive control");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let refusals = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("\"caller_refused\"") && line.contains("\"postgres\""))
+            .count()
+    };
+    let materialized = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("\"materialized\""))
+            .count()
+    };
+    let before = diag_records(home.path());
+    assert_eq!(refusals(&before), 0, "row 102 positive control: {before:?}");
+
+    let own_uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    let other_uid = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "id", "-u"])
+        .output()
+        .expect("sudo");
+    assert!(
+        other_uid.status.success() && !other_uid.stdout.is_empty(),
+        "row 102 needs a working `sudo -n -u {other}`: {other_uid:?}"
+    );
+    assert_ne!(
+        other_uid.stdout, own_uid.stdout,
+        "row 102: ZS_OTHER_USER must be another OS user"
+    );
+
+    let refused = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "bash", "-c", &connect])
+        .output()
+        .expect("sudo");
+    assert!(
+        refused.status.success() && refused.stderr.is_empty(),
+        "row 102: the other user's client must connect and see EOF: {refused:?}"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "row 102: another user must read nothing: {refused:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        pg.seen(|s| s.accepts),
+        1,
+        "row 102: no new upstream contact"
+    );
+    let after = diag_records(home.path());
+    assert_eq!(
+        refusals(&after),
+        1,
+        "row 102: one caller_refused: {after:?}"
+    );
+    assert_eq!(
+        materialized(&after),
+        materialized(&before),
+        "row 102: no materialization"
+    );
+    let _ = agent.child.kill();
+    let _ = agent.child.wait();
 }

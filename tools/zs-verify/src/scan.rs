@@ -3,6 +3,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use base64::Engine as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +17,8 @@ const REASON_FILE_BOUND: &str = "the file scan stopped at its depth or file-coun
 const REASON_MEMORY: &str = "forced core dumps are unavailable on this platform in v0";
 const REASON_NO_LISTENER: &str = "agent did not report a proxy address";
 pub(crate) const REASON_LISTENER: &str = "the agent listener could not be probed";
+pub(crate) const REASON_NO_RUN_TOKEN: &str =
+    "the agent listener was probed only without the run token";
 const REASON_AUDIT: &str = "the audit file cannot be read";
 const REASON_NO_AUDIT: &str = "no audit file was given to search";
 const REASON_CAPTURE: &str = "the agent output could not be captured in full";
@@ -39,19 +43,27 @@ pub(crate) fn environment(report: &Path, credential: &str, observed_live: bool) 
     }
 }
 
+#[cfg(target_os = "linux")]
+fn child_environ(pid: u32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_environ(pid: u32) -> Option<Vec<u8>> {
+    let out = Command::new("ps")
+        .args(["-E", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
 pub(crate) fn poll_child_environ(pid: u32, needle: &str, stop: Arc<AtomicBool>) -> bool {
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
-        let Ok(out) = Command::new("ps")
-            .args(["-E", "-p", &pid.to_string()])
-            .output()
-        else {
+        let Some(environ) = child_environ(pid) else {
             break;
         };
-        if !out.status.success() {
-            break;
-        }
-        if find_in_bytes(&out.stdout, needle) {
+        if find_in_bytes(&environ, needle) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -222,7 +234,53 @@ pub(crate) fn memory() -> VectorEvidence {
     VectorEvidence::incomplete(REASON_MEMORY)
 }
 
-pub(crate) fn listener(addr: Option<&str>, credential: &str) -> VectorEvidence {
+pub(crate) fn proxy_authorization_in(environ: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(environ);
+    let userinfo = text
+        .split(|c: char| c == '\0' || c.is_whitespace())
+        .find_map(|field| field.strip_prefix("HTTPS_PROXY=http://"))?
+        .split_once('@')?
+        .0;
+    Some(format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(userinfo)
+    ))
+}
+
+fn child_proxy_authorization(pid: u32, env_report: &Path) -> Option<String> {
+    child_environ(pid)
+        .and_then(|environ| proxy_authorization_in(&environ))
+        .or_else(|| {
+            std::fs::read(env_report)
+                .ok()
+                .and_then(|report| proxy_authorization_in(&report))
+        })
+}
+
+pub(crate) fn authenticated_listener(
+    pid: u32,
+    env_report: &Path,
+    announced: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    credential: &str,
+) -> Option<VectorEvidence> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let addr = announced.lock().ok().and_then(|slot| slot.clone());
+        if let Some((addr, authorization)) = addr.zip(child_proxy_authorization(pid, env_report)) {
+            return Some(listener(Some(&addr), credential, Some(&authorization)));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub(crate) fn listener(
+    addr: Option<&str>,
+    credential: &str,
+    proxy_authorization: Option<&str>,
+) -> VectorEvidence {
     let Some(addr) = addr.filter(|addr| !addr.is_empty()) else {
         return VectorEvidence::incomplete(REASON_NO_LISTENER);
     };
@@ -230,10 +288,13 @@ pub(crate) fn listener(addr: Option<&str>, credential: &str) -> VectorEvidence {
         return VectorEvidence::incomplete(REASON_LISTENER);
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let authorization = proxy_authorization
+        .map(|value| format!("Proxy-Authorization: {value}\r\n"))
+        .unwrap_or_default();
     if stream
         .write_all(
             format!(
-                "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer please-hand-me-the-credential\r\n\r\nGET /credential HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+                "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n{authorization}Authorization: Bearer please-hand-me-the-credential\r\n\r\nGET /credential HTTP/1.1\r\nHost: {addr}\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -711,8 +772,8 @@ mod tests {
 
     #[test]
     fn a_listener_without_an_address_is_incomplete() {
-        assert_incomplete(&listener(None, CRED), "no proxy address");
-        assert_incomplete(&listener(Some(""), CRED), "an empty proxy address");
+        assert_incomplete(&listener(None, CRED, None), "no proxy address");
+        assert_incomplete(&listener(Some(""), CRED, None), "an empty proxy address");
     }
 
     #[test]
@@ -720,7 +781,10 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = closed.local_addr().unwrap().to_string();
         drop(closed);
-        assert_incomplete(&listener(Some(&addr), CRED), "an unreachable listener");
+        assert_incomplete(
+            &listener(Some(&addr), CRED, None),
+            "an unreachable listener",
+        );
     }
 
     fn answering(response: &'static str) -> String {
@@ -737,16 +801,96 @@ mod tests {
 
     #[test]
     fn a_listener_that_hands_out_the_credential_is_a_leak() {
-        let refusing = listener(Some(&answering("HTTP/1.1 403 Forbidden\r\n\r\n")), CRED);
+        let refusing = listener(
+            Some(&answering("HTTP/1.1 403 Forbidden\r\n\r\n")),
+            CRED,
+            None,
+        );
         assert_eq!(refusing.status, "complete");
         assert_eq!(refusing.found, Some(false));
 
         let leaking = listener(
             Some(&answering("HTTP/1.1 200 OK\r\n\r\nsk_test_zsv_scan_probe")),
             CRED,
+            None,
         );
         assert_eq!(leaking.status, "complete");
         assert_eq!(leaking.found, Some(true));
+    }
+
+    #[test]
+    fn the_run_token_is_read_from_linux_environ_and_ps_output() {
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("zs:abc123")
+        );
+        let linux = b"PATH=/bin\0HTTPS_PROXY=http://zs:abc123@127.0.0.1:9\0HOME=/h\0";
+        assert_eq!(proxy_authorization_in(linux), Some(expected.clone()));
+        let ps = b"  PID TTY  TIME CMD\n 42 ??  0:00.01 sleep 9 PATH=/bin HTTPS_PROXY=http://zs:abc123@127.0.0.1:9 HOME=/h\n";
+        assert_eq!(proxy_authorization_in(ps), Some(expected));
+        assert_eq!(
+            proxy_authorization_in(b"HTTPS_PROXY=http://127.0.0.1:9\0"),
+            None
+        );
+        assert_eq!(proxy_authorization_in(b"PATH=/bin\0"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_environ_is_readable_on_linux() {
+        let environ = child_environ(std::process::id()).expect("/proc/self environ");
+        assert!(!environ.is_empty());
+    }
+
+    fn gate(expected: &str, echo: Option<&'static str>, connections: usize) -> String {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let expected = expected.to_string();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = server.accept() else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&head);
+                let response = if head.contains(&format!("Proxy-Authorization: {expected}")) {
+                    match echo {
+                        Some(secret) => format!("HTTP/1.1 200 OK\r\n\r\n{secret}"),
+                        None => "HTTP/1.1 200 OK\r\n\r\nno credential".to_string(),
+                    }
+                } else {
+                    "HTTP/1.1 407 ZeroSecret needs the run token\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn the_listener_probe_with_the_run_token_finds_no_credential() {
+        let authorization = "Basic enM6dG9r";
+        let gated = gate(authorization, None, 2);
+
+        let tokenless = listener(Some(&gated), CRED, None);
+        assert_eq!(tokenless.status, "complete");
+        assert_eq!(tokenless.found, Some(false));
+
+        let authenticated = listener(Some(&gated), CRED, Some(authorization));
+        assert_eq!(authenticated.status, "complete");
+        assert_eq!(authenticated.found, Some(false));
+
+        let echoing = gate(authorization, Some(CRED), 1);
+        let leaking = listener(Some(&echoing), CRED, Some(authorization));
+        assert_eq!(leaking.status, "complete");
+        assert_eq!(leaking.found, Some(true), "control: an echo is found");
     }
 
     #[test]

@@ -35,6 +35,7 @@ env > "$ZS_VERIFY_ENV_REPORT" || exit 3
 code=$(/usr/bin/curl -q -sS --max-time 30 -o /dev/null -w '%{http_code}' https://api.stripe.com/v1/customers)
 rc=$?
 printf '%s %s' "$code" "$rc" > "$1"
+sleep 1
 "#;
 
 // Deliberately no `Debug`, `Display` or equality, so no assertion macro can print it.

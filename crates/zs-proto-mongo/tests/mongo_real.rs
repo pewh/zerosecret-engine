@@ -79,6 +79,7 @@ impl Real {
         )
         .await
         .unwrap()
+        .with_caller_check(fake::admit_all())
         .with_diag(diag, "real-mongo");
         let local = listener.local_addr();
         tokio::spawn(listener.serve());

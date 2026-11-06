@@ -74,10 +74,11 @@ fn setup(protocol: &str, operations: &[&str], child: &[&str]) -> HttpAgent {
 fn request(proxy: &str, method: &str, target: &str, host: &str) -> String {
     let mut stream = std::net::TcpStream::connect(proxy).unwrap();
     stream
-        .write_all(
+        .write_all(&common::authorized_for_proxy(
+            proxy,
             format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
-        )
+        ))
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
@@ -177,7 +178,13 @@ fn the_child_gets_http_proxy_only_when_an_http_binding_exists() {
         }
         let value = std::fs::read_to_string(&file).unwrap();
         if expect_set {
-            assert_eq!(value, format!("http://{}", agent.agent.proxy_addr));
+            let prefix = "http://zs:";
+            assert!(
+                value.starts_with(prefix) && value.ends_with(&agent.agent.proxy_addr),
+                "{value}"
+            );
+            let token = value[prefix.len()..].split_once('@').unwrap().0;
+            assert_eq!(token.len(), 64, "{value}");
         } else {
             assert_eq!(value, "unset");
         }

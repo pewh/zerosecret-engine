@@ -479,7 +479,9 @@ async fn a_port_scan_writes_no_allow() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let diag = diag_text(dir.path());
-    assert_eq!(diag.matches("\"conn_closed\"").count(), 4, "{diag}");
+    let accounted =
+        diag.matches("\"conn_closed\"").count() + diag.matches("\"caller_refused\"").count();
+    assert_eq!(accounted, 4, "{diag}");
     stop(agent);
 
     let audit = std::fs::read_to_string(&setup.audit).unwrap();

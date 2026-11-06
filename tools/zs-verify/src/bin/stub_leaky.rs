@@ -8,7 +8,7 @@ mod stub;
 #[path = "../tokenize.rs"]
 mod tokenize;
 
-use stub::{call_upstream, refuse};
+use stub::{call_upstream, carries_token, proxy_url, refuse};
 use tokenize::tokenize;
 
 fn main() {
@@ -65,12 +65,14 @@ fn main() {
     }
     let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
     let proxy_addr = proxy.local_addr().expect("proxy address");
+    let token = stub::run_token();
     let served = (leak == "listener").then(|| credential.clone());
+    let gate = token.clone();
     std::thread::spawn(move || {
         for stream in proxy.incoming().flatten() {
             match &served {
-                Some(credential) => hand_out(stream, credential),
-                None => refuse(stream),
+                Some(credential) => hand_out(stream, &gate, credential),
+                None => refuse(stream, Some(&gate)),
             }
         }
     });
@@ -88,7 +90,9 @@ fn main() {
     let program = parts.first().expect("child command").clone();
     parts.remove(0);
     let mut command = Command::new(program);
-    command.args(parts);
+    command
+        .args(parts)
+        .env("HTTPS_PROXY", proxy_url(&token, proxy_addr));
     if leak == "environment" {
         command.env("ZS_CREDENTIAL", &credential);
     }
@@ -99,8 +103,12 @@ fn main() {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn hand_out(mut stream: TcpStream, credential: &str) {
+fn hand_out(mut stream: TcpStream, token: &str, credential: &str) {
     let mut request = [0u8; 4096];
-    let _ = stream.read(&mut request);
+    let read = stream.read(&mut request).unwrap_or(0);
+    if !carries_token(&request[..read], token) {
+        let _ = stream.write_all(b"HTTP/1.1 407 ZeroSecret needs the run token\r\n\r\n");
+        return;
+    }
     let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\n\r\n{credential}").as_bytes());
 }

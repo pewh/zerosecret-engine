@@ -33,12 +33,13 @@ async fn unknown_destination_passes_through_without_credential() {
     let proxy = agent.agent.as_ref().unwrap().proxy_addr.clone();
     let mut stream = TcpStream::connect(&proxy).unwrap();
     stream
-        .write_all(
+        .write_all(&common::authorized_for_proxy(
+            &proxy,
             format!(
                 "CONNECT 127.0.0.1:{plain_port} HTTP/1.1\r\nHost: 127.0.0.1:{plain_port}\r\n\r\n"
             )
             .as_bytes(),
-        )
+        ))
         .unwrap();
     let mut connect_response = Vec::new();
     let mut byte = [0u8; 1];

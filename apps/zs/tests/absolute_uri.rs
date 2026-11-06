@@ -8,12 +8,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 fn absolute_uri_request(proxy: &str, url: &str, host: &str) -> (String, String) {
     let mut stream = std::net::TcpStream::connect(proxy).unwrap();
     stream
-        .write_all(
+        .write_all(&common::authorized_for_proxy(
+            proxy,
             format!(
                 "GET {url} HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
             )
             .as_bytes(),
-        )
+        ))
         .unwrap();
     stream.flush().unwrap();
     let mut reader = BufReader::new(stream);

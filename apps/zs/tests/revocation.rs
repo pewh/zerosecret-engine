@@ -335,16 +335,19 @@ async fn proxy_to_websocket_upstream(grant_id: &str) -> Proxied {
     let ca = Arc::new(zs_mitm::LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap());
     let ca_pem = ca.certificate_pem();
     let journal = home.path().join("audit.jsonl");
+    let token = Arc::new(zs_mitm::RunToken::generate());
     let proxy = zs_mitm::ProxyServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         ca,
         handler.clone(),
         Arc::new(zs_audit::Journal::open(&journal).unwrap()),
+        token.clone(),
     )
     .await
     .unwrap();
     let addr = proxy.local_addr().unwrap();
     tokio::spawn(async move { proxy.serve().await });
+    common::register_proxy_authorization(&addr.to_string(), token.proxy_authorization().as_str());
     Proxied {
         addr,
         ca_pem,

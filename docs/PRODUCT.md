@@ -265,9 +265,10 @@ resource now reports `strict`.
 The claim is scoped to intercepted paths — HTTPS through `zs-mitm`, PostgreSQL through
 `PostgresListener`, MySQL through `MysqlListener`, MongoDB through `MongoListener`. It is not
 a claim about unintercepted traffic, not a claim that the agent is a sandbox (SECURITY §3's
-local-process limit is untouched: any local account that can reach the loopback port gets the
-developer's access, and caller authentication is planned), and strict mode reduces credential
-theft to session abuse rather than providing isolation. See ROADMAP's v1 status block.
+local-process limit is narrowed to the OS user, not removed: every listener authenticates its
+caller, except the Windows database listeners, and a process of that user can still read the run
+token from the child's environment and gets the developer's access, ADR-0052), and strict mode reduces credential theft to session
+abuse rather than providing isolation. See ROADMAP's v1 status block.
 
 ## 8. Edition boundary
 

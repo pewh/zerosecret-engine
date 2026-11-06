@@ -347,12 +347,27 @@ pub fn pki(san: &str) -> Pki {
     }
 }
 
+pub fn admit_all() -> zs_protocol::CallerCheck {
+    Arc::new(|_, _| true)
+}
+
 pub async fn listen(
     host: &str,
     port: u16,
     tls: UpstreamTls,
     materialize: Materialize,
     diag: DiagLog,
+) -> SocketAddr {
+    listen_gated(host, port, tls, materialize, diag, Some(admit_all())).await
+}
+
+pub async fn listen_gated(
+    host: &str,
+    port: u16,
+    tls: UpstreamTls,
+    materialize: Materialize,
+    diag: DiagLog,
+    caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
     let endpoint = UpstreamEndpoint::new(host, port).unwrap();
     let listener = PostgresListener::bind_endpoint(
@@ -366,6 +381,10 @@ pub async fn listen(
     .unwrap()
     .with_diag(diag, RESOURCE)
     .with_cancel_authorize(Arc::new(|| Ok(())));
+    let listener = match caller_check {
+        Some(check) => listener.with_caller_check(check),
+        None => listener,
+    };
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     local

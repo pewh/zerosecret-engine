@@ -70,11 +70,15 @@ letting one test stand in for the set.
 
 Stated plainly, because reviewers will find these anyway.
 
-**A hostile local process, from the same user or any other local account.** The agent's
-listener binds to a loopback address only (`--listen` refuses any other address), but
-loopback is reachable by every account on the machine. Any local account that can reach
-the port can talk to the listener and obtain the same access the developer has, not only
-processes running as the same user. ZeroSecret converts
+**A hostile local process of the same OS user.** The agent's listeners bind to a loopback
+address only (`--listen` refuses any other address), and every local listener authenticates its
+caller (ADR-0052): the HTTP proxy requires the run token in `Proxy-Authorization`, the local
+endpoint and `/.zs/presign` require it as the first path segment, and the database listeners
+close a connection whose peer socket belongs to another OS user. A process of the developer's own
+user can read the token from the child's environment and passes the peer check, so it gets the
+same access the developer has: the boundary is the OS user, not the process. On Windows the
+database listeners do not check the peer, so there any local account that can reach a database
+port is served; the proxy and the endpoint still refuse it. ZeroSecret converts
 credential theft into session abuse. That is a real reduction — a stolen session expires
 and is attributable — but it is not isolation. For an `aws_ssm` source, such a process can
 also ask for a grant as the device and give its identity token to STS and SSM itself, with
@@ -961,6 +965,11 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | PostgreSQL startup or MySQL handshake names a user other than the binding's `user` | Refuse before materialization: PostgreSQL SQLSTATE `28000`, MySQL ERR 1045. The refusal text never names the user. Audit `deny` `connect`, reason `user mismatch`. PostgreSQL never connects upstream; MySQL reads the server greeting but never sends the server a handshake response (`apps/zs/tests/fail_closed_matrix.rs`) |
 | PostgreSQL startup carries the `replication` parameter, whatever its value | Refuse with SQLSTATE `28000` before materialization and before any upstream connection. Audit `deny` `connect`, reason `replication refused` (`apps/zs/tests/fail_closed_matrix.rs`) |
 | More than 30 requests in one minute from one TCP peer host to `/login`, `/login/callback`, `/login/confirm`, `/login/claim`, `/logout`, `/enrollment-token` and `/wire/enroll` together | The 31st and later get 429 `too many requests` before the handler runs, so no token is minted. The limit keys on the TCP peer address, never on `X-Forwarded-For`. `/healthz` and `/ca` are not limited (D11) (commercial suite) |
+| A proxy request without the run token, or with another run's token | 407 `ZeroSecret needs the run token` with `Proxy-Authenticate: Basic realm="zs"`. No grant lookup, no audit record, no upstream contact. Diagnostic event `caller_refused`, `listener` `proxy` (`apps/zs/tests/fail_closed_matrix.rs` row 98) |
+| `Proxy-Authorization` on a request the proxy forwards | Removed before the upstream request; the upstream never sees it (`apps/zs/tests/fail_closed_matrix.rs` row 99) |
+| A local endpoint or `/.zs/presign` request whose path does not start with the run token | 403 `ZeroSecret needs the run token`. No upstream, no audit record. Diagnostic event `caller_refused`, `listener` `endpoint` (`apps/zs/tests/fail_closed_matrix.rs` row 100) |
+| A database listener's peer lookup fails, finds no established socket of the agent's OS user for the connection, or runs on a platform with no lookup | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused` (`apps/zs/tests/fail_closed_matrix.rs` row 101) |
+| A database client whose OS user differs from the agent's (Linux, macOS) | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused`. Windows database listeners do not check (§3) (`apps/zs/tests/fail_closed_matrix.rs` row 102, run in CI with a second OS user) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
@@ -980,13 +989,11 @@ session keys and the SSM value can stay in freed agent memory until the memory i
 
 Tracked here until answered, then moved into a decision.
 
-- **v1 — local caller authentication.** The agent's listener is loopback-only, and any
-  local account that can reach the port gets the developer's access (§3). Caller
-  authentication on that listener, so that only the process the agent started is served,
-  is a planned design and is not built. It must depend on mTLS device enrolment (v1 plan
-  step 12, not published), which issues the device identity it would bind to. Note the
-  ceiling: this narrows the gap §3 concedes, it does not close it, and it must not be
-  described as isolation.
+- **v1 — local caller authentication.** Every local listener of `zs run` refuses a caller that
+  is not a process of the OS user who runs it: the proxy and the endpoint check a per-run token,
+  and the database listeners check the peer socket (ADR-0052). The ceiling is the OS user:
+  a process of that user can read the run token from the child's environment and passes the peer
+  check. It is not isolation. Windows database listeners do not check the peer (§3).
 - **Deferred to v2.** Does the CI runner case need a different identity model than a
   developer workstation?
 - **What is the correct grant TTL?** It trades revocation lag against control-plane load

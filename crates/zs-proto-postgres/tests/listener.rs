@@ -189,7 +189,8 @@ async fn client_authenticates_through_the_listener_without_a_password() {
         Arc::new(|| Ok(credential())),
     )
     .await
-    .expect("listener must bind");
+    .expect("listener must bind")
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(async move { listener.serve().await });
 
@@ -234,7 +235,8 @@ async fn sslrequest_is_explicitly_refused_on_loopback() {
         Arc::new(|| Ok(credential())),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(async move { listener.serve().await });
 
@@ -267,7 +269,8 @@ async fn materialization_failure_denies_the_connection() {
         Arc::new(|| Err(zs_protocol::Denied::new("vault unavailable"))),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(async move { listener.serve().await });
 
@@ -304,7 +307,8 @@ async fn binding_does_not_probe_upstream() {
         Arc::new(|| Ok(credential())),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_caller_check(fake::admit_all());
     let local = listener.local_addr();
     tokio::spawn(async move { listener.serve().await });
 
@@ -788,5 +792,101 @@ async fn a_non_scram_method_is_refused_and_logged_with_its_method() {
         !std::fs::read_to_string(&log)
             .unwrap()
             .contains(fake::PASSWORD)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_the_check_admits_is_relayed() {
+    let plain = fake::start(Script::new(Answer::N)).await;
+    let home = tempfile::tempdir().unwrap();
+    let (diag, _log) = fake::open_diag(home.path());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let check: zs_protocol::CallerCheck = Arc::new(move |peer, local| {
+        record.lock().unwrap().push((peer, local));
+        true
+    });
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        plain.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(fake::PASSWORD),
+        diag,
+        Some(check),
+    )
+    .await;
+
+    let mut client = fake::login(local)
+        .await
+        .expect("the admitted caller is relayed");
+    assert_eq!(fake::query(&mut client, "SELECT 1").await, "SELECT 1");
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.ip(), local.ip());
+    assert_eq!(calls[0].1, local, "the local address is the listener's");
+    drop(calls);
+    assert_eq!(plain.seen(|s| s.accepts), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_peer_lookup_denies() {
+    let plain = fake::start(Script::new(Answer::N)).await;
+    let home = tempfile::tempdir().unwrap();
+    let (diag, log) = fake::open_diag(home.path());
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        plain.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(fake::PASSWORD),
+        diag.clone(),
+        Some(Arc::new(|_, _| false)),
+    )
+    .await;
+
+    let mut client = TcpStream::connect(local).await.unwrap();
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("the refusal is prompt")
+        .expect("the refusal is readable");
+    assert_eq!(read, 0, "the client sees EOF with zero bytes");
+
+    let events = fake::events(&diag, &log).await;
+    assert_eq!(plain.seen(|s| s.accepts), 0);
+    assert!(fake::named(&events, "materialized").is_empty());
+    let refused = fake::named(&events, "caller_refused");
+    assert_eq!(refused.len(), 1, "{events:?}");
+    assert_eq!(refused[0]["fields"]["listener"], "postgres");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_without_a_caller_check_refuses() {
+    let plain = fake::start(Script::new(Answer::N)).await;
+    let home = tempfile::tempdir().unwrap();
+    let (diag, log) = fake::open_diag(home.path());
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        plain.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(fake::PASSWORD),
+        diag.clone(),
+        None,
+    )
+    .await;
+
+    let mut client = TcpStream::connect(local).await.unwrap();
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("the refusal is prompt")
+        .expect("the refusal is readable");
+    assert_eq!(read, 0, "the client sees EOF with zero bytes");
+    let events = fake::events(&diag, &log).await;
+    assert_eq!(plain.seen(|s| s.accepts), 0);
+    assert_eq!(
+        fake::named(&events, "caller_refused").len(),
+        1,
+        "{events:?}"
     );
 }

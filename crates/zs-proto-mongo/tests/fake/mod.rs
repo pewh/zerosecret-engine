@@ -686,6 +686,10 @@ pub fn auth() -> Auth {
     Auth::new(USER, SOURCE)
 }
 
+pub fn admit_all() -> zs_protocol::CallerCheck {
+    Arc::new(|_, _| true)
+}
+
 pub async fn listen(
     seed: SocketAddr,
     tls: Option<UpstreamTls>,
@@ -704,6 +708,28 @@ pub async fn listen_with(
     audit: Option<AuditRefusal>,
     budget: Option<Duration>,
 ) -> SocketAddr {
+    listen_gated(
+        seed,
+        tls,
+        materialize,
+        diag,
+        audit,
+        budget,
+        Some(admit_all()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_gated(
+    seed: SocketAddr,
+    tls: Option<UpstreamTls>,
+    materialize: Materialize,
+    diag: DiagLog,
+    audit: Option<AuditRefusal>,
+    budget: Option<Duration>,
+    caller_check: Option<zs_protocol::CallerCheck>,
+) -> SocketAddr {
     let endpoint = UpstreamEndpoint::new(seed.ip().to_string(), seed.port()).unwrap();
     let mut listener =
         MongoListener::bind_endpoint("127.0.0.1:0", endpoint, tls, auth(), materialize)
@@ -716,6 +742,10 @@ pub async fn listen_with(
     if let Some(budget) = budget {
         listener = listener.with_handshake_budget(budget);
     }
+    let listener = match caller_check {
+        Some(check) => listener.with_caller_check(check),
+        None => listener,
+    };
     let local = listener.local_addr();
     tokio::spawn(listener.serve());
     local

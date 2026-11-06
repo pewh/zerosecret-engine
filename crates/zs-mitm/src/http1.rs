@@ -8,7 +8,8 @@ use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Body as _, Frame, Incoming, SizeHint};
 use hyper::ext::ReasonPhrase;
 use hyper::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, TRANSFER_ENCODING,
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, PROXY_AUTHENTICATE,
+    TRANSFER_ENCODING,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -25,6 +26,7 @@ const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) const HOP_BY_HOP: &[&str] = &[
     "Connection",
     "Proxy-Connection",
+    "Proxy-Authorization",
     "Keep-Alive",
     "Content-Length",
     "Transfer-Encoding",
@@ -345,11 +347,14 @@ pub(crate) enum Reply {
     AuditUnavailable,
     UpstreamUnreachable,
     Refused,
+    RunTokenRequired,
+    RunTokenForbidden,
     Established,
     DeniedBecause(String),
 }
 
 pub(crate) fn reply(kind: Reply) -> Response<Body> {
+    let authenticate = matches!(kind, Reply::RunTokenRequired);
     let (status, phrase, closes) = match kind {
         Reply::Denied => (
             StatusCode::BAD_GATEWAY,
@@ -371,6 +376,16 @@ pub(crate) fn reply(kind: Reply) -> Response<Body> {
             ReasonPhrase::from_static(b"ZeroSecret refused an ambiguous request"),
             true,
         ),
+        Reply::RunTokenRequired => (
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            ReasonPhrase::from_static(b"ZeroSecret needs the run token"),
+            true,
+        ),
+        Reply::RunTokenForbidden => (
+            StatusCode::FORBIDDEN,
+            ReasonPhrase::from_static(b"ZeroSecret needs the run token"),
+            true,
+        ),
         Reply::Established => (
             StatusCode::OK,
             ReasonPhrase::from_static(b"Connection established"),
@@ -388,6 +403,12 @@ pub(crate) fn reply(kind: Reply) -> Response<Body> {
     let mut response = Response::new(fixed_body(Bytes::new()));
     *response.status_mut() = status;
     response.extensions_mut().insert(phrase);
+    if authenticate {
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"zs\""),
+        );
+    }
     if closes {
         response
             .headers_mut()

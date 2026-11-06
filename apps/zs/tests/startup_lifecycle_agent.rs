@@ -364,8 +364,14 @@ fn the_child_receives_every_proxy_ca_and_postgres_variable() {
     let ca = ca_dir.join("ca.crt").display().to_string();
     let bundle = ca_dir.join("ca-bundle.crt");
 
-    assert_eq!(value("HTTPS_PROXY="), format!("http://{proxy}"));
-    assert_eq!(value("https_proxy="), format!("http://{proxy}"));
+    let proxy_url = value("HTTPS_PROXY=");
+    let userinfo = proxy_url
+        .strip_prefix("http://zs:")
+        .and_then(|rest| rest.split_once('@'))
+        .expect("the proxy URL carries the run token");
+    assert_eq!(userinfo.1, proxy);
+    assert_eq!(userinfo.0.len(), 64, "{proxy_url}");
+    assert_eq!(value("https_proxy="), proxy_url);
     assert_eq!(value("NODE_EXTRA_CA_CERTS="), ca);
     for name in ["SSL_CERT_FILE=", "REQUESTS_CA_BUNDLE=", "CURL_CA_BUNDLE="] {
         assert_eq!(value(name), bundle.display().to_string(), "{name}");

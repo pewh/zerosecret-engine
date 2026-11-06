@@ -14,6 +14,7 @@ mod audit_ship;
 mod init;
 mod instructions;
 mod login;
+mod peer;
 mod run;
 mod schema;
 

@@ -37,9 +37,12 @@ fn last_head(agent: &TempAgent) -> String {
 
 async fn connect_line(agent: &TempAgent) -> (TcpStream, String) {
     let mut tcp = TcpStream::connect(proxy_of(agent)).await.unwrap();
-    tcp.write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: {HOST}:443\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
+    tcp.write_all(&common::authorized_for_proxy(
+        &proxy_of(agent),
+        format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: {HOST}:443\r\n\r\n").as_bytes(),
+    ))
+    .await
+    .unwrap();
     let head = read_head(&mut tcp).await;
     (tcp, head)
 }

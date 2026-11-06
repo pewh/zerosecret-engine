@@ -120,6 +120,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub struct MysqlListener {
     listener: TcpListener,
     shared: Shared,
+    caller_check: Option<zs_protocol::CallerCheck>,
 }
 
 #[derive(Clone)]
@@ -147,6 +148,7 @@ impl MysqlListener {
         let config = zs_upstream::client_config(&tls).map_err(std::io::Error::other)?;
         Ok(Self {
             listener: TcpListener::bind(local).await?,
+            caller_check: None,
             shared: Shared {
                 upstream,
                 tls: config,
@@ -190,9 +192,32 @@ impl MysqlListener {
             .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
     }
 
+    pub fn with_caller_check(mut self, check: zs_protocol::CallerCheck) -> Self {
+        self.caller_check = Some(check);
+        self
+    }
+
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
-            let (client, _peer) = self.listener.accept().await?;
+            let (client, peer) = self.listener.accept().await?;
+            let admitted = match (&self.caller_check, client.local_addr()) {
+                (Some(check), Ok(local)) => {
+                    let check = check.clone();
+                    tokio::task::spawn_blocking(move || check(peer, local))
+                        .await
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !admitted {
+                self.shared.diag.emit(
+                    Event::new(Component::Mysql, "caller_refused")
+                        .conn(self.shared.diag.next_conn())
+                        .token("listener", "mysql"),
+                );
+                drop(client);
+                continue;
+            }
             let shared = self.shared.clone();
             tokio::spawn(async move { handle_connection(client, shared).await });
         }
@@ -823,7 +848,7 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, conn: &Conn) {
             ending = &mut forward => match ending {
                 Ending::ChangeUser | Ending::Broken(_) => ending,
                 other => match backward.as_mut().await {
-                    broken @ Ending::Broken(_) => broken,
+                    broken @ Ending::Broken(_) if !quit.load(Ordering::SeqCst) => broken,
                     _ => other,
                 },
             },

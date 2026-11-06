@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 
+use base64::Engine as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,6 +35,59 @@ pub fn clean_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         }
     }
     command
+}
+
+static PROXY_AUTHORIZATIONS: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn register_proxy_authorization(proxy: &str, authorization: &str) {
+    let mut all = PROXY_AUTHORIZATIONS.lock().unwrap();
+    all.push((proxy.to_string(), authorization.to_string()));
+}
+
+static ENDPOINT_PREFIXES: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn register_endpoint_prefix(addr: &str, prefix: &str) {
+    let mut all = ENDPOINT_PREFIXES.lock().unwrap();
+    all.push((addr.to_string(), prefix.to_string()));
+}
+
+pub fn endpoint_prefix(addr: &str) -> String {
+    let all = ENDPOINT_PREFIXES.lock().unwrap();
+    all.iter()
+        .rev()
+        .find(|(known, _)| known == addr)
+        .map(|(_, prefix)| prefix.clone())
+        .unwrap_or_default()
+}
+
+pub fn authorized_for_proxy(proxy: &str, request: &[u8]) -> Vec<u8> {
+    let authorization = registered_proxy_authorization(proxy);
+    with_proxy_authorization(request, &authorization)
+}
+
+fn registered_proxy_authorization(proxy: &str) -> String {
+    let all = PROXY_AUTHORIZATIONS.lock().unwrap();
+    all.iter()
+        .rev()
+        .find(|(addr, _)| addr == proxy)
+        .map(|(_, authorization)| authorization.clone())
+        .unwrap_or_default()
+}
+
+fn with_proxy_authorization(request: &[u8], authorization: &str) -> Vec<u8> {
+    let Some(line_end) = request.windows(2).position(|pair| pair == b"\r\n") else {
+        return request.to_vec();
+    };
+    if authorization.is_empty() {
+        return request.to_vec();
+    }
+    let mut out = Vec::with_capacity(request.len() + authorization.len() + 32);
+    out.extend_from_slice(&request[..line_end + 2]);
+    out.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
+    out.extend_from_slice(&request[line_end + 2..]);
+    out
 }
 
 pub fn random_hex() -> String {
@@ -609,11 +663,43 @@ fn write_local_setup(
 pub struct AgentProcess {
     pub child: std::process::Child,
     pub proxy_addr: String,
+    pub startup_stdout: String,
+    pub proxy_authorization: String,
+    pub endpoint_urls: Vec<(String, String)>,
     pub ca_path: PathBuf,
     pub stderr: std::process::ChildStderr,
     pub postgres_port: Option<u16>,
     pub mysql_port: Option<u16>,
     pub mongo_port: Option<u16>,
+}
+
+#[cfg(unix)]
+const CHILD_ENV_SCRIPT: &str =
+    r#"env | grep -E "^(HTTPS_PROXY|ZS_[A-Z0-9_]+_URL)=" > "$ZS_TEST_ENV_FILE"; exec "$@""#;
+
+pub fn parse_child_env(text: &str) -> (String, Vec<(String, String)>) {
+    let mut authorization = String::new();
+    let mut endpoints = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("HTTPS_PROXY=") {
+            if let Some((userinfo, _)) = value
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split_once('@'))
+            {
+                authorization = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(userinfo)
+                );
+            }
+        } else if let Some((name, url)) = line
+            .strip_prefix("ZS_")
+            .and_then(|rest| rest.split_once('='))
+            && name.ends_with("_URL")
+        {
+            endpoints.push((format!("ZS_{name}"), url.to_string()));
+        }
+    }
+    (authorization, endpoints)
 }
 
 pub fn spawn_agent(
@@ -651,25 +737,40 @@ pub fn spawn_agent_with_env(
     if !audit_dir_exists {
         std::fs::remove_dir_all(audit.parent().unwrap()).ok();
     }
+    let mut arguments: Vec<std::ffi::OsString> = vec![
+        "run".into(),
+        "--policy".into(),
+        policy.as_os_str().to_owned(),
+        "--credentials-dir".into(),
+        creds.as_os_str().to_owned(),
+        "--audit".into(),
+        audit.as_os_str().to_owned(),
+        "--ca-dir".into(),
+        ca_dir.as_os_str().to_owned(),
+        "--as".into(),
+        "default".into(),
+        "--".into(),
+    ];
+    #[cfg(unix)]
+    let env_file = {
+        let path = std::env::temp_dir().join(format!("zs-child-env-{}.env", random_hex()));
+        arguments.push("/bin/sh".into());
+        arguments.push("-c".into());
+        arguments.push(CHILD_ENV_SCRIPT.into());
+        arguments.push("sh".into());
+        Some(path)
+    };
+    arguments.extend(child.iter().map(std::ffi::OsString::from));
     let mut cmd = Command::new(bin);
-    cmd.args([
-        "run",
-        "--policy",
-        policy.to_str().unwrap(),
-        "--credentials-dir",
-        creds.to_str().unwrap(),
-        "--audit",
-        audit.to_str().unwrap(),
-        "--ca-dir",
-        ca_dir.to_str().unwrap(),
-        "--as",
-        "default",
-        "--",
-    ])
-    .args(child)
-    .envs(env.iter().copied())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.args(&arguments)
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let mut cmd = {
+        cmd.env("ZS_TEST_ENV_FILE", env_file.as_ref().unwrap());
+        cmd
+    };
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -701,9 +802,43 @@ pub fn spawn_agent_with_env(
                     .find_map(|l| l.rsplit_once("-> 127.0.0.1:"))
                     .and_then(|(_, port)| port.trim().parse().ok())
             };
+            #[cfg(unix)]
+            let (proxy_authorization, endpoint_urls) = {
+                let path = env_file.as_ref().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let text = loop {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) if text.contains("HTTPS_PROXY=") && text.ends_with('\n') => {
+                            break Some(text);
+                        }
+                        _ if Instant::now() >= deadline => break None,
+                        _ => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                };
+                std::fs::remove_file(path).ok();
+                let parsed = text.as_deref().map(parse_child_env);
+                match parsed {
+                    Some((authorization, endpoints)) if !authorization.is_empty() => {
+                        (authorization, endpoints)
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(
+                            "the child never reported an HTTPS_PROXY with the run token".into()
+                        );
+                    }
+                }
+            };
+            #[cfg(not(unix))]
+            let (proxy_authorization, endpoint_urls) = (String::new(), Vec::new());
+            register_proxy_authorization(addr.trim(), &proxy_authorization);
             return Ok(AgentProcess {
                 child,
                 proxy_addr: addr.trim().to_string(),
+                startup_stdout: text.clone(),
+                proxy_authorization,
+                endpoint_urls,
                 ca_path: PathBuf::from(ca.trim()),
                 stderr,
                 postgres_port: port_of("zs: postgres "),
@@ -720,6 +855,17 @@ pub async fn open_tunnel(
     host: &str,
     port: u16,
 ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+    let authorization = registered_proxy_authorization(proxy);
+    open_tunnel_with(proxy, &authorization, ca_pem, host, port).await
+}
+
+pub async fn open_tunnel_with(
+    proxy: &str,
+    proxy_authorization: &str,
+    ca_pem: &str,
+    host: &str,
+    port: u16,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let (tcp, status) = loop {
         let attempt = async {
@@ -727,7 +873,10 @@ pub async fn open_tunnel(
                 .await
                 .map_err(|e| e.to_string())?;
             tcp.write_all(
-                format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes(),
+                format!(
+                    "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: {proxy_authorization}\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -821,6 +970,15 @@ pub async fn tunneled_exchange(
 }
 
 pub async fn raw_exchange(proxy: &str, request: &[u8]) -> String {
+    let authorization = registered_proxy_authorization(proxy);
+    raw_exchange_with(proxy, &with_proxy_authorization(request, &authorization)).await
+}
+
+pub async fn raw_exchange_without_token(proxy: &str, request: &[u8]) -> String {
+    raw_exchange_with(proxy, request).await
+}
+
+async fn raw_exchange_with(proxy: &str, request: &[u8]) -> String {
     let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
     stream.write_all(request).await.unwrap();
     let mut response = Vec::new();

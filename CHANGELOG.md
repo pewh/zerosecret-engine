@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+**Breaking.** A client that drops the proxy userinfo, and a request to the local endpoint whose
+path does not start with the run token, are refused. There is no opt-out flag.
+
+- Every local listener of `zs run` authenticates its caller (ADR-0052). `HTTPS_PROXY`, and
+  `HTTP_PROXY` for an http binding, carry a per-run token as the proxy userinfo
+  (`http://zs:<64 hex>@<addr>`); the proxy answers `407` with
+  `Proxy-Authenticate: Basic realm="zs"` when `Proxy-Authorization` is missing or wrong.
+  `ZS_<RESOURCE>_URL` carries the token as its first path segment; the endpoint and
+  `/.zs/presign` answer `403` when it is missing, and `/.zs/presign` strips the token from a URL
+  the client presigned on `ZS_<RESOURCE>_URL` before it re-signs it. Both refusals come before
+  grant lookup, materialization and audit, emit one `caller_refused` diagnostic event, and echo
+  nothing the caller sent.
+- The PostgreSQL, MySQL and MongoDB listeners close a connection unless its peer is an
+  established socket of the agent's OS user, before reading a byte and before materialization.
+  The check is `inet_diag` on Linux and a walk of the user's processes on macOS, and it runs off
+  the async runtime. Windows database listeners do not check (SECURITY §3); any other platform
+  refuses every database client.
+- A MySQL server that resets the connection in answer to the client's `COM_QUIT` is no longer
+  reported as an `upstream_failed` relay error, whichever half of the relay finishes first.
+- `Proxy-Authorization` is removed as soon as the proxy admits a request, and it is a hop-by-hop
+  header: it never reaches an upstream.
+- SECURITY §7 gains rows 98-102. `zs-verify` probes the listener with and without the token,
+  reads the token from `/proc/<pid>/environ` on Linux, and reports the listener vector
+  `incomplete` when it could probe only without the token. The conformance adapter reads the
+  endpoint URL from the child's environment.
 - Two `zs run` processes that share a CA directory no longer race on the Bun preload: the file
   is written under a private temporary name and renamed into place, so neither run loses Bun
   WebSocket interception.

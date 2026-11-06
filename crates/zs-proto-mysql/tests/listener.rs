@@ -569,6 +569,7 @@ async fn the_greeting_names_the_configured_client_plugin_and_both_log_in() {
         )
         .await
         .unwrap()
+        .with_caller_check(fake::admit_all())
         .with_client_auth(auth);
         let local = listener.local_addr();
         tokio::spawn(listener.serve());
@@ -903,4 +904,105 @@ async fn local_infile_is_never_offered_upstream() {
         0,
         "negative control: a capability the client set and the server offered survives"
     );
+}
+
+fn caller_diag() -> (DiagLog, std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diag.jsonl");
+    let log = DiagLog::open_with_cap(&path, "caller", 1 << 20).unwrap();
+    (log, path, dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_the_check_admits_is_relayed() {
+    let fake = fake::start(native()).await;
+    let (diag, _log, _dir) = caller_diag();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let check: zs_protocol::CallerCheck = Arc::new(move |peer, local| {
+        record.lock().unwrap().push((peer, local));
+        true
+    });
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        fake.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(PASSWORD),
+        diag,
+        None,
+        Some(check),
+    )
+    .await;
+
+    let session = fake::login(local, CLIENT_CAPS).await;
+    assert_eq!(session.reply.payload.first(), Some(&packet::OK_HEADER));
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, local);
+    drop(calls);
+    assert_eq!(fake.seen(|s| s.accepts), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_peer_lookup_denies() {
+    let fake = fake::start(native()).await;
+    let (diag, log, _dir) = caller_diag();
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        fake.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(PASSWORD),
+        diag.clone(),
+        None,
+        Some(Arc::new(|_, _| false)),
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(local).await.unwrap();
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("the refusal is prompt")
+        .expect("the refusal is readable");
+    assert_eq!(read, 0, "the client sees EOF with zero bytes");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    diag.close();
+    assert_eq!(fake.seen(|s| s.accepts), 0);
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(!text.contains("materialized"), "{text}");
+    assert_eq!(text.matches("\"caller_refused\"").count(), 1, "{text}");
+    assert!(text.contains("\"listener\":\"mysql\""), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_without_a_caller_check_refuses() {
+    let fake = fake::start(native()).await;
+    let (diag, log, _dir) = caller_diag();
+    let local = fake::listen_gated(
+        "127.0.0.1",
+        fake.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize(PASSWORD),
+        diag.clone(),
+        None,
+        None,
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(local).await.unwrap();
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("the refusal is prompt")
+        .expect("the refusal is readable");
+    assert_eq!(read, 0, "the client sees EOF with zero bytes");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    diag.close();
+    assert_eq!(fake.seen(|s| s.accepts), 0);
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("\"listener\":\"mysql\""), "{text}");
 }

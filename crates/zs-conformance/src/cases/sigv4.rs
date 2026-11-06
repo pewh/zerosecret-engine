@@ -666,7 +666,10 @@ fn send(ctx: &Context, request: &Request<'_>) -> Result<String, String> {
         .arg("--dump-header")
         .arg(&header_file)
         .arg("--proxy")
-        .arg(format!("http://{}", ctx.endpoint));
+        .arg(match ctx.env.get("CONFORMANCE_PROXY_USERINFO") {
+            Some(userinfo) => format!("http://{userinfo}@{}", ctx.endpoint),
+            None => format!("http://{}", ctx.endpoint),
+        });
     if request.insecure {
         command.arg("--insecure");
     }

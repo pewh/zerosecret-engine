@@ -299,6 +299,28 @@ fn each_leak_vector_exits_one_and_names_only_that_vector() {
 }
 
 #[test]
+fn a_listener_probed_without_the_run_token_is_incomplete() {
+    let fixture = Fixture::new(BINDINGS);
+
+    let output = fixture.run_stub(
+        clean_stub(),
+        "--upstream-port {UPSTREAM_PORT} --no-run-token",
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let report = report(&output);
+    assert_positive_decisions(&report);
+    assert_eq!(vector(&report, "agent_listener")["status"], "incomplete");
+    assert_eq!(
+        vector(&report, "agent_listener")["reason"],
+        "the agent listener was probed only without the run token"
+    );
+    assert_clean_vectors(&report, &["agent_listener"]);
+    fixture.assert_silent_about_the_credential(&output);
+}
+
+#[test]
 fn a_missing_environment_report_exits_two() {
     let fixture = Fixture::new(BINDINGS);
     let child = fixture.child_script("child.sh", "rm -f \"$ZS_VERIFY_ENV_REPORT\"");
