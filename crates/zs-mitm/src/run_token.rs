@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use base64::Engine as _;
 use hyper::HeaderMap;
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const TOKEN_BYTES: usize = 32;
@@ -83,30 +84,17 @@ impl RunToken {
     }
 
     fn matches(&self, candidate: &[u8]) -> bool {
-        if candidate.len() != TOKEN_LEN {
-            return false;
-        }
-        let mut diff = 0_u8;
-        for (expected, actual) in self.hex.as_bytes().iter().zip(candidate) {
-            diff |= expected ^ actual;
-        }
-        std::hint::black_box(diff) == 0
+        bool::from(self.hex.as_bytes().ct_eq(candidate))
     }
 
     fn matches_credentials(&self, presented: &[u8]) -> bool {
-        if presented.len() != USER.len() + 1 + TOKEN_LEN {
+        let Some(rest) = presented.strip_prefix(USER.as_bytes()) else {
             return false;
-        }
-        let mut diff = 0_u8;
-        for (index, actual) in presented.iter().enumerate() {
-            let expected = match index {
-                index if index < USER.len() => USER.as_bytes()[index],
-                index if index == USER.len() => b':',
-                index => self.hex.as_bytes()[index - USER.len() - 1],
-            };
-            diff |= actual ^ expected;
-        }
-        std::hint::black_box(diff) == 0
+        };
+        let Some(presented_token) = rest.strip_prefix(b":") else {
+            return false;
+        };
+        bool::from(self.hex.as_bytes().ct_eq(presented_token))
     }
 }
 
