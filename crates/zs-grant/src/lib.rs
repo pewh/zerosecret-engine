@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zs_policy::CredentialSource;
 
+pub const GRANT_VERSION: u32 = 1;
+
 #[derive(Debug, Error)]
 pub enum GrantError {
     #[error("grant signature invalid")]
@@ -23,6 +25,10 @@ pub enum GrantError {
     OperationNotGranted { operation: String },
     #[error("grant field {field} has a reserved separator")]
     Unsignable { field: &'static str },
+    #[error("grant version not supported by this zs; upgrade zs")]
+    UnsupportedVersion,
+    #[error("grant is for another environment")]
+    EnvironmentMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +37,7 @@ pub struct VerifyContext<'a> {
     pub workload: &'a str,
     pub resource: &'a str,
     pub operation: &'a str,
+    pub environment: Option<&'a str>,
 }
 
 pub fn canonical_payload(grant: &Grant) -> Vec<u8> {
@@ -78,6 +85,9 @@ pub fn canonical_payload(grant: &Grant) -> Vec<u8> {
     field("upstream_host", &grant.upstream_host);
     field("upstream_port", &grant.upstream_port.to_string());
     field("upstream_tls", &grant.upstream_tls.to_string());
+    if grant.version > GRANT_VERSION {
+        field("version", &grant.version.to_string());
+    }
     field("workload", &grant.workload);
     out.into_bytes()
 }
@@ -136,6 +146,7 @@ pub struct Grant {
     pub upstream_port: u16,
     pub upstream_tls: zs_policy::UpstreamTlsMode,
     pub local_endpoint: bool,
+    pub version: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,7 +169,20 @@ struct GrantWire {
     upstream_host: String,
     upstream_port: u16,
     upstream_tls: zs_policy::UpstreamTlsMode,
+    #[serde(
+        default = "default_grant_version",
+        skip_serializing_if = "version_is_one"
+    )]
+    version: u32,
     local_endpoint: bool,
+}
+
+fn default_grant_version() -> u32 {
+    GRANT_VERSION
+}
+
+fn version_is_one(version: &u32) -> bool {
+    *version == GRANT_VERSION
 }
 
 impl From<Grant> for GrantWire {
@@ -183,6 +207,7 @@ impl From<Grant> for GrantWire {
             upstream_host: grant.upstream_host,
             upstream_port: grant.upstream_port,
             upstream_tls: grant.upstream_tls,
+            version: grant.version,
             local_endpoint: grant.local_endpoint,
         }
     }
@@ -216,6 +241,11 @@ impl TryFrom<GrantWire> for Grant {
             upstream_host: wire.upstream_host,
             upstream_port: wire.upstream_port,
             upstream_tls: wire.upstream_tls,
+            version: if wire.version == 0 {
+                GRANT_VERSION
+            } else {
+                wire.version
+            },
             local_endpoint: wire.local_endpoint,
         })
     }
@@ -284,16 +314,31 @@ impl ControlSigningKey {
 
 #[derive(Clone)]
 pub struct AgentVerifier {
-    keys: Vec<(String, VerifyingKey)>,
+    keys: std::sync::Arc<std::sync::RwLock<Vec<(String, VerifyingKey)>>>,
 }
 
 impl AgentVerifier {
-    pub fn keys(&self) -> &[(String, VerifyingKey)] {
-        &self.keys
+    pub fn keys(&self) -> Vec<(String, VerifyingKey)> {
+        self.keys
+            .read()
+            .map(|keys| keys.clone())
+            .unwrap_or_default()
     }
 
     pub fn new(keys: Vec<(String, VerifyingKey)>) -> Self {
-        Self { keys }
+        Self {
+            keys: std::sync::Arc::new(std::sync::RwLock::new(keys)),
+        }
+    }
+
+    // An empty set is ignored so an old control plane never empties the ring.
+    pub fn replace(&self, keys: Vec<(String, VerifyingKey)>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Ok(mut current) = self.keys.write() {
+            *current = keys;
+        }
     }
 
     pub fn verify(
@@ -303,10 +348,10 @@ impl AgentVerifier {
         context: &VerifyContext<'_>,
     ) -> Result<VerifiedGrant, GrantError> {
         let key = self
-            .keys
-            .iter()
+            .keys()
+            .into_iter()
             .find(|(id, _)| *id == signed.signing_key_id)
-            .map(|(_, k)| *k)
+            .map(|(_, k)| k)
             .ok_or(GrantError::SignatureInvalid)?;
         let payload = canonical_payload(&signed.grant);
         let bytes: [u8; 64] = base64::engine::general_purpose::STANDARD
@@ -317,6 +362,14 @@ impl AgentVerifier {
         let signature = Signature::from_bytes(&bytes);
         key.verify(&payload, &signature)
             .map_err(|_| GrantError::SignatureInvalid)?;
+        if signed.grant.version != GRANT_VERSION {
+            return Err(GrantError::UnsupportedVersion);
+        }
+        if let Some(environment) = context.environment
+            && signed.grant.environment != environment
+        {
+            return Err(GrantError::EnvironmentMismatch);
+        }
         if signed.grant.expires_at_ms <= now_ms {
             return Err(GrantError::Expired);
         }
@@ -396,6 +449,7 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            version: GRANT_VERSION,
         }
     }
 
@@ -405,6 +459,7 @@ mod tests {
             workload: "claude-code",
             resource,
             operation,
+            environment: None,
         }
     }
 
@@ -582,6 +637,7 @@ mod tests {
             workload: "claude-code",
             resource: "stripe-production",
             operation: "GET",
+            environment: None,
         };
         assert!(matches!(
             verifier.verify(&signed, now_ms(), &wrong_subject),
@@ -592,6 +648,7 @@ mod tests {
             workload: "other-agent",
             resource: "stripe-production",
             operation: "GET",
+            environment: None,
         };
         assert!(matches!(
             verifier.verify(&signed, now_ms(), &wrong_workload),
@@ -703,6 +760,7 @@ mod tests {
             workload: "claude-code",
             resource: "stripe-production",
             operation: "GET",
+            environment: None,
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -736,6 +794,7 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            version: GRANT_VERSION,
         }
     }
 
@@ -944,6 +1003,102 @@ mod tests {
         assert!(serde_json::from_value::<PreSourceGrant>(value).is_err());
         let value = serde_json::to_value(golden_grant()).unwrap();
         assert!(serde_json::from_value::<PreSourceGrant>(value).is_ok());
+    }
+
+    #[test]
+    fn a_cloned_verifier_shares_the_replaced_key_set() {
+        let first = ControlSigningKey::generate("control-k1");
+        let second = ControlSigningKey::generate("control-k2");
+        let verifier = verifier_for(&first);
+        let clone = verifier.clone();
+        let signed = second.sign(grant(60_000)).unwrap();
+        let context = ctx("stripe-production", "GET");
+
+        assert!(matches!(
+            clone.verify(&signed, now_ms(), &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+        let second_key = VerifyingKey::from_bytes(&second.verifying_key_bytes()).unwrap();
+        clone.replace(vec![("control-k2".to_string(), second_key)]);
+        assert!(verifier.verify(&signed, now_ms(), &context).is_ok());
+
+        verifier.replace(Vec::new());
+        assert!(
+            verifier.verify(&signed, now_ms(), &context).is_ok(),
+            "an empty set must not clear the ring"
+        );
+        assert_eq!(verifier.keys().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_grant_version_is_refused_by_name() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+
+        let signed = control.sign(grant(60_000)).unwrap();
+        assert!(verifier.verify(&signed, now_ms(), &context).is_ok());
+
+        let mut next = grant(60_000);
+        next.version = 2;
+        let signed = control.sign(next).unwrap();
+        let err = verifier.verify(&signed, now_ms(), &context).unwrap_err();
+        assert!(
+            matches!(&err, GrantError::UnsupportedVersion),
+            "expected UnsupportedVersion, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "grant version not supported by this zs; upgrade zs"
+        );
+
+        let mut document = serde_json::to_value(&signed).unwrap();
+        document["grant"].as_object_mut().unwrap().remove("version");
+        let stripped: SignedGrant = serde_json::from_value(document).unwrap();
+        assert!(matches!(
+            verifier.verify(&stripped, now_ms(), &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn a_grant_for_another_environment_is_refused() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let mut production_grant = grant(60_000);
+        production_grant.environment = "production".into();
+        let production = control.sign(production_grant).unwrap();
+        let development = control.sign(grant(60_000)).unwrap();
+
+        let in_production = VerifyContext {
+            environment: Some("production"),
+            ..ctx("stripe-production", "GET")
+        };
+        assert!(
+            verifier
+                .verify(&production, now_ms(), &in_production)
+                .is_ok()
+        );
+        let err = verifier
+            .verify(&development, now_ms(), &in_production)
+            .unwrap_err();
+        assert!(
+            matches!(err, GrantError::EnvironmentMismatch),
+            "expected EnvironmentMismatch, got {err:?}"
+        );
+        assert_eq!(err.to_string(), "grant is for another environment");
+
+        let no_environment = ctx("stripe-production", "GET");
+        assert!(
+            verifier
+                .verify(&production, now_ms(), &no_environment)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify(&development, now_ms(), &no_environment)
+                .is_ok()
+        );
     }
 
     #[test]

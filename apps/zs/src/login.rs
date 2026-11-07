@@ -85,6 +85,8 @@ fn sign_in_and_enrol(args: &Args, control: &str) -> Result<(), String> {
         grant_verifying_key_hex: hex(&response.grant_verifying_key),
         grant_verifying_key_id: response.grant_verifying_key_id,
         wire_url: response.wire_url,
+        environment: response.environment,
+        control_ca_pems: response.control_ca_pems,
     };
     if !valid_device_id(&enrolment.device_id) {
         return Err(

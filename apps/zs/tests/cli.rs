@@ -251,6 +251,8 @@ fn stored_enrolment(control: &str) -> zs::device::Enrolment {
         grant_verifying_key_hex: "cd".repeat(32),
         grant_verifying_key_id: "control-k1".into(),
         wire_url: "https://localhost:8444".into(),
+        environment: None,
+        control_ca_pems: Vec::new(),
     }
 }
 

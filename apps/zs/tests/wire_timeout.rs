@@ -39,6 +39,8 @@ async fn wire_client_times_out_a_silent_control_plane() {
             .collect(),
         grant_verifying_key_id: "control-k1".into(),
         wire_url: format!("https://localhost:{port}"),
+        environment: None,
+        control_ca_pems: Vec::new(),
     };
     let secrets = DeviceSecrets::new(
         Zeroizing::new(key.serialize_pem()),

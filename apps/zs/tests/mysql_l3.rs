@@ -63,6 +63,7 @@ fn write_setup(dir: &Path, bindings: &[(&str, &str, u16)], password: &str) -> Se
                         upstream_port: connection.upstream_port,
                         upstream_tls: connection.upstream_tls,
                         local_endpoint: connection.local_endpoint,
+                        version: zs_grant::GRANT_VERSION,
                     })
                     .unwrap(),
             )

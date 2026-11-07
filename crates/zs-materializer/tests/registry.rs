@@ -40,6 +40,7 @@ fn grant(source: CredentialSource, mode: Materialization) -> Grant {
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        version: zs_grant::GRANT_VERSION,
     }
 }
 
@@ -58,6 +59,7 @@ fn verified(source: CredentialSource, mode: Materialization) -> VerifiedGrant {
             workload: "claude-code",
             resource: "acme-db",
             operation: "connect",
+            environment: None,
         },
     )
     .unwrap()

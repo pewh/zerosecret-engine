@@ -83,6 +83,10 @@ pub struct Enrolment {
     pub grant_verifying_key_hex: String,
     pub grant_verifying_key_id: String,
     pub wire_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_ca_pems: Vec<String>,
 }
 
 impl Enrolment {
@@ -212,6 +216,8 @@ mod tests {
             grant_verifying_key_hex: "cd".repeat(32),
             grant_verifying_key_id: "control-k1".into(),
             wire_url: "https://localhost:8444".into(),
+            environment: Some("development".into()),
+            control_ca_pems: Vec::new(),
         }
     }
 

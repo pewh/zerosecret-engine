@@ -135,6 +135,7 @@ fn workspace_for(host: &str, port: u16) -> common::TestHome {
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                version: zs_grant::GRANT_VERSION,
             })
             .unwrap(),
     )

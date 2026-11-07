@@ -68,6 +68,20 @@ letting one test stand in for the set.
 
 ## 3. What ZeroSecret does not defend against
 
+**Key rings.** The grant signing key, the federation key and the device CA are rings in one
+`ZS_CONTROL_CA_DIR` (ADR-0053). A device trusts the published grant keys and CA certificates that
+the control plane sends in the 60-second revocations response; an absent or empty set leaves its
+set unchanged, and a set with one invalid entry is rejected whole. Every control instance must
+read the same directory: separate copies publish different sets, and a device that refreshes from
+one drops the key the other promoted. A key retires only after its grace period: 320 seconds for
+the grant and federation keys (one 300-second lifetime plus two 10-second ring reloads, because an
+instance may sign with a demoted key until its next reload), and 7 days plus 1 hour for a device
+CA, so no grant, token or device certificate it signed is still valid. The published CA set is the
+agent's whole wire trust once it has one: a retired CA, even the one pinned at enrolment, no longer
+authenticates the wire. A device that was offline for the whole 10-minute publish window of a new
+CA cannot reach the wire after the promotion; it recovers by placing the control plane's current
+CA (`GET /ca`) as its `control-ca.crt` and running `zs login` again.
+
 Stated plainly, because reviewers will find these anyway.
 
 **A hostile local process of the same OS user.** The agent's listeners bind to a loopback
@@ -970,6 +984,13 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | A local endpoint or `/.zs/presign` request whose path does not start with the run token | 403 `ZeroSecret needs the run token`. No upstream, no audit record. Diagnostic event `caller_refused`, `listener` `endpoint` (`apps/zs/tests/fail_closed_matrix.rs` row 100) |
 | A database listener's peer lookup fails, finds no established socket of the agent's OS user for the connection, or runs on a platform with no lookup | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused` (`apps/zs/tests/fail_closed_matrix.rs` row 101) |
 | A database client whose OS user differs from the agent's (Linux, macOS) | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused`. Windows database listeners do not check (§3) (`apps/zs/tests/fail_closed_matrix.rs` row 102, run in CI with a second OS user) |
+| A grant whose signed `version` is not 1 | Refused by name with `grant version not supported by this zs; upgrade zs`; no upstream contact, no audit record (`apps/zs/tests/fail_closed_matrix.rs` row 103) |
+| A grant for an environment other than the device's enrolment | Refused with `grant is for another environment`; no upstream contact, no audit record (`apps/zs/tests/fail_closed_matrix.rs` row 104) |
+| A wire server certificate from a CA the control plane never published | The TLS handshake fails, so the refresh and any grant renewal fail closed; the agent keeps its last good key set and CA set (`apps/zs/tests/fail_closed_matrix.rs` row 105) |
+| An audit batch from a device whose enrolment has expired | 401 with `{"code":"enrolment_expired"}`; no audit row is written (commercial suite) |
+| `control keys promote` inside the publish window, or `retire` of the active key | The fixed refusal text and exit 1; the state file is byte-identical (commercial suite) |
+| `control keys promote federation` while the hosted JWKS lacks the new `kid`, the JWKS cannot be read, or `ZS_FEDERATION_ISSUER` is not set in the command's environment | The fixed refusal text and exit 1; no file changes (D-f) (commercial suite) |
+| A wire server certificate from a CA the control plane no longer publishes (retired), the CA pinned at enrolment included | The TLS handshake fails, so the refresh and any grant renewal fail closed. Once the agent has installed a published set, that set is its whole wire trust (`apps/zs/tests/fail_closed_matrix.rs` row 109) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
@@ -988,6 +1009,11 @@ session keys and the SSM value can stay in freed agent memory until the memory i
 ## 8. Open questions
 
 Tracked here until answered, then moved into a decision.
+
+- **How long does AWS cache the federation JWKS?** `control keys promote federation` proves the
+  hosted JWKS holds the new `kid` (D-f, ADR-0053); it does not prove AWS STS has fetched it again.
+  Until the AWS cache time is measured, wait several minutes after the upload before the
+  promotion, and keep the retired key in the hosted JWKS until its grace has passed.
 
 - **v1 — local caller authentication.** Every local listener of `zs run` refuses a caller that
   is not a process of the OS user who runs it: the proxy and the endpoint check a per-run token,

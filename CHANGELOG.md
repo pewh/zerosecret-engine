@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
+- The control plane can replace its grant signing key, its federation key and its device CA without
+  breaking enrolled devices (ADR-0053). The agent learns the published grant keys and CA
+  certificates from the 60-second revocations response, verifies a grant under any published key,
+  and trusts a published device CA before it signs. An absent or empty set leaves the agent's
+  current set unchanged; a set with one invalid entry is rejected whole. Once the agent holds a
+  published CA set, that set is its whole wire trust: a retired CA, even the one pinned at
+  enrolment, no longer authenticates the wire. An unchanged set keeps the current connections.
+- Grants carry a signed `version`. A grant without the field is version 1 and keeps its exact
+  bytes, so a `v0.3.0` control plane keeps working; an agent refuses an unknown version by name
+  (`grant version not supported by this zs; upgrade zs`). A device enrolled with an environment
+  refuses a grant for another environment (`grant is for another environment`).
+- Device certificates expire with the device's standing plus one hour, not after a year.
+- Every wire request carries `User-Agent: zs/<version>`, and the control plane logs it as `agent`
+  (`zs/<version>`, `none` or `other`).
+- SECURITY §7 gains rows 103-105 and 109 (rows 106-108 run in the commercial suite).
+
 ## [0.3.0] - 2026-11-07
 
 **Breaking.** A client that drops the proxy userinfo, and a request to the local endpoint whose

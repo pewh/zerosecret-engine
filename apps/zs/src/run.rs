@@ -91,6 +91,42 @@ struct StoredIdentity {
     secrets: zs::device::DeviceSecrets,
 }
 
+// A non-empty CA set that parses replaces the trusted roots and is saved to the device record.
+// The set is the whole wire trust: a CA the control plane stopped publishing is dropped.
+fn install_ca_set(
+    wire: &zs::wire_client::WireClient,
+    control: &str,
+    pems: &[String],
+    diag: &DiagLog,
+) {
+    match wire.set_roots(pems) {
+        // An empty or unchanged set: the record already holds it, so the file is not reread.
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(_) => {
+            diag.emit(Event::new(Component::Grant, "ca_set_invalid").warn());
+            return;
+        }
+    }
+    let home = super::zs_home();
+    let mut file = match zs::device::load_file(&home) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let mut changed = false;
+    for slot in file.enrolments.iter_mut() {
+        if zs::device::normalise(&slot.control) == zs::device::normalise(control)
+            && slot.control_ca_pems != pems
+        {
+            slot.control_ca_pems = pems.to_vec();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = zs::device::save_file(&home, &file);
+    }
+}
+
 fn stored_identity(control: &str, args: &super::Args) -> Result<StoredIdentity, RunRefusal> {
     let ca_pem = zs::control_ca_pem(args.control_ca.as_deref(), &args.ca_dir)
         .map_err(RunRefusal::Control)?;
@@ -105,7 +141,7 @@ fn stored_identity(control: &str, args: &super::Args) -> Result<StoredIdentity, 
             }
             Err(text) => return Err(RunRefusal::Line(device_record_line(&text))),
         };
-    if zs::control_ca_sha256(&ca_pem) != enrolment.control_ca_sha256 {
+    if !zs::wire_client::pin_accepts(&ca_pem, &enrolment) {
         return Err(RunRefusal::Line(CA_CHANGED.to_string()));
     }
     Ok(StoredIdentity {
@@ -821,16 +857,20 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
         )
         .with_diag(diag.clone()),
     );
+    let control = args.control.clone().unwrap_or_default();
     if let Some(client) = wire.as_ref() {
         match runtime.block_on(client.fetch_revocations()) {
-            Ok(response) if !response.revoked_grant_ids.is_empty() => {
-                agent.apply_revocations(&response.revoked_grant_ids);
-                stdout_line!(
-                    "zs: applied {} revoked grant(s) known at startup",
-                    response.revoked_grant_ids.len()
-                );
+            Ok(response) => {
+                client.install_key_set(&response.grant_verifying_keys, diag);
+                install_ca_set(client, &control, &response.control_ca_pems, diag);
+                if !response.revoked_grant_ids.is_empty() {
+                    agent.apply_revocations(&response.revoked_grant_ids);
+                    stdout_line!(
+                        "zs: applied {} revoked grant(s) known at startup",
+                        response.revoked_grant_ids.len()
+                    );
+                }
             }
-            Ok(_) => {}
             Err(e) => {
                 stderr_line!("zs: cannot read revocations at startup: {e}");
                 return Err(refuse_run(diag, "revocations", 1));
@@ -1133,6 +1173,7 @@ async fn start_services(
         let diag = prepared.diag.clone();
         let every = refresh_interval();
 
+        let control = args.control.clone().unwrap_or_default();
         let (revocation_wire, revocation_agent, revocation_diag) =
             (wire.clone(), agent.clone(), diag.clone());
         tasks.push(tokio::spawn(async move {
@@ -1140,6 +1181,14 @@ async fn start_services(
                 tokio::time::sleep(every).await;
                 match revocation_wire.fetch_revocations().await {
                     Ok(response) => {
+                        revocation_wire
+                            .install_key_set(&response.grant_verifying_keys, &revocation_diag);
+                        install_ca_set(
+                            &revocation_wire,
+                            &control,
+                            &response.control_ca_pems,
+                            &revocation_diag,
+                        );
                         let learned = response.revoked_grant_ids.len();
                         revocation_agent.apply_revocations(&response.revoked_grant_ids);
                         if learned > 0 {
@@ -1879,6 +1928,7 @@ mod tests {
             upstream_port: port,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap()
     }

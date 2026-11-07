@@ -74,6 +74,7 @@ fn workspace(https_mode: zs_policy::Materialization) -> tempfile::TempDir {
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    version: zs_grant::GRANT_VERSION,
                 })
                 .unwrap(),
         )
@@ -273,6 +274,7 @@ fn protocol_case_and_near_misses_are_classified_by_one_allowlist() {
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    version: zs_grant::GRANT_VERSION,
                 })
                 .unwrap(),
         )

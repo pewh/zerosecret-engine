@@ -30,6 +30,32 @@ impl TestCa {
         self.cert.pem()
     }
 
+    pub fn issue_server_certificate(&self, host: &str) -> Result<(String, String), String> {
+        let key = KeyPair::generate().map_err(|e| e.to_string())?;
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
+        match host.parse::<std::net::IpAddr>() {
+            Ok(address) => params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(address)),
+            Err(_) => params.subject_alt_names.push(rcgen::SanType::DnsName(
+                host.to_string()
+                    .try_into()
+                    .map_err(|e: rcgen::Error| e.to_string())?,
+            )),
+        }
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, host.to_string());
+        let cert = params
+            .signed_by(&key, &self.cert, &self.key)
+            .map_err(|e| e.to_string())?;
+        Ok((
+            format!("{}\n{}", cert.pem(), self.certificate_pem()),
+            key.serialize_pem(),
+        ))
+    }
+
     /// The CN comes from `device_id`, never the CSR, as in the control plane.
     pub fn issue_client_certificate(
         &self,

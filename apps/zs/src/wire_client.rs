@@ -35,12 +35,20 @@ pub enum WireError {
     DeviceRefused { code: String },
 }
 
+// The HTTP client and the CA set its roots were built from, so an unchanged set is not rebuilt.
+struct WireHttp {
+    roots: Vec<String>,
+    client: reqwest::Client,
+}
+
 pub struct WireClient {
     wire_url: String,
-    http: reqwest::Client,
+    http: std::sync::Mutex<WireHttp>,
+    identity: Option<reqwest::Identity>,
     device_id: String,
     device_key: SigningKey,
     verifier: AgentVerifier,
+    environment: Option<String>,
 }
 
 impl WireClient {
@@ -62,6 +70,8 @@ impl WireClient {
             grant_verifying_key_hex: hex(&enrollment.grant_verifying_key),
             grant_verifying_key_id: enrollment.grant_verifying_key_id,
             wire_url: enrollment.wire_url,
+            environment: enrollment.environment,
+            control_ca_pems: enrollment.control_ca_pems,
         };
         Self::from_identity(ca_pem, &enrolment, &secrets)
     }
@@ -91,7 +101,7 @@ impl WireClient {
             .to_bytes()
             .to_vec();
 
-        let enroll_http = wire_client(ca_pem, None)?;
+        let enroll_http = wire_client(&[ca_pem], None)?;
         let response = enroll_http
             .post(format!("{enroll_url}/wire/enroll"))
             .json(&EnrollmentRequest {
@@ -100,6 +110,7 @@ impl WireClient {
                 enrollment_token: enrollment_token.to_string(),
                 csr,
             })
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -151,22 +162,79 @@ impl WireClient {
         ));
         let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
             .map_err(|e| WireError::Identity(e.to_string()))?;
-        let http = wire_client(ca_pem, Some(identity))?;
+        let client = wire_client(
+            &trust_set(ca_pem, &enrolment.control_ca_pems),
+            Some(identity.clone()),
+        )?;
+        let http = std::sync::Mutex::new(WireHttp {
+            roots: enrolment.control_ca_pems.clone(),
+            client,
+        });
 
         Ok(Self {
             wire_url: enrolment.wire_url.trim_end_matches('/').to_string(),
             http,
+            identity: Some(identity),
             device_id: enrolment.device_id.clone(),
             device_key,
             verifier: AgentVerifier::new(vec![(
                 enrolment.grant_verifying_key_id.clone(),
                 verifying,
             )]),
+            environment: enrolment.environment.clone(),
         })
+    }
+
+    fn http(&self) -> reqwest::Client {
+        match self.http.lock() {
+            Ok(current) => current.client.clone(),
+            Err(poisoned) => poisoned.into_inner().client.clone(),
+        }
+    }
+
+    fn roots(&self) -> Vec<String> {
+        match self.http.lock() {
+            Ok(current) => current.roots.clone(),
+            Err(poisoned) => poisoned.into_inner().roots.clone(),
+        }
+    }
+
+    // A non-empty set of PEM certificates replaces the trusted roots: it becomes the whole trust,
+    // so a CA the control plane no longer publishes is dropped, even the one pinned at enrolment.
+    // Any invalid PEM rejects the whole update and keeps the current client. An unchanged set
+    // keeps the current client and its connections. Returns whether the roots changed.
+    pub fn set_roots(&self, pems: &[String]) -> Result<bool, WireError> {
+        if pems.is_empty() || self.roots() == pems {
+            return Ok(false);
+        }
+        let client = wire_client(&trust_set("", pems), self.identity.clone())?;
+        match self.http.lock() {
+            Ok(mut current) => {
+                *current = WireHttp {
+                    roots: pems.to_vec(),
+                    client,
+                }
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = WireHttp {
+                    roots: pems.to_vec(),
+                    client,
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn verifier(&self) -> &AgentVerifier {
         &self.verifier
+    }
+
+    pub fn install_key_set(
+        &self,
+        keys: &[zs_wire::VerifyingKeyEntry],
+        diag: &zs_diag::DiagLog,
+    ) -> bool {
+        apply_key_set(&self.verifier, keys, diag)
     }
 
     pub fn device_id(&self) -> &str {
@@ -179,8 +247,9 @@ impl WireClient {
 
     pub async fn fetch_policy(&self) -> Result<PolicyResponse, WireError> {
         let response = self
-            .http
+            .http()
             .get(format!("{}/wire/policy", self.wire_url))
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -193,12 +262,13 @@ impl WireClient {
         reason: Option<&str>,
     ) -> Result<(), WireError> {
         let response = self
-            .http
+            .http()
             .post(format!("{}/wire/revoke", self.wire_url))
             .json(&zs_wire::RevokeRequest {
                 grant_id: grant_id.to_string(),
                 reason: reason.map(String::from),
             })
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -214,8 +284,9 @@ impl WireClient {
 
     pub async fn fetch_revocations(&self) -> Result<zs_wire::RevocationsResponse, WireError> {
         let response = self
-            .http
+            .http()
             .get(format!("{}/wire/revocations", self.wire_url))
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -241,10 +312,11 @@ impl WireClient {
         );
 
         let response = self
-            .http
+            .http()
             .post(format!("{}/wire/grant", self.wire_url))
             .header("x-device-signature", signature)
             .json(&body)
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -268,6 +340,7 @@ impl WireClient {
                     workload: &request.workload,
                     resource: &request.resource,
                     operation,
+                    environment: self.environment.as_deref(),
                 },
             )?;
         }
@@ -290,9 +363,10 @@ impl WireClient {
 
     pub async fn submit_audit(&self, records: &[AuditIngestRecord]) -> Result<(), WireError> {
         let response = self
-            .http
+            .http()
             .post(format!("{}/wire/audit", self.wire_url))
             .json(records)
+            .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
             .map_err(|e| WireError::Transport(transport_kind(&e).to_string()))?;
@@ -320,12 +394,33 @@ impl WireClient {
     }
 }
 
+// The trusted CAs are the published set when there is one; without a set (a `v0.3.0` record or
+// control plane) the pinned CA is the set of one. The pinned CA is not added to a published set:
+// once the control plane stops publishing it (retired), it no longer authenticates the wire.
+fn trust_set<'a>(pinned: &'a str, published: &'a [String]) -> Vec<&'a str> {
+    if published.is_empty() {
+        vec![pinned]
+    } else {
+        published.iter().map(String::as_str).collect()
+    }
+}
+
 fn wire_client(
-    ca_pem: &str,
+    trust: &[&str],
     identity: Option<reqwest::Identity>,
 ) -> Result<reqwest::Client, WireError> {
+    let mut roots: Vec<CertificateDer<'static>> = Vec::with_capacity(trust.len());
+    for pem_text in trust {
+        let der = root_certificate(pem_text)?;
+        if !roots
+            .iter()
+            .any(|existing| existing.as_ref() == der.as_ref())
+        {
+            roots.push(der);
+        }
+    }
     http::client(
-        Roots::Only(vec![root_certificate(ca_pem)?]),
+        Roots::Only(roots),
         WIRE_REQUEST_TIMEOUT,
         identity,
         false,
@@ -333,6 +428,43 @@ fn wire_client(
         &Network::default(),
     )
     .map_err(|e| WireError::Transport(e.to_string()))
+}
+
+// The local CA is trusted when it is the one the record enrolled with, or any CA the control
+// plane has published to this device since.
+pub fn pin_accepts(ca_pem: &str, enrolment: &crate::device::Enrolment) -> bool {
+    let hash = crate::control_ca_sha256(ca_pem);
+    hash == enrolment.control_ca_sha256
+        || enrolment
+            .control_ca_pems
+            .iter()
+            .any(|pem| crate::control_ca_sha256(pem) == hash)
+}
+
+// An absent or empty set keeps the current keys; an invalid entry rejects the whole set.
+pub fn apply_key_set(
+    verifier: &AgentVerifier,
+    keys: &[zs_wire::VerifyingKeyEntry],
+    diag: &zs_diag::DiagLog,
+) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let mut parsed = Vec::with_capacity(keys.len());
+    for entry in keys {
+        match <[u8; 32]>::try_from(entry.key.as_slice())
+            .ok()
+            .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+        {
+            Some(key) => parsed.push((entry.kid.clone(), key)),
+            None => {
+                diag.emit(zs_diag::Event::new(zs_diag::Component::Grant, "key_set_invalid").warn());
+                return false;
+            }
+        }
+    }
+    verifier.replace(parsed);
+    true
 }
 
 fn root_certificate(ca_pem: &str) -> Result<CertificateDer<'static>, WireError> {

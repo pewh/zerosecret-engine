@@ -1,8 +1,8 @@
 {
   "files": {
     "grant-aws-ssm.json": 1,
-    "grant-file.json": 1,
-    "grant-json.json": 7,
+    "grant-file.json": 2,
+    "grant-json.json": 8,
     "grant-refusals.json": 23
   }
 }

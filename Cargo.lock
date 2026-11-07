@@ -3922,7 +3922,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "zs-audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "zs-conformance"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -3999,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "zs-credential"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror 1.0.69",
  "trybuild",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "zs-diag"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "zs-grant"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4031,14 +4031,14 @@ dependencies = [
 
 [[package]]
 name = "zs-identity"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "zs-materializer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -4061,7 +4061,7 @@ dependencies = [
 
 [[package]]
 name = "zs-mitm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4096,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "zs-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cedar-policy",
  "serde",
@@ -4109,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "zs-proto-http"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -4125,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "zs-proto-mongo"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "zs-proto-mysql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rand 0.8.8",
  "rcgen",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "zs-proto-postgres"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "zs-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror 1.0.69",
  "zs-credential",
@@ -4201,7 +4201,7 @@ dependencies = [
 
 [[package]]
 name = "zs-test-aws"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "zs-test-idp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4240,11 +4240,11 @@ dependencies = [
 
 [[package]]
 name = "zs-test-keychain"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "zs-upstream"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rcgen",
  "reqwest",
@@ -4260,14 +4260,14 @@ dependencies = [
 
 [[package]]
 name = "zs-vectors"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "zs-verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -4277,7 +4277,7 @@ dependencies = [
 
 [[package]]
 name = "zs-wire"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -97,6 +97,7 @@ fn signed(key: &ControlSigningKey, grant_id: &str) -> SignedGrant {
         upstream_port: 5432,
         upstream_tls: zs_policy::UpstreamTlsMode::Default,
         local_endpoint: false,
+        version: zs_grant::GRANT_VERSION,
     })
     .unwrap()
 }

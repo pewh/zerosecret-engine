@@ -158,6 +158,7 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap();
     let connection = common::loopback_connection(https_upstream.addr.port(), true);
@@ -178,6 +179,7 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap();
     let port = upstream.addr.port();

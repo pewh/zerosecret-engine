@@ -60,6 +60,7 @@ fn write_setup(dir: &Path, port: u16, password: &str) -> Setup {
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                version: zs_grant::GRANT_VERSION,
             })
             .unwrap(),
     )

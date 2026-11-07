@@ -104,7 +104,11 @@ fn grant_json(_context: &Value, input: &Value) -> Value {
     let value: Value = serde_json::from_str(text).unwrap();
     match parser {
         "grant" => match serde_json::from_value::<Grant>(value) {
-            Ok(grant) => json!({"accepted": true, "grant_id": grant.grant_id}),
+            Ok(grant) => json!({
+                "accepted": true,
+                "grant_id": grant.grant_id,
+                "version": grant.version,
+            }),
             Err(_) => json!({"accepted": false}),
         },
         "pre_source" => match serde_json::from_value::<PreSourceGrant>(value) {

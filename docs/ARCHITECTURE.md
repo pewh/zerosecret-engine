@@ -380,6 +380,55 @@ tenant, which is what every policy written before project scoping is. A **device
 no project is not the mirror of that: it reaches only unprojected resources, because absent
 scope must not become a wildcard.
 
+### Key rings and rotation
+
+Three keys rotate independently: the grant signing key, the federation key and the device CA.
+Each is a ring in `ZS_CONTROL_CA_DIR`, with one state file per kind (`keyring-<kind>.json`) that
+names the active entry and the published entries. `control keys add|promote|retire|list` edits the
+ring; the running control plane rereads it every 10 seconds, so no restart is needed.
+
+A new key is published for 10 minutes before it may be promoted, and a demoted key signs for its
+grace period before it may be retired: 320 seconds for the grant and federation keys (one
+300-second lifetime plus two 10-second reloads, because an instance signs with the demoted key
+until its next reload), 7 days plus 1 hour for the device CA, so every certificate that CA signed
+has expired. Device certificates are
+not reissued in place; a device gets a certificate from the new CA at its next `zs login`.
+
+The agent does not need a new control-plane address: the 60-second revocations response carries the
+published grant keys and CA certificates. The agent verifies a grant under any published key and
+trusts any published CA at the wire handshake. An absent or empty set leaves its current set
+unchanged, and a set with one invalid entry is rejected whole. The published CA set is the whole
+wire trust: once a CA is retired and drops out of the set, the agent stops trusting it, even when
+it is the CA pinned at enrolment. A device enrolled before `v0.4.0` has no stored CA set, so the
+pinned CA is its set of one until the first refresh.
+
+A device that is offline for the whole 10-minute publish window of a new device CA misses it: after
+the promotion its wire handshake fails. It recovers by saving the control plane's current CA
+(`GET /ca`) as its `control-ca.crt` and running `zs login` again.
+
+Every control instance must read the same `ZS_CONTROL_CA_DIR`. Instances with separate copies
+publish different key sets, and a device that refreshes from one drops the key the other promoted.
+
+The procedure, on the control host:
+
+```bash
+# 1. publish the new key; every agent learns it at its next refresh
+control keys add grant            # or: federation, ca
+# 2. wait 10 minutes, then make it active
+control keys promote grant control-k2
+# 3. wait the grace period, then drop the old key and its files
+control keys retire grant control-k1
+```
+
+`control keys promote federation` also reads `<ZS_FEDERATION_ISSUER>/.well-known/jwks.json` and
+refuses until the hosted JWKS holds the new `kid`, so upload the `oidc-export` files first. It
+also refuses when `ZS_FEDERATION_ISSUER` is not set in its environment. After `retire federation`,
+run `oidc-export` again and upload the result, so the hosted JWKS drops the retired key. A refused
+command changes no file. Two `control keys` commands on one kind run one after the other (a lock
+file beside the state). `control keys list <kind>` prints ids, states and times only. The grant
+and federation graces are 320 seconds; the device CA grace is 7 days and 1 hour.
+
+
 ### Device enrolment and stored identity
 
 `zs login` enrols a device once. Later `zs run` commands load that enrolment from the native

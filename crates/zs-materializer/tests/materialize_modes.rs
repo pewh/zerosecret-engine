@@ -28,6 +28,7 @@ fn signed(mode: Materialization, credential_ref: &str) -> SignedGrant {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap()
 }
@@ -46,6 +47,7 @@ fn verified(signed: &SignedGrant) -> VerifiedGrant {
             workload: "claude-code",
             resource: "stripe-production",
             operation: "GET",
+            environment: None,
         },
     )
     .unwrap()

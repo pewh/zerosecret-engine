@@ -342,6 +342,8 @@ mod tests {
                 .collect(),
             grant_verifying_key_id: "control-k1".into(),
             wire_url,
+            environment: None,
+            control_ca_pems: Vec::new(),
         };
         let secrets = zs::device::DeviceSecrets::new(
             zs_mitm::Zeroizing::new(tls_key.serialize_pem()),

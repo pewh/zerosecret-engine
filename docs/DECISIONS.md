@@ -7,6 +7,149 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0055 — Release pipeline, ready but not publishing
+
+**2026-11-07 · Accepted** · owner request 2026-11-07 (accepts DS2-DS5 of the distribution spec,
+with deviations D-a to D-e; DS1 stays open) · does not lift ADR-0045 D6
+
+ADR-0045 D6 makes every release a source release. Users build `zs` themselves, nothing records
+which source and workflow produced a binary, and a release cannot be checked against its
+dependencies. Windows runs no end-to-end agent test, and the macOS jobs skip without failing if
+this repository becomes private.
+
+**Decision.**
+- **Pipeline.** `.github/workflows/release.yml` builds five targets with `--locked --release`:
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+  `x86_64-apple-darwin` and `x86_64-pc-windows-msvc`. No musl build while `zs` links `libdbus`
+  dynamically (DS4). Linux builds on `ubuntu-22.04`, a glibc 2.35 floor, as an exception to
+  ADR-0045 D8 for release builds only (D-e).
+- **Release checks per target.** The tag matches the workspace version; the binary holds no
+  `ZS_TEST_` string, with a debug-build positive control; `zs version` prints the tag without `v`
+  and the tag's commit (D-b).
+- **Signature and provenance (DS2).** Sigstore keyless GitHub artifact attestations (S1) for
+  every file and for `SHA256SUMS`, with a CycloneDX SBOM per target (B1) and SLSA provenance
+  (B3). No long-lived signing key. No Apple or Windows code signing (DS3).
+- **Not publishing.** The `publish` job runs only on a pushed `v*` tag while the repository
+  variable `ZS_RELEASE_BINARIES` is `true`. It creates a draft release, never replaces an asset,
+  and the owner publishes the draft after verifying it (D-c). Until DS1 is decided, every run is a
+  dry run.
+- **Permissions.** Only `publish` holds `contents: write`, `id-token: write` and
+  `attestations: write`. A gate script checks every workflow for this.
+- **Platform CI.** A `windows-agent` job runs the proxy, endpoint and PostgreSQL relay tests
+  under `zs run` on Windows, through a test child that reports the run token (W1, D-a). macOS
+  coverage stays in this public repository (M3), and a private run fails a `macos-guard` job
+  instead of skipping the macOS jobs (DS5).
+- New pinned CI tools: `actionlint` and `cargo-cyclonedx` (D-d). No crate enters `Cargo.lock`.
+
+**Consequence.** The pipeline is proven on dry runs before any binary exists, so lifting D6
+becomes one variable and one tag. Users of a published binary verify it with
+`gh attestation verify`; macOS users remove the quarantine attribute by hand. The workflow file
+becomes part of what users trust.
+
+**Reverse it if** Sigstore attestation is unavailable to the users who need offline
+verification; then add a minisign signature of `SHA256SUMS` (S2) beside it.
+
+---
+
+## ADR-0054 — Control plane metrics, trusted proxies and host-selected organizations
+
+**2026-11-07 · Accepted** · owner request 2026-11-07 (accepts OB1-OB5 of the observability and
+multi-org spec, with deviations D-a to D-g)
+
+The control plane has a request log but no metrics. Its rate limiter keys on the TCP peer, so
+every client behind a TLS-terminating proxy shares one bucket. One process serves one
+organization with one IdP.
+
+**Decision.**
+- **Metrics (X1, OB1, OB2).** A third listener, `ZS_CONTROL_METRICS_ADDR`, off by default, serves
+  only `GET /metrics` in the Prometheus text format, written with the standard library. Outside
+  `development` it must be loopback unless `ZS_CONTROL_METRICS_PUBLIC=1`. Every label value comes
+  from a set declared in code, and anything else is `other`; `build_info` is the one exception and
+  carries only the binary's own version and commit. A credential, token, cookie, session id,
+  subject, device id, grant id, resource name, address, path or header value never becomes a
+  label. There is no `organization` label.
+- **Outcomes (D-a to D-c).** Grant outcomes use a fixed set, not the response text, because most
+  refusals are free text and some embed the subject. `InsertAudit` returns a stored count so that
+  stored and duplicate records differ. Store errors are counted at the handlers, with a fixed
+  operation set.
+- **Trusted proxies (T2, OB3).** Only when the TCP peer is in `ZS_CONTROL_TRUSTED_PROXIES` does
+  the limiter read `X-Forwarded-For`, from the right, and key on the first address not in the
+  list. A malformed entry keys on the peer. No `Forwarded` header support yet.
+- **Organizations by host (O2, OB4, D-d).** The request host selects the organization and its
+  IdP, from a JSON file read at startup. Client secrets come from a separate 0600 file keyed by
+  organization, and never enter the database. An unknown host gets `404`. `/healthz`, `/ca` and
+  `/wire/enroll` answer on any host, and wire tenancy still comes from the device row.
+- **Issuer on identities (D-e).** Members, sessions, pending logins, enrolment tokens and devices
+  carry the IdP issuer. A member is `(organization, issuer, subject)`, so the same subject from
+  two IdPs is two members, and the wire member check uses the device's issuer.
+- **Upgrade (OB5, D-f, D-g).** The deploy that adds the issuer ends every dashboard session.
+  Without the organizations file the process stays single-org, and startup binds unbound rows to
+  `ZS_OIDC_ISSUER`. In multi-org mode, startup refuses while any member, enrolment token or device
+  has no issuer: the operator starts the new version once in single-org mode first.
+
+**Consequence.** A session for one organization never authorizes another, even for the same
+person. Adding an organization needs a restart. A wrong trusted-proxy CIDR lets a client choose
+its rate-limit key, so the list is part of the security configuration. Each new refusal is a row
+in [SECURITY.md §7](SECURITY.md#7-fail-closed-matrix).
+
+**Reverse it if** a customer needs isolation that a shared process and schema cannot give; then
+that customer gets its own process (O1), which stays supported.
+
+---
+
+## ADR-0053 — Key rings and wire versions
+
+**2026-11-07 · Accepted** · owner request 2026-11-07 (accepts KR1-KR5 of the key rotation and
+renewal spec, with deviations D-a to D-g) · amends ADR-0038 ("No version field is added") ·
+amended 2026-11-07 after the implementation review: retire grace 320 s, issuer-less federation
+promote refused, published CA set replaces the pinned CA
+
+The control plane has three long-lived keys: the grant signing key, the federation key and the
+device CA. None can be replaced without breaking every enrolled device. The agent holds one grant
+key from enrolment and pins one CA hash. Device certificates outlive standing, `/wire/audit` does
+not check standing, and nothing on the wire carries a format or agent version.
+
+**Decision.**
+- **Key rings (G1).** Each key is a ring in the control key directory: `control keys
+  add|promote|retire|list <grant|federation|ca>` edits one state file per kind, written as a temp
+  file plus rename, mode 0600. The running control plane rereads the rings every 10 s (D-e).
+- **Three phases (KR1).** `add` publishes a key; `promote` signs with it, refused until 10
+  minutes after `add`; `retire` removes the old key, refused for the active key and until one
+  grant lifetime plus two reload intervals (320 s) after demotion for `grant` and `federation`,
+  because an instance signs with the demoted key until its next reload, and 7 days plus 1 hour for
+  `ca` (D-d). Concurrent `control keys` commands on one kind are serialised by a lock file. The enrolment response and the 60-s revocations response carry the published grant
+  keys and CA certificates. An absent or empty set leaves the agent's set unchanged.
+- **Federation upload check (D-f).** `promote federation` reads the hosted
+  `<issuer>/.well-known/jwks.json` and refuses unless it holds the new `kid`, and refuses when
+  the issuer is not set in the command's environment.
+- **One key directory (D-g).** Every control instance reads the same key directory.
+- **CA trust set (C1, KR4).** The agent stores the published CA certificates in its device record
+  and trusts exactly that set, so a retired CA, the one pinned at enrolment included, stops
+  authenticating the wire. A record without the set loads as a set of one, the pinned hash.
+- **Certificate lifetime (R1, KR2).** A device certificate expires one hour after standing. There
+  is no renewal route; renewal is `zs login`.
+- **Standing (KR3, D-b).** Every `/wire/*` route checks standing. The refusal is `401` with
+  `{"code":"enrolment_expired"}`, which the agent maps to `DeviceRefused`.
+- **Grant version (V1, KR5, D-a).** A grant without `version` is version 1. `version` enters the
+  signed canonical payload only when it is not 1, so a version-1 grant's bytes are unchanged. An
+  agent refuses an unknown version with `grant version not supported by this zs; upgrade zs`.
+- **Environment (E1, D-c).** The enrolment response carries the environment; the agent refuses a
+  grant for another one with `grant is for another environment`. A device record without an
+  environment skips the check.
+- **Agent version (A1).** Wire requests carry `User-Agent: zs/<version>`; the control plane logs
+  it as `agent` (`none` when absent, `other` when malformed).
+
+**Consequence.** A `v0.3.0` agent keeps working until the first promotion, because the legacy
+single-key fields carry the active key. A CA overlap lasts at least 7 days plus 1 hour. An agent
+offline through the publish window fails closed with `SignatureInvalid` and recovers at its next
+refresh. The federation check proves the JWKS upload, not that AWS has refetched it; the AWS cache
+time stays open. Each new refusal is a row in [SECURITY.md §7](SECURITY.md#7-fail-closed-matrix).
+
+**Reverse it if** a key must be replaced faster than one publish window, for example after a key
+compromise. Then add an emergency path that revokes devices instead of shortening the window.
+
+---
+
 ## ADR-0052 — Local callers authenticate to `zs run`
 
 **2026-11-06 · Accepted** · owner request 2026-11-06 (accepts CA1-CA4 of the local caller

@@ -785,6 +785,8 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
 
 pub const MATERIALIZE_FAILED: &str = "materialize failed";
 
+pub const WIRE_USER_AGENT: &str = concat!("zs/", env!("ZS_BUILD_VERSION"));
+
 pub const NODE_PRELOAD_SOURCE: &str = r#"'use strict';
 // Installed by `zs run`. Routes Node's global fetch (undici) through the ZeroSecret proxy,
 // which undici does not do from HTTPS_PROXY alone.
@@ -1125,6 +1127,7 @@ impl AgentHandler {
                     workload: self.workload.as_str(),
                     resource,
                     operation,
+                    environment: None,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -1395,6 +1398,7 @@ mod clock_tests {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap()
     }
@@ -1422,6 +1426,7 @@ mod clock_tests {
             workload: "claude-code",
             resource: "stripe-production",
             operation: "GET",
+            environment: None,
         };
         let signed = grant(&key, clock_ms(std::time::SystemTime::now()) + 300_000);
         assert!(
@@ -1490,6 +1495,7 @@ mod renewal_lineage_tests {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap()
     }

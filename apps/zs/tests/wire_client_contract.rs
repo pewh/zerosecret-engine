@@ -40,6 +40,8 @@ fn client_for_wire_url(wire_url: String) -> Result<WireClient, WireError> {
             .collect(),
         grant_verifying_key_id: "control-k1".into(),
         wire_url,
+        environment: None,
+        control_ca_pems: Vec::new(),
     };
     let secrets = zs::device::DeviceSecrets::new(
         zs_mitm::Zeroizing::new(tls_key.serialize_pem()),

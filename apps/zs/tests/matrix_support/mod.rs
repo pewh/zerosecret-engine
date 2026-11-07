@@ -45,6 +45,7 @@ pub fn grant(expires_at_ms: u64, grant_id: &str) -> Grant {
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        version: zs_grant::GRANT_VERSION,
     }
 }
 
@@ -184,45 +185,114 @@ pub struct FakeControl {
     grant: Arc<std::sync::Mutex<FakeGrant>>,
     revoked: Arc<std::sync::Mutex<Vec<String>>>,
     grant_calls: Arc<std::sync::atomic::AtomicUsize>,
+    user_agents: Arc<std::sync::Mutex<Vec<String>>>,
+    signing_key: Arc<std::sync::Mutex<ControlSigningKey>>,
+    key_set: Arc<std::sync::Mutex<Vec<zs_wire::VerifyingKeyEntry>>>,
+    mint_version: Arc<std::sync::atomic::AtomicU32>,
+    mint_environment: Arc<std::sync::Mutex<String>>,
     _runtime: tokio::runtime::Runtime,
 }
 
 #[cfg(unix)]
 impl FakeControl {
+    pub fn ca_pem(&self) -> &str {
+        &self.ca_pem
+    }
+
+    pub fn set_signing_key(&self, key_id: &str, seed: [u8; 32]) {
+        *self.signing_key.lock().unwrap() = ControlSigningKey::from_bytes(key_id, &seed);
+    }
+
+    pub fn set_key_set(&self, entries: Vec<zs_wire::VerifyingKeyEntry>) {
+        *self.key_set.lock().unwrap() = entries;
+    }
+
+    pub fn key_set(&self) -> Vec<zs_wire::VerifyingKeyEntry> {
+        self.key_set.lock().unwrap().clone()
+    }
+
+    pub fn set_minted_version(&self, version: u32) {
+        self.mint_version
+            .store(version, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_minted_environment(&self, environment: &str) {
+        *self.mint_environment.lock().unwrap() = environment.to_string();
+    }
+
+    pub fn user_agents(&self) -> Vec<String> {
+        self.user_agents.lock().unwrap().clone()
+    }
+
     pub fn start() -> Self {
         use axum::response::IntoResponse;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let ca = Arc::new(crate::common::test_ca::TestCa::generate("fake-control").unwrap());
-        let key = Arc::new(ControlSigningKey::generate("control-k1"));
+        let key = Arc::new(std::sync::Mutex::new(ControlSigningKey::generate(
+            "control-k1",
+        )));
+        let key_set: Arc<std::sync::Mutex<Vec<zs_wire::VerifyingKeyEntry>>> = Arc::default();
         let grant = Arc::new(std::sync::Mutex::new(FakeGrant::Mint {
             host: HOST.into(),
             protocol: "https".into(),
         }));
         let revoked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let grant_calls: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let user_agents: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let mint_version = Arc::new(std::sync::atomic::AtomicU32::new(zs_grant::GRANT_VERSION));
+        let mint_environment: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new("development".to_string()));
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let enrol = {
             let (ca, key, url) = (ca.clone(), key.clone(), url.clone());
-            move |axum::Json(request): axum::Json<zs_wire::EnrollmentRequest>| async move {
+            let agents = user_agents.clone();
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(request): axum::Json<zs_wire::EnrollmentRequest>| async move {
+                if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
+                    agents
+                        .lock()
+                        .unwrap()
+                        .push(value.to_str().unwrap_or_default().to_string());
+                }
+                let (verifying_key, key_id) = {
+                    let current = key.lock().unwrap();
+                    (
+                        current.verifying_key_bytes().to_vec(),
+                        current.key_id().to_string(),
+                    )
+                };
                 axum::Json(zs_wire::EnrollmentResponse {
                     device_id: "dev-fake".into(),
                     organization: "default".into(),
                     client_certificate: ca
                         .issue_client_certificate(&request.csr, "dev-fake", "default")
                         .unwrap(),
-                    grant_verifying_key: key.verifying_key_bytes().to_vec(),
-                    grant_verifying_key_id: key.key_id().to_string(),
+                    grant_verifying_key: verifying_key,
+                    grant_verifying_key_id: key_id,
                     wire_url: url,
+                    grant_verifying_keys: Vec::new(),
+                    control_ca_pems: Vec::new(),
+                    environment: None,
                 })
             }
         };
         let mint = {
             let (key, grant, grant_calls) = (key.clone(), grant.clone(), grant_calls.clone());
-            move |axum::Json(request): axum::Json<serde_json::Value>| async move {
+            let agents = user_agents.clone();
+            let version = mint_version.clone();
+            let environment = mint_environment.clone();
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(request): axum::Json<serde_json::Value>| async move {
                 use std::sync::atomic::Ordering;
+                if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
+                    agents
+                        .lock()
+                        .unwrap()
+                        .push(value.to_str().unwrap_or_default().to_string());
+                }
                 let text = |field: &str| request[field].as_str().unwrap_or_default().to_string();
                 let mut source = zs_policy::CredentialSource::file("fake");
                 let mut identity_token = None;
@@ -275,28 +345,52 @@ impl FakeControl {
                         (HOST.into(), "https".into(), false, connection.clone())
                     }
                 };
-                let other = ControlSigningKey::generate("control-k1");
-                let signer = if forged { &other } else { &*key };
-                let signed = signer
-                    .sign(Grant {
-                        subject: text("subject"),
-                        workload: text("workload"),
-                        resource: text("resource"),
-                        host,
-                        protocol,
-                        source,
-                        operations: serde_json::from_value(request["operations"].clone())
-                            .unwrap_or_default(),
-                        environment: "development".into(),
-                        expires_at_ms: now_ms() + expires_in_ms,
-                        grant_id: "g-fake".into(),
-                        materialization: zs_policy::Materialization::Retrieve,
-                        upstream_host: connection.upstream_host,
-                        upstream_port: connection.upstream_port,
-                        upstream_tls: connection.upstream_tls,
-                        local_endpoint: connection.local_endpoint,
-                    })
-                    .unwrap();
+                let signed = if forged {
+                    ControlSigningKey::generate("control-k1")
+                        .sign(Grant {
+                            subject: text("subject"),
+                            workload: text("workload"),
+                            resource: text("resource"),
+                            host,
+                            protocol,
+                            source,
+                            operations: serde_json::from_value(request["operations"].clone())
+                                .unwrap_or_default(),
+                            environment: environment.lock().unwrap().clone(),
+                            expires_at_ms: now_ms() + expires_in_ms,
+                            grant_id: "g-fake".into(),
+                            materialization: zs_policy::Materialization::Retrieve,
+                            upstream_host: connection.upstream_host,
+                            upstream_port: connection.upstream_port,
+                            upstream_tls: connection.upstream_tls,
+                            local_endpoint: connection.local_endpoint,
+                            version: version.load(std::sync::atomic::Ordering::SeqCst),
+                        })
+                        .unwrap()
+                } else {
+                    let signer = key.lock().unwrap();
+                    signer
+                        .sign(Grant {
+                            subject: text("subject"),
+                            workload: text("workload"),
+                            resource: text("resource"),
+                            host,
+                            protocol,
+                            source,
+                            operations: serde_json::from_value(request["operations"].clone())
+                                .unwrap_or_default(),
+                            environment: environment.lock().unwrap().clone(),
+                            expires_at_ms: now_ms() + expires_in_ms,
+                            grant_id: "g-fake".into(),
+                            materialization: zs_policy::Materialization::Retrieve,
+                            upstream_host: connection.upstream_host,
+                            upstream_port: connection.upstream_port,
+                            upstream_tls: connection.upstream_tls,
+                            local_endpoint: connection.local_endpoint,
+                            version: version.load(std::sync::atomic::Ordering::SeqCst),
+                        })
+                        .unwrap()
+                };
                 axum::Json(zs_wire::GrantMintResponse {
                     signed_grant_json: serde_json::to_string(&signed).unwrap(),
                     identity_token,
@@ -311,11 +405,21 @@ impl FakeControl {
                 "/wire/revocations",
                 axum::routing::get({
                     let revoked = revoked.clone();
-                    move || {
+                    let agents = user_agents.clone();
+                    let keys = key_set.clone();
+                    move |headers: axum::http::HeaderMap| {
                         let revoked = revoked.lock().unwrap().clone();
+                        if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
+                            agents
+                                .lock()
+                                .unwrap()
+                                .push(value.to_str().unwrap_or_default().to_string());
+                        }
                         async move {
                             axum::Json(zs_wire::RevocationsResponse {
                                 revoked_grant_ids: revoked,
+                                grant_verifying_keys: keys.lock().unwrap().clone(),
+                                control_ca_pems: Vec::new(),
                             })
                         }
                     }
@@ -331,6 +435,11 @@ impl FakeControl {
             grant,
             revoked,
             grant_calls,
+            user_agents,
+            signing_key: key,
+            key_set,
+            mint_version,
+            mint_environment,
             _runtime: runtime,
         }
     }
@@ -363,7 +472,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly one hundred and two.
+/// exactly one hundred and eight.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -387,10 +496,148 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        102,
-        "SECURITY §7 must have one hundred and two rows; found {}:\n{}",
+        109,
+        "SECURITY §7 must have one hundred and nine rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );
     rows
+}
+
+/// A TLS wire endpoint whose leaf certificate can be swapped, for the CA-trust rows.
+#[cfg(unix)]
+pub struct TlsWire {
+    pub url: String,
+    server: Arc<std::sync::Mutex<Arc<rustls::ServerConfig>>>,
+    keys: Arc<std::sync::Mutex<Vec<zs_wire::VerifyingKeyEntry>>>,
+    ca_pems: Arc<std::sync::Mutex<Vec<String>>>,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl TlsWire {
+    pub fn start(ca: &crate::common::test_ca::TestCa) -> Self {
+        let (chain, key) = ca.issue_server_certificate("127.0.0.1").unwrap();
+        let server = Arc::new(std::sync::Mutex::new(Arc::new(server_config(&chain, &key))));
+        let keys: Arc<std::sync::Mutex<Vec<zs_wire::VerifyingKeyEntry>>> = Arc::default();
+        let ca_pems: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let requests: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+
+        let accepting = server.clone();
+        let served_keys = keys.clone();
+        let served_pems = ca_pems.clone();
+        let counted = requests.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let config = accepting.lock().unwrap().clone();
+                    let keys = served_keys.clone();
+                    let pems = served_pems.clone();
+                    let counted = counted.clone();
+                    tokio::spawn(async move {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                        let Ok(mut tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut request = Vec::new();
+                        let mut buffer = [0u8; 1024];
+                        loop {
+                            match tokio::io::AsyncReadExt::read(&mut tls, &mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => {
+                                    request.extend_from_slice(&buffer[..read]);
+                                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                    if request.len() > 16 * 1024 {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&request);
+                        let path = head
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = match path.as_str() {
+                            "/wire/revocations" => serde_json::json!({
+                                "revoked_grant_ids": [],
+                                "grant_verifying_keys": *keys.lock().unwrap(),
+                                "control_ca_pems": *pems.lock().unwrap(),
+                            })
+                            .to_string(),
+                            "/wire/audit" => String::new(),
+                            _ => String::new(),
+                        };
+                        let status = if path == "/wire/revocations" || path == "/wire/audit" {
+                            "200 OK"
+                        } else {
+                            "404 Not Found"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut tls, response.as_bytes()).await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
+                    });
+                }
+            });
+        });
+
+        Self {
+            url,
+            server,
+            keys,
+            ca_pems,
+            requests,
+        }
+    }
+
+    pub fn set_leaf(&self, ca: &crate::common::test_ca::TestCa) {
+        let (chain, key) = ca.issue_server_certificate("127.0.0.1").unwrap();
+        *self.server.lock().unwrap() = Arc::new(server_config(&chain, &key));
+    }
+
+    pub fn set_ca_pems(&self, pems: Vec<String>) {
+        *self.ca_pems.lock().unwrap() = pems;
+    }
+
+    pub fn set_keys(&self, keys: Vec<zs_wire::VerifyingKeyEntry>) {
+        *self.keys.lock().unwrap() = keys;
+    }
+
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+fn server_config(chain: &str, key: &str) -> rustls::ServerConfig {
+    use rustls::pki_types::pem::PemObject;
+    let certificates: Vec<rustls::pki_types::CertificateDer<'static>> = chain
+        .split_inclusive("-----END CERTIFICATE-----\n")
+        .filter(|block| block.contains("BEGIN CERTIFICATE"))
+        .map(|block| rustls::pki_types::CertificateDer::from_pem_slice(block.as_bytes()).unwrap())
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .unwrap()
 }

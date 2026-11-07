@@ -41,6 +41,7 @@ fn verified(key: &ControlSigningKey, signed: SignedGrant) -> zs_grant::VerifiedG
             workload: WORKLOAD,
             resource: RESOURCE,
             operation: "GET",
+            environment: None,
         },
     )
     .unwrap()
@@ -2488,6 +2489,8 @@ fn stored_record_fixture() -> (tempfile::TempDir, zs_mitm::Zeroizing<Vec<u8>>) {
         grant_verifying_key_hex: "cd".repeat(32),
         grant_verifying_key_id: "control-k1".into(),
         wire_url: "https://localhost:8444".into(),
+        environment: None,
+        control_ca_pems: Vec::new(),
     };
     zs::device::save_file(
         home.path(),
@@ -4622,6 +4625,7 @@ fn peer_setup(
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap();
     let policy = format!(
@@ -4781,4 +4785,237 @@ async fn row_102_a_database_client_of_another_os_user_is_refused() {
     );
     let _ = agent.child.kill();
     let _ = agent.child.wait();
+}
+
+fn rotation_request() -> zs_wire::GrantMintRequest {
+    zs_wire::GrantMintRequest {
+        device_id: "dev-fake".into(),
+        subject: SUBJECT.into(),
+        workload: WORKLOAD.into(),
+        resource: RESOURCE.into(),
+        operations: vec!["GET".into()],
+    }
+}
+
+fn rotation_client(
+    control: &FakeControl,
+    environment: Option<&str>,
+) -> zs::wire_client::WireClient {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let ca_pem = control.ca_pem().to_string();
+    let token = format!("enr-{}", "a1".repeat(32));
+    let (response, secrets) = runtime
+        .block_on(zs::wire_client::WireClient::enroll_identity(
+            &control.url,
+            &ca_pem,
+            &token,
+            "laptop",
+        ))
+        .expect("enrolment");
+    let enrolment = zs::device::Enrolment {
+        control: control.url.clone(),
+        control_ca_sha256: zs::control_ca_sha256(&ca_pem),
+        subject: SUBJECT.into(),
+        device_id: response.device_id,
+        organization: response.organization,
+        client_certificate: response.client_certificate,
+        grant_verifying_key_hex: response
+            .grant_verifying_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        grant_verifying_key_id: response.grant_verifying_key_id,
+        wire_url: response.wire_url,
+        environment: environment.map(str::to_string),
+        control_ca_pems: Vec::new(),
+    };
+    zs::wire_client::WireClient::from_identity(&ca_pem, &enrolment, &secrets)
+        .expect("a wire client")
+}
+
+#[test]
+fn row_103_a_grant_with_an_unknown_version_is_refused_by_name() {
+    let control = FakeControl::start();
+    let client = rotation_client(&control, None);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+    let minted = runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect("positive control: a version-1 grant");
+    assert_eq!(minted.signed.grant.version, zs_grant::GRANT_VERSION);
+
+    control.set_minted_version(2);
+    let error = runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect_err("a version-2 grant must be refused");
+    assert!(
+        error
+            .to_string()
+            .ends_with("grant version not supported by this zs; upgrade zs"),
+        "row 103: {error}"
+    );
+}
+
+#[test]
+fn row_104_a_grant_for_another_environment_is_refused() {
+    let control = FakeControl::start();
+    let client = rotation_client(&control, Some("production"));
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+    control.set_minted_environment("production");
+    runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect("positive control: a grant for the agent's environment");
+
+    control.set_minted_environment("development");
+    let error = runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect_err("a grant for another environment must be refused");
+    assert!(
+        error
+            .to_string()
+            .ends_with("grant is for another environment"),
+        "row 104: {error}"
+    );
+}
+
+fn tls_rotation_client(url: &str, pin: &str) -> zs::wire_client::WireClient {
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let client_pem = certificate.pem();
+    let verifying = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+    let enrolment = zs::device::Enrolment {
+        control: url.to_string(),
+        control_ca_sha256: zs::control_ca_sha256(pin),
+        subject: SUBJECT.into(),
+        device_id: "dev-tls".into(),
+        organization: "default".into(),
+        client_certificate: client_pem.clone(),
+        grant_verifying_key_hex: verifying
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        grant_verifying_key_id: "control-k1".into(),
+        wire_url: url.to_string(),
+        environment: None,
+        control_ca_pems: Vec::new(),
+    };
+    let secrets = zs::device::DeviceSecrets::new(
+        zs_mitm::Zeroizing::new(tls_key.serialize_pem()),
+        zs_mitm::Zeroizing::new(vec![7u8; 32]),
+    );
+    zs::wire_client::WireClient::from_identity(pin, &enrolment, &secrets).expect("a wire client")
+}
+
+#[test]
+fn row_105_a_wire_server_certificate_from_a_ca_outside_the_set_is_refused() {
+    let first = common::test_ca::TestCa::generate("control-1").unwrap();
+    let second = common::test_ca::TestCa::generate("control-2").unwrap();
+    let outside = common::test_ca::TestCa::generate("control-3").unwrap();
+    let wire = matrix_support::TlsWire::start(&first);
+    wire.set_ca_pems(vec![first.certificate_pem(), second.certificate_pem()]);
+
+    let client = tls_rotation_client(&wire.url, &first.certificate_pem());
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let response = runtime
+        .block_on(client.fetch_revocations())
+        .expect("positive control: the pinned CA is trusted");
+    client
+        .set_roots(&response.control_ca_pems)
+        .expect("the published set parses");
+    wire.set_leaf(&second);
+    runtime
+        .block_on(client.fetch_revocations())
+        .expect("positive control: a published CA is trusted");
+
+    wire.set_leaf(&outside);
+    let before = wire.requests();
+    let error = runtime
+        .block_on(client.fetch_revocations())
+        .expect_err("a CA outside the set must be refused");
+    assert!(
+        matches!(error, zs::wire_client::WireError::Transport(_)),
+        "row 105: {error}"
+    );
+    assert_eq!(
+        wire.requests(),
+        before,
+        "row 105: the handshake never completed"
+    );
+    let renewal = runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect_err("row 105: no grant is renewed");
+    assert!(
+        matches!(renewal, zs::wire_client::WireError::Transport(_)),
+        "row 105: {renewal}"
+    );
+}
+
+#[test]
+fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
+    let first = common::test_ca::TestCa::generate("control-1").unwrap();
+    let second = common::test_ca::TestCa::generate("control-2").unwrap();
+    let wire = matrix_support::TlsWire::start(&first);
+    wire.set_ca_pems(vec![first.certificate_pem(), second.certificate_pem()]);
+
+    let client = tls_rotation_client(&wire.url, &first.certificate_pem());
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let response = runtime
+        .block_on(client.fetch_revocations())
+        .expect("positive control: the pinned CA is trusted");
+    assert!(
+        client
+            .set_roots(&response.control_ca_pems)
+            .expect("the published set parses"),
+        "the overlap set changes the roots"
+    );
+    assert!(
+        !client
+            .set_roots(&response.control_ca_pems)
+            .expect("the same set parses"),
+        "an unchanged set keeps the current client"
+    );
+
+    // Promote, then retire the first CA: the wire serves the second, which publishes itself alone.
+    wire.set_leaf(&second);
+    wire.set_ca_pems(vec![second.certificate_pem()]);
+    let response = runtime
+        .block_on(client.fetch_revocations())
+        .expect("positive control: the promoted CA is trusted");
+    assert!(
+        client
+            .set_roots(&response.control_ca_pems)
+            .expect("the retired set parses"),
+        "the retire changes the roots"
+    );
+    runtime
+        .block_on(client.fetch_revocations())
+        .expect("positive control: the active CA still authenticates the wire");
+
+    // A server certificate from the retired CA, the one pinned at enrolment, is now refused.
+    wire.set_leaf(&first);
+    let before = wire.requests();
+    let error = runtime
+        .block_on(client.fetch_revocations())
+        .expect_err("row 109: the retired pinned CA must be refused");
+    assert!(
+        matches!(error, zs::wire_client::WireError::Transport(_)),
+        "row 109: {error}"
+    );
+    assert_eq!(
+        wire.requests(),
+        before,
+        "row 109: the handshake never completed"
+    );
+    let renewal = runtime
+        .block_on(client.request_grant(&rotation_request()))
+        .expect_err("row 109: no grant is renewed");
+    assert!(
+        matches!(renewal, zs::wire_client::WireError::Transport(_)),
+        "row 109: {renewal}"
+    );
 }

@@ -104,6 +104,7 @@ fn verified_for(
             upstream_port: 3306,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            version: zs_grant::GRANT_VERSION,
         })
         .unwrap();
     AgentVerifier::new(vec![(
@@ -118,6 +119,7 @@ fn verified_for(
             workload: "claude-code",
             resource,
             operation: "connect",
+            environment: None,
         },
     )
     .unwrap()

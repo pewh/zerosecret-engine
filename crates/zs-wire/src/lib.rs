@@ -73,6 +73,12 @@ pub struct EnrollmentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyingKeyEntry {
+    pub kid: String,
+    pub key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentResponse {
     pub device_id: String,
     pub organization: String,
@@ -80,6 +86,12 @@ pub struct EnrollmentResponse {
     pub grant_verifying_key: Vec<u8>,
     pub grant_verifying_key_id: String,
     pub wire_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_verifying_keys: Vec<VerifyingKeyEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_ca_pems: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +158,10 @@ pub struct RevokeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevocationsResponse {
     pub revoked_grant_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_verifying_keys: Vec<VerifyingKeyEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_ca_pems: Vec<String>,
 }
 
 #[cfg(test)]

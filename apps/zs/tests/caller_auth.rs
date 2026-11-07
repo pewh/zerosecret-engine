@@ -350,6 +350,7 @@ fn three_protocol_setup(
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                version: zs_grant::GRANT_VERSION,
             })
             .unwrap();
         grants.push(serde_json::to_string(&grant).unwrap());

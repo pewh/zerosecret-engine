@@ -40,6 +40,7 @@ fn grant(expires_at_ms: u64) -> Grant {
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        version: zs_grant::GRANT_VERSION,
     }
 }
 

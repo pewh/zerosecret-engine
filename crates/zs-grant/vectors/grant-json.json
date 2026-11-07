@@ -12,7 +12,8 @@
       },
       "expect": {
         "accepted": true,
-        "grant_id": "g-1"
+        "grant_id": "g-1",
+        "version": 1
       }
     },
     {
@@ -23,7 +24,8 @@
       },
       "expect": {
         "accepted": true,
-        "grant_id": "g-1"
+        "grant_id": "g-1",
+        "version": 1
       }
     },
     {
@@ -75,6 +77,18 @@
       },
       "expect": {
         "accepted": false
+      }
+    },
+    {
+      "name": "version_absent_means_one",
+      "input": {
+        "parser": "grant",
+        "text": "{\"subject\":\"alice@company.com\",\"workload\":\"claude-code\",\"resource\":\"stripe-production\",\"host\":\"api.stripe.com\",\"protocol\":\"https\",\"credential_ref\":\"vault:kv/stripe\",\"operations\":[\"POST\",\"GET\"],\"environment\":\"development\",\"expires_at_ms\":1700000000000,\"grant_id\":\"g-1\",\"materialization\":\"retrieve\",\"upstream_host\":\"api.stripe.com\",\"upstream_port\":443,\"upstream_tls\":\"default\",\"local_endpoint\":false}"
+      },
+      "expect": {
+        "accepted": true,
+        "grant_id": "g-1",
+        "version": 1
       }
     }
   ]
