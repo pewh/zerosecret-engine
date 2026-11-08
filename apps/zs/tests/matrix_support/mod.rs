@@ -496,8 +496,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        115,
-        "SECURITY §7 must have one hundred and fifteen rows; found {}:\n{}",
+        116,
+        "SECURITY §7 must have one hundred and sixteen rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

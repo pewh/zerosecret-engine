@@ -1006,6 +1006,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `ZS_CONTROL_METRICS_ADDR` outside loopback while `ZS_CONTROL_ENV` is not `development` and `ZS_CONTROL_METRICS_PUBLIC` is unset | Startup refuses with the fixed text; no listener opens (commercial suite) |
 | `X-Forwarded-For` from a peer outside `ZS_CONTROL_TRUSTED_PROXIES` | Ignored: the limiter and the request log key on the TCP peer (commercial suite) |
 | Multi-org startup while a member, enrolment token or device row has no issuer | Startup refuses with the fixed text before any listener opens; a single-org start binds the rows (D-g) (commercial suite) |
+| A CLI login completed at one organization's host, confirmed or claimed at another organization's host | Refused: the claim answers 404 and issues no enrolment token; the login stays claimable at its own host (commercial suite) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
