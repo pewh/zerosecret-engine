@@ -3,8 +3,8 @@
 mod common;
 
 use common::{
-    AgentProcess, FakeUpstream, TestHome, bin_path, loopback_connection, spawn_agent,
-    spawn_fake_upstream, write_test_setup_signing,
+    AgentProcess, ChildAction, FakeUpstream, TestHome, bin_path, child, loopback_connection,
+    spawn_agent_with_env, spawn_fake_upstream, write_test_setup_signing,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -16,7 +16,6 @@ const SIGV4: &str = r#""auth": {"scheme": "aws-sigv4", "access_key_id": "AKIDTES
 struct Agent {
     agent: AgentProcess,
     upstream: FakeUpstream,
-    dir: PathBuf,
     _temp: TestHome,
 }
 
@@ -39,35 +38,43 @@ fn setup(auth: &str, operations: &[&str]) -> Agent {
         .unwrap()
         .replace(r#""operations": "#, auth);
     std::fs::write(&policy, text).unwrap();
-    let probe = format!(
-        "printf %s \"${{ZS_STRIPE_PRODUCTION_URL:-unset}}\" > {}/endpoint; sleep 20",
-        dir.display()
-    );
-    let agent = spawn_agent(
+    let child = child(ChildAction::Sleep(20));
+    let agent = spawn_agent_with_env(
         bin_path().as_path(),
         policy.as_path(),
         creds.as_path(),
         audit.as_path(),
         ca_dir.as_path(),
-        &["sh", "-c", &probe],
+        &child.args,
         true,
+        &child.env(),
     )
     .expect("agent spawn");
     Agent {
         agent,
         upstream,
-        dir,
         _temp: temp,
     }
 }
 
 fn endpoint(agent: &Agent) -> (String, String) {
-    let file = agent.dir.join("endpoint");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !file.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let url = std::fs::read_to_string(file).unwrap();
+    let url = agent
+        .agent
+        .endpoint_urls
+        .iter()
+        .find(|(name, _)| name == "ZS_STRIPE_PRODUCTION_URL")
+        .map(|(_, url)| url.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "the agent did not report ZS_STRIPE_PRODUCTION_URL; it reported: {:?}",
+                agent
+                    .agent
+                    .endpoint_urls
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>()
+            )
+        });
     let rest = url.strip_prefix("http://").expect("an http endpoint");
     let (host, token) = rest.split_once('/').expect("the path token");
     (host.to_string(), format!("/{token}"))

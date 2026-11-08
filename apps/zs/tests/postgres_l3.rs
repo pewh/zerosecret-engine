@@ -69,13 +69,15 @@ fn zs_run_exposes_postgres_through_l3_without_a_password() {
     let (policy, creds, audit, ca_dir) =
         common::write_postgres_setup(dir.path(), upstream.port, true);
 
-    let agent = common::spawn_agent_capturing(
+    let child = common::child(common::ChildAction::PrintEnv);
+    let agent = common::spawn_agent_capturing_with_env(
         &common::bin_path(),
         &policy,
         &creds,
         &audit,
         &ca_dir,
-        &["/usr/bin/env"],
+        &child.args,
+        &child.env(),
     )
     .expect("agent must start and run the child");
 
@@ -115,13 +117,15 @@ fn no_postgres_resource_means_no_pg_environment() {
     let (policy, creds, audit, ca_dir, _) =
         common::write_test_setup(dir.path(), fake.addr.port(), true, true);
 
-    let agent = common::spawn_agent_capturing(
+    let child = common::child(common::ChildAction::PrintEnv);
+    let agent = common::spawn_agent_capturing_with_env(
         &common::bin_path(),
         &policy,
         &creds,
         &audit,
         &ca_dir,
-        &["/usr/bin/env"],
+        &child.args,
+        &child.env(),
     )
     .expect("agent must start");
 
@@ -139,14 +143,16 @@ fn a_client_connecting_to_pghost_reaches_the_database_through_the_listener() {
     let (policy, creds, audit, ca_dir) =
         common::write_postgres_setup(dir.path(), upstream.port, true);
 
-    let mut agent = common::spawn_agent(
+    let child = common::child(common::ChildAction::Sleep(10));
+    let mut agent = common::spawn_agent_with_env(
         &common::bin_path(),
         &policy,
         &creds,
         &audit,
         &ca_dir,
-        &["sleep", "10"],
+        &child.args,
         true,
+        &child.env(),
     )
     .expect("agent must start");
 
@@ -195,13 +201,15 @@ fn no_postgres_credential_reaches_the_child_or_the_agent_output() {
     let (policy, creds, audit, ca_dir) =
         common::write_postgres_setup(dir.path(), upstream.port, true);
 
-    let agent = common::spawn_agent_capturing(
+    let child = common::child(common::ChildAction::PrintEnv);
+    let agent = common::spawn_agent_capturing_with_env(
         &common::bin_path(),
         &policy,
         &creds,
         &audit,
         &ca_dir,
-        &["/usr/bin/env"],
+        &child.args,
+        &child.env(),
     )
     .expect("agent must start");
 
@@ -296,6 +304,8 @@ fn postgres_binding_tls_fields_are_checked_at_config_load() {
     }
 }
 
+// Its only caller keeps a Unix `sh -c` child, so it is Unix-only too.
+#[cfg(unix)]
 fn with_upstream_ca(policy: &std::path::Path, port: u16, ca: &str) -> String {
     let text = std::fs::read_to_string(policy).unwrap();
     let field = format!("\"upstream_port\": {port}");
@@ -308,6 +318,7 @@ fn with_upstream_ca(policy: &std::path::Path, port: u16, ca: &str) -> String {
     text
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn zs_run_verifies_a_postgres_upstream_with_its_upstream_ca() {
     let pki = pg_fake::pki("127.0.0.1");
@@ -420,15 +431,17 @@ impl PgRun {
         if let Some(user) = user {
             bind_user(&policy, port, user);
         }
+        let child = common::child(common::ChildAction::Sleep(30));
         let agent = tokio::task::block_in_place(|| {
-            common::spawn_agent(
+            common::spawn_agent_with_env(
                 &common::bin_path(),
                 &policy,
                 &creds,
                 &audit,
                 &ca_dir,
-                &["sleep", "30"],
+                &child.args,
                 true,
+                &child.env(),
             )
         })
         .expect("the agent must start");

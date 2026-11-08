@@ -1,0 +1,335 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+      # zs links libdbus on Linux; the hosted image has the runtime library but not the headers.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-${{ matrix.target }}
+      - name: setup
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zs") | .version')
+          if [ -z "$version" ]; then
+            echo "release: cargo metadata reported no zs version" >&2
+            exit 1
+          fi
+          echo "ZS_VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "ZS_BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+          binary="target/${{ matrix.target }}/release/zs"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            binary="$binary.exe"
+          fi
+          echo "ZS_BIN=$binary" >> "$GITHUB_ENV"
+      - name: tag-matches-version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash tools/release-version-check.sh "$GITHUB_REF_NAME" "$ZS_VERSION"
+      - name: build
+        run: cargo build --locked --release -p zs --target "${{ matrix.target }}"
+      - name: no-test-endpoints
+        run: |
+          set -euo pipefail
+          if grep -aq ZS_TEST_ "$ZS_BIN"; then
+            echo "release: $ZS_BIN carries a ZS_TEST_ string" >&2
+            exit 1
+          fi
+          echo "release: no ZS_TEST_ string in $ZS_BIN"
+      - name: version-is-the-tag
+        run: |
+          set -euo pipefail
+          actual=$("$ZS_BIN" version)
+          echo "$actual"
+          rev=$(git rev-parse --short=12 HEAD)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            expected=${GITHUB_REF_NAME#v}
+          else
+            expected=$(git describe --tags --always --dirty)
+            expected=${expected#v}
+          fi
+          if [[ "$actual" != *"zs $expected ($rev,"* ]]; then
+            echo "release: expected 'zs $expected ($rev,' in the version line" >&2
+            exit 1
+          fi
+      - name: glibc-floor
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Versioned symbols only: `GLIBC_PRIVATE` carries no version and is no positive control.
+          symbols=$(objdump -T "$ZS_BIN" | grep -o 'GLIBC_2\.[0-9.]*' | sort -u || true)
+          count=$(printf '%s\n' "$symbols" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "release: objdump found no GLIBC_ symbol in $ZS_BIN; the positive control failed" >&2
+            exit 1
+          fi
+          max=$(printf '%s\n' "$symbols" | sed 's/^GLIBC_//' | sort -V | tail -n 1)
+          highest=$(printf '2.35\n%s\n' "$max" | sort -V | tail -n 1)
+          if [ "$highest" != "2.35" ]; then
+            echo "release: $ZS_BIN needs GLIBC_$max ($count symbols), above the 2.35 floor" >&2
+            exit 1
+          fi
+          echo "release: highest GLIBC symbol is GLIBC_$max ($count symbols), at or below 2.35"
+      - name: archive
+        run: |
+          set -euo pipefail
+          archive="zs-${ZS_VERSION}-${{ matrix.target }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            native_tar="$(cygpath -u "$SYSTEMROOT")/System32/tar.exe"
+            "$native_tar" -a -c -f "$archive.zip" -C "$(dirname "$ZS_BIN")" zs.exe
+            magic=$(head -c 2 "$archive.zip")
+            if [ "$magic" != "PK" ]; then
+              echo "release: $archive.zip is not a zip archive" >&2
+              exit 1
+            fi
+            "$native_tar" -tf "$archive.zip" | grep -Fxq zs.exe
+          else
+            # COPYFILE_DISABLE keeps macOS tar from adding a `._zs` AppleDouble entry for the
+            # binary's extended attributes; GNU tar ignores it. The listing must be `zs` alone.
+            COPYFILE_DISABLE=1 tar -czf "$archive.tar.gz" -C "$(dirname "$ZS_BIN")" "$(basename "$ZS_BIN")"
+            listing=$(tar -tzf "$archive.tar.gz")
+            if [ "$listing" != "zs" ]; then
+              echo "release: $archive.tar.gz must hold only zs, holds: $listing" >&2
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-${{ matrix.target }}
+          path: zs-*
+          if-no-files-found: error
+          retention-days: 7
+
+  checks:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build the debug positive control
+        env:
+          ZS_BUILD_TEST_ENDPOINTS: "1"
+        run: cargo build --locked -p zs
+      - name: The positive control carries the test endpoint
+        run: |
+          set -euo pipefail
+          grep -aq ZS_TEST_AWS_RESOLVE target/debug/zs
+          echo "release: the debug positive control carries ZS_TEST_AWS_RESOLVE"
+
+  sbom:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version 0.5.10
+      # cargo-cyclonedx lists optional and feature-gated crates that this build does not
+      # compile, so the check is a completeness check: every crate `cargo tree -e
+      # normal,build` names for the target must be a component. The extras do not fail it.
+      - name: Write one SBOM per target
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zs") | .version')
+          mkdir -p dist
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            x86_64-pc-windows-msvc
+          do
+            name="zs-$version-$target"
+            cargo cyclonedx --manifest-path apps/zs/Cargo.toml --format json --spec-version 1.5 \
+              --target "$target" --override-filename "$name.cdx" --quiet
+            mv "apps/zs/$name.cdx.json" "dist/$name.cdx.json"
+            find . -path ./dist -prune -o -name "$name.cdx.json" -type f -delete
+            bash tools/sbom-check.sh "dist/$name.cdx.json" "$target"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Observed, not enforced: until the first result lands, a difference is a recorded known
+  # gap and this job must not block the dry run.
+  reproducible-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build twice and compare the two hashes
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          binary=target/x86_64-unknown-linux-gnu/release/zs
+          cargo build --locked --release -p zs --target x86_64-unknown-linux-gnu
+          first=$(sha256sum "$binary" | cut -d' ' -f1)
+          cargo clean
+          cargo build --locked --release -p zs --target x86_64-unknown-linux-gnu
+          second=$(sha256sum "$binary" | cut -d' ' -f1)
+          echo "release: first=$first second=$second"
+          if [ "$first" != "$second" ]; then
+            echo "release: the two builds differ; record this as a known gap" >&2
+            exit 1
+          fi
+          echo "release: the two builds are identical"
+
+  # The only job with write permissions. It runs only for a pushed `v*` tag while the owner's
+  # `ZS_RELEASE_BINARIES` variable is true: that variable is the switch for ADR-0045 D6, so a
+  # dispatch from a branch never attests and never publishes. It also waits for `checks`: without
+  # the positive control, `no-test-endpoints` proves nothing.
+  publish:
+    needs: [build, sbom, checks]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push' && vars.ZS_RELEASE_BINARIES == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Runs before anything is attested, because attestations go to the public Rekor log.
+      - name: No release uses this tag yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | bash tools/release-absent.sh "$GITHUB_REF_NAME"
+      # `--notes-from-tag` reads the annotation from the local tag; fetch the tag object itself
+      # so the notes are the annotation, not the commit message of a lightweight local ref.
+      - name: Fetch the annotated tag
+        run: git fetch --force --depth=1 origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write and verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          for file in zs-*.tar.gz zs-*.zip; do
+            break
+          done
+          if [ ! -f "$file" ]; then
+            echo "release: no archive in dist" >&2
+            exit 1
+          fi
+          expected=$(sha256sum "$file" | cut -d' ' -f1)
+          tmp=$(mktemp -d)
+          cp "$file" "$tmp/tampered"
+          printf 'X' | dd of="$tmp/tampered" bs=1 seek=0 conv=notrunc status=none
+          if (cd "$tmp" && echo "$expected  tampered" | sha256sum -c -); then
+            echo "release: a byte-flipped archive passed sha256sum -c" >&2
+            exit 1
+          fi
+          echo "release: SHA256SUMS covers $(wc -l < SHA256SUMS) files and rejects a tampered copy"
+      - name: Read the workspace version from the artifact names
+        run: |
+          set -euo pipefail
+          for archive in dist/zs-*-x86_64-unknown-linux-gnu.tar.gz; do
+            break
+          done
+          version=$(basename "$archive" | sed -E 's/^zs-(.+)-x86_64-unknown-linux-gnu\.tar\.gz$/\1/')
+          if [ -z "$version" ] || [ "$version" = "$(basename "$archive")" ]; then
+            echo "release: cannot read the version from $archive" >&2
+            exit 1
+          fi
+          echo "ZS_VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+          sbom-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-unknown-linux-gnu.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/zs-${{ env.ZS_VERSION }}-aarch64-unknown-linux-gnu.tar.gz
+          sbom-path: dist/zs-${{ env.ZS_VERSION }}-aarch64-unknown-linux-gnu.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/zs-${{ env.ZS_VERSION }}-aarch64-apple-darwin.tar.gz
+          sbom-path: dist/zs-${{ env.ZS_VERSION }}-aarch64-apple-darwin.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-apple-darwin.tar.gz
+          sbom-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-apple-darwin.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-pc-windows-msvc.zip
+          sbom-path: dist/zs-${{ env.ZS_VERSION }}-x86_64-pc-windows-msvc.cdx.json
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          read -r -a args <<< "$(bash tools/publish-args.sh "$GITHUB_REF_NAME")"
+          gh release create "${args[@]}"

@@ -13,6 +13,7 @@ permissions:
   contents: read
 
 env:
+  ACTIONLINT_VERSION: "1.7.12"
   GITLEAKS_VERSION: "8.30.1"
 
 jobs:
@@ -21,6 +22,28 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          sha256sum --check --ignore-missing "actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          tar -xzf "$archive" actionlint
+          sudo install actionlint /usr/local/bin/actionlint
+          rm -f actionlint "$archive" "actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+      - name: Lint workflows
+        run: actionlint
+      - name: Gate scripts
+        run: |
+          set -euo pipefail
+          bash tools/check-release-permissions-test.sh
+          bash tools/release-version-check-test.sh
+          bash tools/macos-guard-test.sh
+          bash tools/publish-args-test.sh
+          bash tools/release-absent-test.sh
+          bash tools/check-release-permissions.sh .github/workflows/*.yml
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -158,9 +181,19 @@ jobs:
       - if: failure()
         run: docker compose --profile pgtls --profile mysql --profile mongo logs postgres postgres-tls mysql mongo
 
+  # A private repository must fail here instead of skipping both macOS jobs without notice.
+  macos-guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: tools/macos-guard.sh "${{ github.event.repository.private }}"
+
   # The macOS jobs run only while this repository is public: hosted macOS minutes are free on a
-  # public repository and billed at ten times the Linux rate on a private one.
+  # public repository and billed at ten times the Linux rate on a private one. On a private
+  # repository the guard fails, so these two jobs are skipped after a failure, not without notice.
   macos-check:
+    needs: macos-guard
     if: ${{ !github.event.repository.private }}
     runs-on: macos-latest
     timeout-minutes: 60
@@ -297,6 +330,7 @@ jobs:
   # adapter, process and delete steps receive. The job builds the whole agent. A locked
   # keychain is refused by the agent's lock check, so no step waits out the 30 s bound.
   macos-native:
+    needs: macos-guard
     if: ${{ !github.event.repository.private }}
     runs-on: macos-latest
     timeout-minutes: 35
@@ -370,7 +404,7 @@ jobs:
         run: |
           set -euo pipefail
           log=$(mktemp)
-          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --skip common::zs_test_child --test-threads=1 | tee "$log"
           grep -Fq "test result: ok. 15 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 15 macOS CA process tests to pass" >&2; exit 1; }
       # The real verifier drives the real agent through one synthetic HTTPS workload with
       # secure CA startup in this disposable keychain, then once more expecting a different
@@ -389,7 +423,7 @@ jobs:
           cargo build --locked -p zs-verify --bin zs-verify
           cargo test --locked -p zs --test verifier_ca_evidence --no-run
           log=$(mktemp)
-          cargo test --locked -p zs --test verifier_ca_evidence -- --ignored --test-threads=1 --show-output | tee "$log"
+          cargo test --locked -p zs --test verifier_ca_evidence -- --ignored --skip common::zs_test_child --test-threads=1 --show-output | tee "$log"
           grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 1 hardened verifier evidence test to pass" >&2; exit 1; }
       - name: Delete disposable keychain
         if: always()
@@ -437,7 +471,7 @@ jobs:
       - run: |
           set -euo pipefail
           log=$(mktemp)
-          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --skip common::zs_test_child --test-threads=1 | tee "$log"
           grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 11 Linux CA process tests to pass" >&2; exit 1; }
       # Agent-spawning tests reach the session bus they inherit, and `TestHome` deletes the
       # exact item each test's `.ca-storage-id` names (service `zerosecret.ca.v1`, that
@@ -478,7 +512,7 @@ jobs:
           ready || { echo "private secret service did not start" >&2; exit 1; }
           log=$(mktemp)
           cargo test --locked -p zs --test absolute_uri -- --test-threads=1 | tee "$log"
-          grep -Fq "test result: ok. 4 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 4 agent-spawning tests to pass" >&2; exit 1; }
+          grep -Fq "test result: ok. 5 passed; 0 failed; 1 ignored;" "$log" || { echo "expected exactly 5 agent-spawning tests to pass" >&2; exit 1; }
           count() {
             secrets /org/freedesktop/secrets org.freedesktop.Secret.Service.SearchItems dict:string:string:service,zerosecret.ca.v1 | { grep -c '^ *object path ' || true; }
           }
@@ -531,5 +565,43 @@ jobs:
         run: |
           set -euo pipefail
           log=$(mktemp)
-          cargo test --locked -p zs --test platform_ca_startup -- --ignored --test-threads=1 | tee "$log"
+          cargo test --locked -p zs --test platform_ca_startup -- --ignored --skip common::zs_test_child --test-threads=1 | tee "$log"
           grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 11 Windows CA process tests to pass" >&2; exit 1; }
+
+  windows-agent:
+    # `absolute_uri`, `signing_binding` and `postgres_l3` run the test child in
+    # `tests/common/mod.rs` instead of `sleep`, `/usr/bin/env` or `sh -c`, so the same tests
+    # run on Windows. The exact pass counts are pinned after the first CI run, as
+    # `windows-native` pins its own; until then each step proves its file ran and failed none.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: absolute_uri
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test absolute_uri -- --test-threads=1 | tee "$log"
+          grep -Fq "0 failed" "$log" || { echo "absolute_uri reported a failure" >&2; exit 1; }
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "absolute_uri passed no test" >&2; exit 1; }
+      - name: signing_binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test signing_binding -- --test-threads=1 | tee "$log"
+          grep -Fq "0 failed" "$log" || { echo "signing_binding reported a failure" >&2; exit 1; }
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "signing_binding passed no test" >&2; exit 1; }
+      - name: postgres_l3
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test postgres_l3 -- --test-threads=1 | tee "$log"
+          grep -Fq "0 failed" "$log" || { echo "postgres_l3 reported a failure" >&2; exit 1; }
+          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "postgres_l3 passed no test" >&2; exit 1; }

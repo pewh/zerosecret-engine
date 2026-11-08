@@ -663,6 +663,7 @@ fn write_local_setup(
 #[allow(dead_code)]
 pub struct AgentProcess {
     pub child: std::process::Child,
+    pub stdout: std::process::ChildStdout,
     pub proxy_addr: String,
     pub startup_stdout: String,
     pub proxy_authorization: String,
@@ -677,6 +678,102 @@ pub struct AgentProcess {
 #[cfg(unix)]
 const CHILD_ENV_SCRIPT: &str =
     r#"env | grep -E "^(HTTPS_PROXY|ZS_[A-Z0-9_]+_URL)=" > "$ZS_TEST_ENV_FILE"; exec "$@""#;
+
+#[derive(Clone, Copy)]
+pub enum ChildAction {
+    Sleep(u64),
+    PrintEnv,
+}
+
+impl ChildAction {
+    fn encoded(self) -> String {
+        match self {
+            ChildAction::Sleep(seconds) => format!("sleep:{seconds}"),
+            ChildAction::PrintEnv => "env".to_string(),
+        }
+    }
+}
+
+/// The child that `zs run` starts in place of `sleep`, `/usr/bin/env` or `sh -c`, so the same
+/// test runs on Windows: this test executable filtered to `zs_test_child`, with the action in
+/// `ZS_TEST_CHILD_ACTION`. The action reaches the child only through the agent's environment,
+/// so a spawn helper takes both `args` and `env()`.
+pub struct TestChild {
+    pub args: Vec<String>,
+    action: String,
+}
+
+impl TestChild {
+    pub fn env(&self) -> [(&str, &str); 1] {
+        [("ZS_TEST_CHILD_ACTION", self.action.as_str())]
+    }
+}
+
+pub fn child(action: ChildAction) -> TestChild {
+    let exe = std::env::current_exe().expect("the test executable has a path");
+    let exe = exe.to_str().expect("the test executable path is UTF-8");
+    TestChild {
+        args: vec![
+            exe.to_string(),
+            "--exact".to_string(),
+            "common::zs_test_child".to_string(),
+            "--ignored".to_string(),
+            "--nocapture".to_string(),
+        ],
+        action: action.encoded(),
+    }
+}
+
+/// The test child's entry point. Every binary that includes `common` lists it as an ignored
+/// test, so a CI step that runs `-- --ignored` against a pinned count passes
+/// `--skip common::zs_test_child`. Without `ZS_TEST_CHILD_ACTION` it returns at once.
+#[test]
+#[ignore]
+fn zs_test_child() {
+    let Ok(action) = std::env::var("ZS_TEST_CHILD_ACTION") else {
+        return;
+    };
+    #[cfg(windows)]
+    write_child_env_file();
+    if action == "env" {
+        for (name, value) in std::env::vars_os() {
+            println!("{}={}", name.to_string_lossy(), value.to_string_lossy());
+        }
+        return;
+    }
+    let seconds: u64 = action
+        .strip_prefix("sleep:")
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or_else(|| panic!("unknown ZS_TEST_CHILD_ACTION: {action}"));
+    std::thread::sleep(Duration::from_secs(seconds));
+}
+
+#[cfg(windows)]
+fn write_child_env_file() {
+    let Some(path) = std::env::var_os("ZS_TEST_ENV_FILE") else {
+        return;
+    };
+    let mut text = String::new();
+    if let Some(value) = std::env::var_os("HTTPS_PROXY") {
+        text.push_str(&format!("HTTPS_PROXY={}\n", value.to_string_lossy()));
+    }
+    let mut endpoints: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            (name.starts_with("ZS_") && name.ends_with("_URL"))
+                .then(|| (name, value.to_string_lossy().into_owned()))
+        })
+        .collect();
+    endpoints.sort();
+    for (name, value) in endpoints {
+        text.push_str(&format!("{name}={value}\n"));
+    }
+    let mut pending = PathBuf::from(&path);
+    pending.as_mut_os_string().push(".pending");
+    if std::fs::write(&pending, text).is_ok() {
+        let _ = std::fs::rename(&pending, &path);
+    }
+}
 
 pub fn parse_child_env(text: &str) -> (String, Vec<(String, String)>) {
     let mut authorization = String::new();
@@ -703,13 +800,13 @@ pub fn parse_child_env(text: &str) -> (String, Vec<(String, String)>) {
     (authorization, endpoints)
 }
 
-pub fn spawn_agent(
+pub fn spawn_agent<C: AsRef<std::ffi::OsStr>>(
     bin: &std::path::Path,
     policy: &std::path::Path,
     creds: &std::path::Path,
     audit: &std::path::Path,
     ca_dir: &std::path::Path,
-    child: &[&str],
+    child: &[C],
     audit_dir_exists: bool,
 ) -> Result<AgentProcess, String> {
     spawn_agent_with_env(
@@ -725,13 +822,13 @@ pub fn spawn_agent(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_agent_with_env(
+pub fn spawn_agent_with_env<C: AsRef<std::ffi::OsStr>>(
     bin: &std::path::Path,
     policy: &std::path::Path,
     creds: &std::path::Path,
     audit: &std::path::Path,
     ca_dir: &std::path::Path,
-    child: &[&str],
+    child: &[C],
     audit_dir_exists: bool,
     env: &[(&str, &str)],
 ) -> Result<AgentProcess, String> {
@@ -752,26 +849,21 @@ pub fn spawn_agent_with_env(
         "default".into(),
         "--".into(),
     ];
+    let env_file = std::env::temp_dir().join(format!("zs-child-env-{}.env", random_hex()));
     #[cfg(unix)]
-    let env_file = {
-        let path = std::env::temp_dir().join(format!("zs-child-env-{}.env", random_hex()));
+    {
         arguments.push("/bin/sh".into());
         arguments.push("-c".into());
         arguments.push(CHILD_ENV_SCRIPT.into());
         arguments.push("sh".into());
-        Some(path)
-    };
-    arguments.extend(child.iter().map(std::ffi::OsString::from));
+    }
+    arguments.extend(child.iter().map(|arg| arg.as_ref().to_owned()));
     let mut cmd = Command::new(bin);
     cmd.args(&arguments)
         .envs(env.iter().copied())
+        .env("ZS_TEST_ENV_FILE", &env_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    let mut cmd = {
-        cmd.env("ZS_TEST_ENV_FILE", env_file.as_ref().unwrap());
-        cmd
-    };
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -803,9 +895,8 @@ pub fn spawn_agent_with_env(
                     .find_map(|l| l.rsplit_once("-> 127.0.0.1:"))
                     .and_then(|(_, port)| port.trim().parse().ok())
             };
-            #[cfg(unix)]
             let (proxy_authorization, endpoint_urls) = {
-                let path = env_file.as_ref().unwrap();
+                let path = &env_file;
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let text = loop {
                     match std::fs::read_to_string(path) {
@@ -831,11 +922,10 @@ pub fn spawn_agent_with_env(
                     }
                 }
             };
-            #[cfg(not(unix))]
-            let (proxy_authorization, endpoint_urls) = (String::new(), Vec::new());
             register_proxy_authorization(addr.trim(), &proxy_authorization);
             return Ok(AgentProcess {
                 child,
+                stdout,
                 proxy_addr: addr.trim().to_string(),
                 startup_stdout: text.clone(),
                 proxy_authorization,
@@ -1094,14 +1184,16 @@ pub fn setup_agent_with(
         true,
         paths,
     );
-    let agent = spawn_agent(
+    let child = child(ChildAction::Sleep(120));
+    let agent = spawn_agent_with_env(
         bin_path().as_path(),
         policy.as_path(),
         creds.as_path(),
         audit.as_path(),
         ca_dir.as_path(),
-        &["sleep", "120"],
+        &child.args,
         true,
+        &child.env(),
     );
     TempAgent {
         dir,
@@ -1271,13 +1363,25 @@ pub struct CapturedAgent {
     pub stderr: String,
 }
 
-pub fn spawn_agent_capturing(
+pub fn spawn_agent_capturing<C: AsRef<std::ffi::OsStr>>(
     bin: &std::path::Path,
     policy: &std::path::Path,
     creds: &std::path::Path,
     audit: &std::path::Path,
     ca_dir: &std::path::Path,
-    child: &[&str],
+    child: &[C],
+) -> Result<CapturedAgent, String> {
+    spawn_agent_capturing_with_env(bin, policy, creds, audit, ca_dir, child, &[])
+}
+
+pub fn spawn_agent_capturing_with_env<C: AsRef<std::ffi::OsStr>>(
+    bin: &std::path::Path,
+    policy: &std::path::Path,
+    creds: &std::path::Path,
+    audit: &std::path::Path,
+    ca_dir: &std::path::Path,
+    child: &[C],
+    env: &[(&str, &str)],
 ) -> Result<CapturedAgent, String> {
     let mut command = Command::new(bin);
     command
@@ -1295,7 +1399,8 @@ pub fn spawn_agent_capturing(
             "default",
             "--",
         ])
-        .args(child)
+        .args(child.iter().map(|arg| arg.as_ref()))
+        .envs(env.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
