@@ -84,8 +84,7 @@ fn zs_run_exposes_postgres_through_l3_without_a_password() {
     assert!(
         !agent.child_output.contains("PGPASSWORD"),
         "PGPASSWORD must never be set in the child environment — that is the PRODUCT §4 \
-         claim for the psql line. Child env was:\n{}",
-        agent.child_output
+         claim for the psql line"
     );
     assert!(
         agent.child_output.contains("PGHOST=127.0.0.1"),

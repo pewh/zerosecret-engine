@@ -1401,6 +1401,9 @@ pub fn spawn_agent_capturing_with_env<C: AsRef<std::ffi::OsStr>>(
         ])
         .args(child.iter().map(|arg| arg.as_ref()))
         .envs(env.iter().copied())
+        // The Windows runner image exports PGPASSWORD; these tests prove that `zs run` does
+        // not add it, not that the host has none.
+        .env_remove("PGPASSWORD")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
