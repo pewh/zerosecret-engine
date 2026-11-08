@@ -84,6 +84,15 @@ CA (`GET /ca`) as its `control-ca.crt` and running `zs login` again.
 
 Stated plainly, because reviewers will find these anyway.
 
+**The metrics listener and the proxy header.** `ZS_CONTROL_METRICS_ADDR` opens a third
+listener that serves only `GET /metrics` and has no authentication. Outside `development` it
+must bind a loopback address unless `ZS_CONTROL_METRICS_PUBLIC=1`. The exposition has no
+tenant, subject, credential, session or address label (OB2, §2.3), so it shows traffic shape
+and counts, not who made the requests. The rate limiter and the request log honour
+`X-Forwarded-For` only from a peer inside `ZS_CONTROL_TRUSTED_PROXIES`. A prefix wider than the
+real proxy, or a proxy that forwards a header its client supplied, lets a client choose the
+limiter key it is bucketed under. Neither the peer nor the client becomes a metric label.
+
 **A hostile local process of the same OS user.** The agent's listeners bind to a loopback
 address only (`--listen` refuses any other address), and every local listener authenticates its
 caller (ADR-0052): the HTTP proxy requires the run token in `Proxy-Authorization`, the local
@@ -991,6 +1000,12 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `control keys promote` inside the publish window, or `retire` of the active key | The fixed refusal text and exit 1; the state file is byte-identical (commercial suite) |
 | `control keys promote federation` while the hosted JWKS lacks the new `kid`, the JWKS cannot be read, or `ZS_FEDERATION_ISSUER` is not set in the command's environment | The fixed refusal text and exit 1; no file changes (D-f) (commercial suite) |
 | A wire server certificate from a CA the control plane no longer publishes (retired), the CA pinned at enrolment included | The TLS handshake fails, so the refresh and any grant renewal fail closed. Once the agent has installed a published set, that set is its whole wire trust (`apps/zs/tests/fail_closed_matrix.rs` row 109) |
+| A request for a host that no organization in `ZS_CONTROL_ORGANIZATIONS` names | 404 `unknown organization`; no `Location` header and no pending login (commercial suite) |
+| A dashboard session issued at one organization's host, sent to another organization's host | The sign-in refusal; no data of the session's organization is rendered (commercial suite) |
+| A device whose issuer differs from the issuer of a member with the same subject | Not a member: the wire request is refused (`not_a_member`) (commercial suite) |
+| `ZS_CONTROL_METRICS_ADDR` outside loopback while `ZS_CONTROL_ENV` is not `development` and `ZS_CONTROL_METRICS_PUBLIC` is unset | Startup refuses with the fixed text; no listener opens (commercial suite) |
+| `X-Forwarded-For` from a peer outside `ZS_CONTROL_TRUSTED_PROXIES` | Ignored: the limiter and the request log key on the TCP peer (commercial suite) |
+| Multi-org startup while a member, enrolment token or device row has no issuer | Startup refuses with the fixed text before any listener opens; a single-org start binds the rows (D-g) (commercial suite) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
@@ -1020,6 +1035,11 @@ Tracked here until answered, then moved into a decision.
   and the database listeners check the peer socket (ADR-0052). The ceiling is the OS user:
   a process of that user can read the run token from the child's environment and passes the peer
   check. It is not isolation. Windows database listeners do not check the peer (§3).
+- **Should `/metrics` ever be reachable beyond loopback?** Outside `development` the
+  listener must bind loopback unless `ZS_CONTROL_METRICS_PUBLIC=1` is set, and it has no
+  authentication. The labels carry no tenant or subject, but the exposition still shows traffic
+  volume and route shape. A future answer needs an authentication story or a scrape proxy, not a
+  wider default bind.
 - **Deferred to v2.** Does the CI runner case need a different identity model than a
   developer workstation?
 - **What is the correct grant TTL?** It trades revocation lag against control-plane load

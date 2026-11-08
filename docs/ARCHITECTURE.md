@@ -110,10 +110,18 @@ control/
   css/                 the dashboard stylesheet
 ```
 
+The process can open a third listener (`ZS_CONTROL_METRICS_ADDR`) that serves only
+`GET /metrics`, and it can serve one organization per request host
+(`ZS_CONTROL_ORGANIZATIONS`). The host is resolved before any dashboard or login handler runs;
+`GET /healthz`, `GET /ca` and `POST /wire/enroll` answer on any host, because a load balancer
+does not know the tenant and an enrolment token names its organization.
+
 | Package | Owns |
 |---|---|
 | `internal/config` | environment and listener configuration |
 | `internal/server` | `chi` routing, listener startup, mTLS, `GET /ca` |
+| `internal/metrics` | the Prometheus text exposition and its own listener |
+| `internal/tenant` | the organization selected by the request host, and its IdP |
 | `internal/store` | PostgreSQL: `sqlc` queries, startup migration, per-run test schemas |
 | `internal/wire` | `/wire/*` handlers and wire authorization |
 | `internal/session` | login, OIDC callback, logout, session authorization, CSRF |
