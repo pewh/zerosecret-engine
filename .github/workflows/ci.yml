@@ -571,8 +571,8 @@ jobs:
   windows-agent:
     # `absolute_uri`, `signing_binding` and `postgres_l3` run the test child in
     # `tests/common/mod.rs` instead of `sleep`, `/usr/bin/env` or `sh -c`, so the same tests
-    # run on Windows. The exact pass counts are pinned after the first CI run, as
-    # `windows-native` pins its own; until then each step proves its file ran and failed none.
+    # run on Windows. The counts are pinned from the first full run, as `windows-native` pins
+    # its own.
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -587,21 +587,18 @@ jobs:
           set -euo pipefail
           log=$(mktemp)
           cargo test --locked -p zs --test absolute_uri -- --test-threads=1 | tee "$log"
-          grep -Fq "0 failed" "$log" || { echo "absolute_uri reported a failure" >&2; exit 1; }
-          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "absolute_uri passed no test" >&2; exit 1; }
+          grep -Fq "test result: ok. 5 passed; 0 failed; 1 ignored;" "$log" || { echo "expected exactly 5 absolute_uri tests to pass" >&2; exit 1; }
       - name: signing_binding
         shell: bash
         run: |
           set -euo pipefail
           log=$(mktemp)
           cargo test --locked -p zs --test signing_binding -- --test-threads=1 | tee "$log"
-          grep -Fq "0 failed" "$log" || { echo "signing_binding reported a failure" >&2; exit 1; }
-          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "signing_binding passed no test" >&2; exit 1; }
+          grep -Fq "test result: ok. 6 passed; 0 failed; 1 ignored;" "$log" || { echo "expected exactly 6 signing_binding tests to pass" >&2; exit 1; }
       - name: postgres_l3
         shell: bash
         run: |
           set -euo pipefail
           log=$(mktemp)
           cargo test --locked -p zs --test postgres_l3 -- --test-threads=1 | tee "$log"
-          grep -Fq "0 failed" "$log" || { echo "postgres_l3 reported a failure" >&2; exit 1; }
-          grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed;" "$log" || { echo "postgres_l3 passed no test" >&2; exit 1; }
+          grep -Fq "test result: ok. 10 passed; 0 failed; 1 ignored;" "$log" || { echo "expected exactly 10 postgres_l3 tests to pass" >&2; exit 1; }
