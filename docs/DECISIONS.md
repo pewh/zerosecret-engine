@@ -7,6 +7,33 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0056 — Binary releases (lifts ADR-0045 D6)
+
+**2026-11-08 · Accepted** · owner request 2026-11-08 (DS1 of the distribution spec) · supersedes
+ADR-0045 D6, which ADR-0055 left in place
+
+ADR-0045 D6 makes every release a source release. ADR-0055 built a pipeline that can publish
+five targets with Sigstore keyless attestations, and left DS1 to decide when to use it. The dry
+run proved the pipeline: five `build-<target>` artifacts, the five describe-form version lines,
+the test-endpoint and glibc checks, the SBOMs and identical rebuilds, with `publish` skipped on a
+dispatch.
+
+**Decision.** D6 is lifted. A pushed `v*` tag whose version matches the workspace, while the
+repository variable `ZS_RELEASE_BINARIES` is `true`, publishes a draft release with the five
+targets of ADR-0055, `SHA256SUMS` and one CycloneDX SBOM per target, every file attested. The
+owner verifies the draft with `tools/verify-release.sh <tag>` and then publishes it. A tag
+ruleset restricts `refs/tags/v*` creation to the owner.
+
+**Consequence.** Users download and verify a binary instead of building it. The git tag is the
+release identity and is never moved (ADR-0050 D4). There is no Apple or Windows code signing
+(DS3): macOS users remove the quarantine attribute, and the README says how. Only `publish`
+holds write permissions, and a dispatch never attests or publishes.
+
+**Reverse it if** the audience that needs a binary cannot verify an attestation, or a target's
+runner disappears. Then reinstate D6 by a new ADR and set `ZS_RELEASE_BINARIES` to `false`.
+
+---
+
 ## ADR-0055 — Release pipeline, ready but not publishing
 
 **2026-11-07 · Accepted** · owner request 2026-11-07 (accepts DS2-DS5 of the distribution spec,

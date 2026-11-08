@@ -67,6 +67,29 @@ the macOS Keychain, or on Linux a Secret Service on the D-Bus session bus. The C
 starts a private bus with `gnome-keyring` for this. [CONTRIBUTING.md](CONTRIBUTING.md) lists
 the checks a pull request must pass.
 
+## Install a release binary
+
+A release publishes `zs-<version>-<target>.tar.gz` (`.zip` on Windows), one CycloneDX SBOM per
+target and a `SHA256SUMS` file, with a Sigstore keyless attestation for every file. The
+targets are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+`x86_64-apple-darwin` and `x86_64-pc-windows-msvc`.
+
+```bash
+version=0.5.0
+target=x86_64-unknown-linux-gnu
+repo=pewh/zerosecret-engine
+gh release download "v$version" --repo "$repo" \
+  --pattern "zs-$version-$target.tar.gz" --pattern SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 --check
+gh attestation verify "zs-$version-$target.tar.gz" --repo "$repo"
+tar -xzf "zs-$version-$target.tar.gz"
+install -m 0755 zs ~/.local/bin/zs
+```
+
+On macOS, remove the quarantine attribute before the first run: `xattr -d com.apple.quarantine zs`.
+The binaries are not code-signed (ADR-0055, DS3). The Linux binaries link `libdbus-1.so.3`
+dynamically; the platform table below lists the runtime requirements.
+
 ## Run the conformance suite
 
 The suite drives the agent against real PostgreSQL, MySQL and MongoDB servers in Docker and

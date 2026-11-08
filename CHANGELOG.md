@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-08
+
+- Releases publish binaries for five targets (ADR-0056, which lifts ADR-0045 D6):
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+  `x86_64-apple-darwin` and `x86_64-pc-windows-msvc`. Each release carries `SHA256SUMS`,
+  one CycloneDX SBOM per target and a Sigstore keyless attestation. `publish` creates a
+  draft release; the owner verifies it with `tools/verify-release.sh` and publishes it.
+- A `windows-agent` CI job runs the proxy, endpoint and PostgreSQL relay tests under
+  `zs run` on Windows. A private repository fails `macos-guard` instead of skipping the
+  macOS jobs.
+- The agent is unchanged from 0.4.0.
+
 ## [0.4.0] - 2026-11-07
 
 - The control plane can replace its grant signing key, its federation key and its device CA without
