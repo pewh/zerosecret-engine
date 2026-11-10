@@ -36,6 +36,7 @@ base64.workspace = true
 rcgen.workspace = true
 rand.workspace = true
 async-trait.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

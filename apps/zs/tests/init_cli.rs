@@ -437,3 +437,107 @@ fn test_zs_init_rejects_listen_port_zero() {
     assert_eq!(output.status.code(), Some(2));
     assert!(!sandbox.ws.join("zs-policy.json").exists());
 }
+
+const SPLIT_ENV: &str = "DB_HOST=cluster.example.internal\nDB_USER=svc\nDB_PASSWORD=db-secret-1\nAPI_URL=https://api.example.internal\nAPI_CLIENT_ID=client\nAPI_CLIENT_SECRET=api-secret-2\nSQUID_URL=https://squid.example.internal\nSQUID_KEY=squid-secret-3\n";
+
+#[test]
+fn init_brokers_split_keys_writes_credentials_and_names_the_resources() {
+    let sandbox = Sandbox::with_env(SPLIT_ENV);
+    let output = sandbox.init(&["--db", "DB=mysql", "--auth", "SQUID_KEY=header:app-key"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for secret in ["db-secret-1", "api-secret-2", "squid-secret-3"] {
+        assert!(!stdout.contains(secret), "{secret} reached stdout");
+    }
+    assert!(stdout.contains(
+        "zs: control plane resource: name=mysql-db host=cluster.example.internal protocol=mysql operations=connect credential_ref=mysql-db"
+    ), "{stdout}");
+    assert!(
+        stdout.contains("name=api host=api.example.internal protocol=https operations=GET,POST")
+    );
+
+    let policy: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sandbox.ws.join("zs-policy.json")).unwrap())
+            .unwrap();
+    assert_eq!(policy["run"]["credentials_dir"], "~/.zs-credentials/proj");
+    let resources: Vec<&str> = policy["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["resource"].as_str().unwrap())
+        .collect();
+    assert_eq!(resources, ["mysql-db", "api", "squid"]);
+    assert_eq!(policy["bindings"][0]["listen_port"], 3306);
+    assert_eq!(policy["bindings"][2]["auth"]["header"], "app-key");
+
+    let creds = sandbox.home.join(".zs-credentials/proj");
+    assert_eq!(
+        fs::read_to_string(creds.join("mysql-db")).unwrap(),
+        "db-secret-1"
+    );
+    assert_eq!(
+        fs::read_to_string(creds.join("squid")).unwrap(),
+        "squid-secret-3"
+    );
+    assert!(fs::read_to_string(creds.join("api")).unwrap().len() > 8);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["mysql-db", "api", "squid"] {
+            let mode = fs::metadata(creds.join(name)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
+    }
+
+    let env = fs::read_to_string(sandbox.env_path()).unwrap();
+    for secret in ["db-secret-1", "api-secret-2", "squid-secret-3"] {
+        assert!(!env.contains(secret), "{secret} stayed in .env");
+    }
+    assert!(env.contains("DB_HOST=127.0.0.1\n"));
+    assert!(env.contains("API_CLIENT_ID=client\n"));
+    assert_eq!(sandbox.backups().len(), 1);
+}
+
+#[test]
+fn init_dry_run_writes_no_credential() {
+    let sandbox = Sandbox::with_env(SPLIT_ENV);
+    let output = sandbox.init(&["--dry-run", "--db", "DB=mysql"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("zs: would write credential ~/.zs-credentials/proj/mysql-db (0600)"),
+        "{stdout}"
+    );
+    assert!(!sandbox.home.join(".zs-credentials").exists());
+    assert_eq!(fs::read_to_string(sandbox.env_path()).unwrap(), SPLIT_ENV);
+}
+
+#[test]
+fn init_stops_before_env_changes_when_a_credential_file_differs() {
+    let sandbox = Sandbox::with_env(SPLIT_ENV);
+    let creds = sandbox.home.join(".zs-credentials/proj");
+    fs::create_dir_all(&creds).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(creds.join("mysql-db"), "an-older-value").unwrap();
+    let output = sandbox.init(&["--db", "DB=mysql"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("already holds another value"), "{stderr}");
+    assert!(!stderr.contains("an-older-value") && !stderr.contains("db-secret-1"));
+    assert_eq!(fs::read_to_string(sandbox.env_path()).unwrap(), SPLIT_ENV);
+    assert!(!sandbox.ws.join("zs-policy.json").exists());
+}
+
+#[test]
+fn init_refuses_bad_override_flags() {
+    let sandbox = Sandbox::with_env(SPLIT_ENV);
+    for args in [["--db", "DB=oracle"], ["--auth", "SQUID_KEY"]] {
+        let output = sandbox.init(&args);
+        assert_ne!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(fs::read_to_string(sandbox.env_path()).unwrap(), SPLIT_ENV);
+    }
+}

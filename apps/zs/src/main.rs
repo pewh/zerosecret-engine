@@ -130,6 +130,20 @@ fn parse_args() -> Result<Args, String> {
                 "--control" => {
                     args.init_opts.control = Some(it.next().ok_or("--control needs a value")?);
                 }
+                "--db" => {
+                    let val = it
+                        .next()
+                        .ok_or("--db needs PREFIX=mysql, postgres or mongo")?;
+                    let parsed = init::parse_db_override(&val)?;
+                    args.init_opts.overrides.db.push(parsed);
+                }
+                "--auth" => {
+                    let val = it
+                        .next()
+                        .ok_or("--auth needs KEY=bearer or KEY=header:<Name>")?;
+                    let parsed = init::parse_auth_override(&val)?;
+                    args.init_opts.overrides.auth.push(parsed);
+                }
                 "--listen-port-start" => {
                     let val = it.next().ok_or("--listen-port-start needs a value")?;
                     args.init_opts.listen_port_start = val

@@ -1,10 +1,42 @@
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use zeroize::Zeroizing;
+
 pub const PLACEHOLDER: &str = "placeholder_managed_by_zerosecret";
+const PLACEHOLDER_VALUES: &[&str] = &[PLACEHOLDER, "zs-brokered"];
+const CREDENTIALS_DIR_NOT_PRIVATE: &str = "the credential directory is not private";
+const HOST_SUFFIXES: &[&str] = &["_HOST", "_HOSTNAME"];
+const PASSWORD_SUFFIXES: &[&str] = &["_PASSWORD", "_PASS", "_PASSWD", "_PWD"];
+const DB_USER_SUFFIXES: &[&str] = &["_USER", "_USERNAME"];
+const DIALECT_SUFFIXES: &[&str] = &["_DIALECT", "_DRIVER", "_CONNECTION", "_ENGINE", "_TYPE"];
+const URL_SUFFIXES: &[&str] = &["_URL", "_BASE_URL", "_API_URL"];
+const BASIC_PAIRS: &[(&str, &str)] = &[
+    ("_CLIENT_ID", "_CLIENT_SECRET"),
+    ("_USERNAME", "_PASSWORD"),
+    ("_USER", "_PASSWORD"),
+    ("_AUTH_USER", "_AUTH_PASSWORD"),
+    ("_AUTH_USERNAME", "_AUTH_PASSWORD"),
+    ("_ID", "_SECRET"),
+];
+const TOKEN_SUFFIXES: &[&str] = &[
+    "_AUTH_TOKEN",
+    "_ACCESS_TOKEN",
+    "_API_KEY",
+    "_TOKEN",
+    "_KEY",
+    "_SECRET",
+    "_PASSWORD",
+];
+const HTTP_OPERATIONS: &[&str] = &["GET", "POST"];
+const REDIS_REASON: &str = "zs does not broker Redis yet";
+const ONE_PER_HOST_REASON: &str = "several credentials in this file target the same host; zs injects one credential per host, so none of them is brokered";
 pub const SANITIZED_MARKER: &str =
     "# zs init: brokered secrets in this file were replaced; the original is at";
 const BACKUP_PATH_PENDING: &str = "<backup path>";
@@ -41,6 +73,8 @@ pub struct ScannedBinding {
     pub auth_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<ScannedAuth>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
 }
 
 fn default_protocol() -> String {
@@ -51,21 +85,87 @@ fn default_protocol() -> String {
 #[serde(tag = "scheme", rename_all = "kebab-case")]
 pub enum ScannedAuth {
     Bearer,
+    Basic,
+    ApiKeyHeader { header: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unbrokered {
     pub key: String,
-    pub reason: &'static str,
+    pub reason: Cow<'static, str>,
 }
 
-#[derive(Debug, Default)]
+pub struct ScannedCredential {
+    pub resource: String,
+    value: Zeroizing<String>,
+}
+
+impl ScannedCredential {
+    fn new(resource: &str, value: &str) -> Self {
+        Self {
+            resource: resource.to_string(),
+            value: Zeroizing::new(value.to_string()),
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Default)]
 pub struct ScanReport {
     pub bindings: Vec<ScannedBinding>,
+    pub credentials: Vec<ScannedCredential>,
     pub sanitized: String,
     pub masked: String,
     pub replaced: Vec<String>,
     pub unbrokered: Vec<Unbrokered>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOverride {
+    Bearer,
+    Header(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOverrides {
+    pub db: Vec<(String, String)>,
+    pub auth: Vec<(String, AuthOverride)>,
+}
+
+pub fn parse_db_override(raw: &str) -> Result<(String, String), String> {
+    let (prefix, protocol) = raw
+        .split_once('=')
+        .ok_or("--db needs PREFIX=mysql, postgres or mongo")?;
+    let protocol = protocol.to_ascii_lowercase();
+    if prefix.is_empty() || !["mysql", "postgres", "mongo"].contains(&protocol.as_str()) {
+        return Err("--db needs PREFIX=mysql, postgres or mongo".into());
+    }
+    Ok((prefix.to_ascii_uppercase(), protocol))
+}
+
+pub fn parse_auth_override(raw: &str) -> Result<(String, AuthOverride), String> {
+    const USAGE: &str = "--auth needs KEY=bearer or KEY=header:<Name>";
+    let (key, scheme) = raw.split_once('=').ok_or(USAGE)?;
+    let auth = match scheme.split_once(':') {
+        None if scheme.eq_ignore_ascii_case("bearer") => AuthOverride::Bearer,
+        Some((kind, header))
+            if kind.eq_ignore_ascii_case("header")
+                && !header.is_empty()
+                && header
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            AuthOverride::Header(header.to_string())
+        }
+        _ => return Err(USAGE.into()),
+    };
+    if key.is_empty() {
+        return Err(USAGE.into());
+    }
+    Ok((key.to_string(), auth))
 }
 
 pub struct InitOptions {
@@ -74,6 +174,7 @@ pub struct InitOptions {
     pub from_env: Option<PathBuf>,
     pub control: Option<String>,
     pub listen_port_start: u16,
+    pub overrides: ScanOverrides,
 }
 
 impl Default for InitOptions {
@@ -84,6 +185,7 @@ impl Default for InitOptions {
             from_env: None,
             control: None,
             listen_port_start: 54320,
+            overrides: ScanOverrides::default(),
         }
     }
 }
@@ -158,6 +260,7 @@ const DB_SCHEMES: &[DbScheme] = &[
 
 struct DbUrl<'a> {
     user: Option<&'a str>,
+    password: &'a str,
     has_password: bool,
     host: &'a str,
     port: Option<u16>,
@@ -216,6 +319,7 @@ fn parse_db_url(rest: &str) -> Option<DbUrl<'_>> {
     };
     Some(DbUrl {
         user: Some(user).filter(|u| !u.is_empty()),
+        password,
         has_password: !password.is_empty(),
         host,
         port,
@@ -301,10 +405,10 @@ fn classify(
     next_port: &mut Option<u16>,
 ) -> Result<Option<String>, String> {
     if value.starts_with("mongodb+srv://") {
-        report.unbrokered.push(Unbrokered {
-            key: name.to_string(),
-            reason: "mongodb+srv needs a DNS SRV lookup that the mongo broker does not do; use a mongodb:// URL",
-        });
+        report.skip(
+            name,
+            "mongodb+srv needs a DNS SRV lookup that the mongo broker does not do; use a mongodb:// URL",
+        );
         return Ok(None);
     }
     if let Some((scheme, rest)) = DB_SCHEMES
@@ -312,10 +416,10 @@ fn classify(
         .find_map(|s| value.strip_prefix(s.prefix).map(|rest| (s, rest)))
     {
         let Some(url) = parse_db_url(rest) else {
-            report.unbrokered.push(Unbrokered {
-                key: name.to_string(),
-                reason: "database URL with several hosts or an unreadable host or port",
-            });
+            report.skip(
+                name,
+                "database URL with several hosts or an unreadable host or port",
+            );
             return Ok(None);
         };
         if url.is_loopback() && !url.has_password {
@@ -323,8 +427,14 @@ fn classify(
         }
         let port = take_port(next_port)?;
         let is_mongo = scheme.protocol == "mongo";
+        let resource = unique_resource(&report.bindings, scheme.resource);
+        if url.has_password && !is_placeholder(url.password) {
+            report
+                .credentials
+                .push(ScannedCredential::new(&resource, url.password));
+        }
         report.bindings.push(ScannedBinding {
-            resource: unique_resource(&report.bindings, scheme.resource),
+            resource,
             host: url.host.to_string(),
             protocol: scheme.protocol.into(),
             listen_port: Some(port),
@@ -335,6 +445,7 @@ fn classify(
                 .filter(|_| is_mongo)
                 .map(str::to_string),
             auth: None,
+            operations: Vec::new(),
         });
         let user_prefix = match url.user {
             Some(user) if !is_mongo => format!("{user}@"),
@@ -348,7 +459,10 @@ fn classify(
         )));
     }
     let upper = name.to_ascii_uppercase();
-    if PUBLIC_KEY_WORDS.iter().any(|w| upper.contains(w))
+    let names_a_secret = ["PASSWORD", "PASSWD", "SECRET", "PRIVATE"]
+        .iter()
+        .any(|w| upper.contains(w));
+    if (PUBLIC_KEY_WORDS.iter().any(|w| upper.contains(w)) && !names_a_secret)
         || PUBLIC_VALUE_PREFIXES.iter().any(|p| value.starts_with(p))
     {
         return Ok(None);
@@ -368,27 +482,504 @@ fn classify(
                 user: None,
                 auth_source: None,
                 auth: Some(ScannedAuth::Bearer),
+                operations: Vec::new(),
             });
+            if !is_placeholder(value) {
+                report
+                    .credentials
+                    .push(ScannedCredential::new(service.resource, value));
+            }
         }
         return Ok(Some(PLACEHOLDER.into()));
     }
     if url_has_password(value) {
-        report.unbrokered.push(Unbrokered {
-            key: name.to_string(),
-            reason: "URL with an embedded password for a protocol zs init does not broker",
-        });
+        report.skip(
+            name,
+            "URL with an embedded password for a protocol zs init does not broker",
+        );
     } else if SECRET_KEY_WORDS.iter().any(|w| upper.contains(w)) || upper.ends_with("_KEY") {
-        report.unbrokered.push(Unbrokered {
-            key: name.to_string(),
-            reason: "zs init cannot broker this value; move it out of the file by hand",
-        });
+        report.skip(
+            name,
+            "zs init cannot broker this value; move it out of the file by hand, or pass --auth KEY=bearer or KEY=header:<Name> when a matching _URL key names its host",
+        );
     }
     Ok(None)
 }
 
-pub fn scan_and_sanitize(content: &str, listen_port_start: u16) -> Result<ScanReport, String> {
+impl ScanReport {
+    fn skip(&mut self, key: &str, reason: impl Into<Cow<'static, str>>) {
+        self.unbrokered.push(Unbrokered {
+            key: key.to_string(),
+            reason: reason.into(),
+        });
+    }
+
+    fn host_taken(&self, host: &str) -> bool {
+        self.bindings
+            .iter()
+            .any(|b| b.listen_port.is_none() && b.host.eq_ignore_ascii_case(host))
+    }
+
+    fn port_taken(&self, port: u16) -> bool {
+        self.bindings.iter().any(|b| b.listen_port == Some(port))
+    }
+}
+
+fn is_placeholder(value: &str) -> bool {
+    PLACEHOLDER_VALUES.contains(&value)
+}
+
+struct Entry {
+    name: String,
+    value: String,
+}
+
+fn entries(content: &str) -> Vec<Entry> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let (raw_key, raw_value) = line.split_once('=')?;
+            let key = raw_key.trim();
+            let name = key.strip_prefix("export ").unwrap_or(key).trim();
+            let value = env_value(raw_value)?;
+            (!name.is_empty()).then(|| Entry {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct Plan {
+    rewrites: HashMap<String, String>,
+    claimed: HashSet<String>,
+}
+
+impl Plan {
+    fn handled(&self, name: &str) -> bool {
+        self.rewrites.contains_key(name) || self.claimed.contains(name)
+    }
+}
+
+fn lookup<'a>(entries: &'a [Entry], name: &str) -> Option<&'a str> {
+    entries
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.value.as_str())
+        .filter(|v| !v.is_empty())
+}
+
+fn first_key(entries: &[Entry], prefix: &str, suffixes: &[&str]) -> Option<(String, String)> {
+    suffixes.iter().find_map(|suffix| {
+        let name = format!("{prefix}{suffix}");
+        lookup(entries, &name).map(|value| (name, value.to_string()))
+    })
+}
+
+fn resource_name(bindings: &[ScannedBinding], prefix: &str, protocol: &str) -> String {
+    let base = prefix.to_ascii_lowercase().replace('_', "-");
+    let base = if ["db", "database", "data"].contains(&base.as_str()) || base.is_empty() {
+        format!("{protocol}-db")
+    } else {
+        base
+    };
+    unique_resource(bindings, &base)
+}
+
+fn default_port(protocol: &str) -> u16 {
+    match protocol {
+        "mysql" => 3306,
+        "postgres" => 5432,
+        _ => 27017,
+    }
+}
+
+fn protocol_named_in(text: &str) -> Option<&'static str> {
+    let upper = text.to_ascii_uppercase();
+    if upper.contains("MYSQL") || upper.contains("MARIADB") {
+        Some("mysql")
+    } else if upper.contains("POSTGRE")
+        || upper.contains("PSQL")
+        || upper.split(['_', '-']).any(|segment| segment == "PG")
+    {
+        Some("postgres")
+    } else if upper.contains("MONGO") {
+        Some("mongo")
+    } else {
+        None
+    }
+}
+
+fn db_protocol(
+    entries: &[Entry],
+    prefix: &str,
+    overrides: &ScanOverrides,
+) -> Result<&'static str, Cow<'static, str>> {
+    if let Some((_, protocol)) = overrides
+        .db
+        .iter()
+        .find(|(p, _)| p.eq_ignore_ascii_case(prefix))
+    {
+        return Ok(match protocol.as_str() {
+            "mysql" => "mysql",
+            "postgres" => "postgres",
+            _ => "mongo",
+        });
+    }
+    if prefix.to_ascii_uppercase().contains("REDIS") {
+        return Err(REDIS_REASON.into());
+    }
+    if let Some(protocol) = protocol_named_in(prefix) {
+        return Ok(protocol);
+    }
+    match lookup(entries, &format!("{prefix}_PORT")) {
+        Some("3306") => return Ok("mysql"),
+        Some("5432") => return Ok("postgres"),
+        Some("27017") => return Ok("mongo"),
+        _ => {}
+    }
+    if let Some(protocol) =
+        first_key(entries, prefix, DIALECT_SUFFIXES).and_then(|(_, v)| protocol_named_in(&v))
+    {
+        return Ok(protocol);
+    }
+    Err(format!(
+        "cannot tell the protocol of {prefix}_HOST; if it is a database, rerun with --db {prefix}=mysql, postgres or mongo"
+    )
+    .into())
+}
+
+fn plan_databases(
+    entries: &[Entry],
+    overrides: &ScanOverrides,
+    report: &mut ScanReport,
+    plan: &mut Plan,
+    next_port: &mut Option<u16>,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let Some(prefix) = HOST_SUFFIXES
+            .iter()
+            .find_map(|suffix| entry.name.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if prefix.is_empty() || !seen.insert(prefix.to_string()) {
+            continue;
+        }
+        let Some((password_key, password)) = first_key(entries, prefix, PASSWORD_SUFFIXES) else {
+            continue;
+        };
+        if plan.handled(&password_key) {
+            continue;
+        }
+        plan.claimed.insert(password_key.clone());
+        if is_placeholder(&password) {
+            continue;
+        }
+        let protocol = match db_protocol(entries, prefix, overrides) {
+            Ok(protocol) => protocol,
+            Err(reason) => {
+                report.skip(&password_key, reason);
+                continue;
+            }
+        };
+        let Some((host, host_port)) = split_host_port(&entry.value) else {
+            report.skip(&password_key, format!("{} is not a host name", entry.name));
+            continue;
+        };
+        let port_key = format!("{prefix}_PORT");
+        let upstream_port = match (lookup(entries, &port_key), host_port) {
+            (Some(raw), _) => match raw.parse::<u16>().ok().filter(|p| *p != 0) {
+                Some(port) => port,
+                None => {
+                    report.skip(&password_key, format!("{port_key} is not a port"));
+                    continue;
+                }
+            },
+            (None, Some(port)) => port,
+            (None, None) => default_port(protocol),
+        };
+        let user = first_key(entries, prefix, DB_USER_SUFFIXES).map(|(_, v)| v);
+        if protocol == "mongo" && user.is_none() {
+            report.skip(
+                &password_key,
+                format!("a MongoDB binding needs {prefix}_USER or {prefix}_USERNAME"),
+            );
+            continue;
+        }
+        let mut listen_port = upstream_port;
+        if report.port_taken(listen_port) {
+            if lookup(entries, &port_key).is_none() {
+                report.skip(
+                    &password_key,
+                    format!("port {listen_port} is taken by another binding; set {port_key}"),
+                );
+                continue;
+            }
+            listen_port = take_port(next_port)?;
+            plan.rewrites.insert(port_key, listen_port.to_string());
+        }
+        let resource = resource_name(&report.bindings, prefix, protocol);
+        let host_prefix = format!("{prefix}_");
+        for other in entries {
+            let same_group = other.name == entry.name
+                || (other.name.starts_with(&host_prefix)
+                    && HOST_SUFFIXES.iter().any(|s| other.name.ends_with(s))
+                    && other.value == entry.value);
+            if same_group {
+                plan.rewrites
+                    .insert(other.name.clone(), "127.0.0.1".to_string());
+            }
+        }
+        plan.rewrites.insert(password_key, PLACEHOLDER.to_string());
+        report
+            .credentials
+            .push(ScannedCredential::new(&resource, &password));
+        report.bindings.push(ScannedBinding {
+            resource,
+            host: host.to_string(),
+            protocol: protocol.into(),
+            listen_port: Some(listen_port),
+            upstream_port: Some(upstream_port),
+            user: (protocol == "mongo").then(|| user.unwrap_or_default()),
+            auth_source: (protocol == "mongo")
+                .then(|| lookup(entries, &format!("{prefix}_AUTH_SOURCE")).map(str::to_string))
+                .flatten(),
+            auth: None,
+            operations: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+fn http_host(value: &str) -> Option<(&'static str, String)> {
+    let lower = value.to_ascii_lowercase();
+    let (protocol, rest) = if lower.starts_with("https://") {
+        ("https", &value[8..])
+    } else if lower.starts_with("http://") {
+        ("http", &value[7..])
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, _) = split_host_port(host_port)?;
+    Some((protocol, host.to_ascii_lowercase()))
+}
+
+fn url_prefixes(name: &str) -> Vec<String> {
+    let Some(base) = URL_SUFFIXES
+        .iter()
+        .rev()
+        .find_map(|suffix| name.strip_suffix(suffix))
+    else {
+        return Vec::new();
+    };
+    let mut prefixes = vec![base.to_string()];
+    if let Some(full) = name.strip_suffix("_URL")
+        && full != base
+    {
+        prefixes.push(full.to_string());
+    }
+    prefixes.retain(|p| !p.is_empty());
+    prefixes
+}
+
+fn http_binding(
+    report: &mut ScanReport,
+    resource_prefix: &str,
+    protocol: &str,
+    host: String,
+    auth: ScannedAuth,
+    credential: &str,
+) {
+    let resource = resource_name(&report.bindings, resource_prefix, protocol);
+    report
+        .credentials
+        .push(ScannedCredential::new(&resource, credential));
+    report.bindings.push(ScannedBinding {
+        resource,
+        host,
+        protocol: protocol.into(),
+        listen_port: None,
+        upstream_port: None,
+        user: None,
+        auth_source: None,
+        auth: Some(auth),
+        operations: HTTP_OPERATIONS.iter().map(|op| op.to_string()).collect(),
+    });
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+struct HttpCandidate {
+    prefix: String,
+    protocol: &'static str,
+    host: String,
+    key: String,
+    auth: ScannedAuth,
+    credential: Zeroizing<String>,
+}
+
+fn plan_http(candidates: Vec<HttpCandidate>, report: &mut ScanReport, plan: &mut Plan) {
+    let shared: HashSet<String> = candidates
+        .iter()
+        .filter(|c| {
+            report.host_taken(&c.host)
+                || candidates
+                    .iter()
+                    .filter(|o| o.host.eq_ignore_ascii_case(&c.host))
+                    .count()
+                    > 1
+        })
+        .map(|c| c.host.to_ascii_lowercase())
+        .collect();
+    for candidate in candidates {
+        if shared.contains(&candidate.host.to_ascii_lowercase()) {
+            report.skip(&candidate.key, ONE_PER_HOST_REASON);
+            continue;
+        }
+        http_binding(
+            report,
+            &candidate.prefix,
+            candidate.protocol,
+            candidate.host,
+            candidate.auth,
+            &candidate.credential,
+        );
+        plan.rewrites.insert(candidate.key, PLACEHOLDER.to_string());
+    }
+}
+
+fn basic_candidates(entries: &[Entry], plan: &mut Plan) -> Vec<HttpCandidate> {
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Some((protocol, host)) = http_host(&entry.value) else {
+            continue;
+        };
+        if is_loopback_host(&host) {
+            continue;
+        }
+        let pair = url_prefixes(&entry.name).into_iter().find_map(|prefix| {
+            BASIC_PAIRS.iter().find_map(|(user_suffix, secret_suffix)| {
+                let user = lookup(entries, &format!("{prefix}{user_suffix}"))?;
+                let secret_key = format!("{prefix}{secret_suffix}");
+                let secret = lookup(entries, &secret_key)?;
+                Some((
+                    prefix.clone(),
+                    user.to_string(),
+                    secret_key,
+                    secret.to_string(),
+                ))
+            })
+        });
+        let Some((prefix, user, secret_key, secret)) = pair else {
+            continue;
+        };
+        if plan.handled(&secret_key) {
+            continue;
+        }
+        plan.claimed.insert(secret_key.clone());
+        if is_placeholder(&secret) {
+            continue;
+        }
+        candidates.push(HttpCandidate {
+            prefix,
+            protocol,
+            host,
+            key: secret_key,
+            auth: ScannedAuth::Basic,
+            credential: Zeroizing::new(
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")),
+            ),
+        });
+    }
+    candidates
+}
+
+fn override_candidates(
+    entries: &[Entry],
+    overrides: &ScanOverrides,
+    plan: &mut Plan,
+) -> Result<Vec<HttpCandidate>, String> {
+    let mut candidates = Vec::new();
+    for (key, auth) in &overrides.auth {
+        let Some(value) = lookup(entries, key) else {
+            return Err(format!("--auth {key}: the file has no value for {key}"));
+        };
+        if plan.handled(key) {
+            continue;
+        }
+        plan.claimed.insert(key.clone());
+        if is_placeholder(value) {
+            continue;
+        }
+        let prefix = TOKEN_SUFFIXES
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix))
+            .unwrap_or(key);
+        let Some((protocol, host)) = URL_SUFFIXES
+            .iter()
+            .find_map(|suffix| lookup(entries, &format!("{prefix}{suffix}")))
+            .and_then(http_host)
+        else {
+            return Err(format!(
+                "--auth {key}: no {prefix}_URL, {prefix}_BASE_URL or {prefix}_API_URL names its host"
+            ));
+        };
+        if is_loopback_host(&host) {
+            return Err(format!(
+                "--auth {key}: its URL is a loopback address, which zs does not broker"
+            ));
+        }
+        candidates.push(HttpCandidate {
+            prefix: prefix.to_string(),
+            protocol,
+            host,
+            key: key.clone(),
+            auth: match auth {
+                AuthOverride::Bearer => ScannedAuth::Bearer,
+                AuthOverride::Header(header) => ScannedAuth::ApiKeyHeader {
+                    header: header.clone(),
+                },
+            },
+            credential: Zeroizing::new(value.to_string()),
+        });
+    }
+    Ok(candidates)
+}
+
+#[cfg(test)]
+fn scan_and_sanitize(content: &str, listen_port_start: u16) -> Result<ScanReport, String> {
+    scan_with(content, listen_port_start, &ScanOverrides::default())
+}
+
+pub fn scan_with(
+    content: &str,
+    listen_port_start: u16,
+    overrides: &ScanOverrides,
+) -> Result<ScanReport, String> {
     let mut report = ScanReport::default();
     let mut next_port = Some(listen_port_start);
+    let parsed = entries(content);
+    let mut plan = Plan::default();
+    plan_databases(&parsed, overrides, &mut report, &mut plan, &mut next_port)?;
+    let mut candidates = basic_candidates(&parsed, &mut plan);
+    candidates.extend(override_candidates(&parsed, overrides, &mut plan)?);
+    plan_http(candidates, &mut report, &mut plan);
     let mut lines = Vec::new();
     let mut masked = Vec::new();
     for (index, line) in content.lines().enumerate() {
@@ -414,7 +1005,14 @@ pub fn scan_and_sanitize(content: &str, listen_port_start: u16) -> Result<ScanRe
         let value = env_value(raw_value).ok_or_else(|| {
             format!("line {number}: multi-line or unterminated quoted values are not supported")
         })?;
-        match classify(name, value, &mut report, &mut next_port)? {
+        let outcome = if let Some(new_value) = plan.rewrites.get(name) {
+            Some(new_value.clone())
+        } else if plan.claimed.contains(name) {
+            None
+        } else {
+            classify(name, value, &mut report, &mut next_port)?
+        };
+        match outcome {
             Some(new_value) => {
                 let rewritten = format!("{key}={new_value}");
                 masked.push(rewritten.clone());
@@ -496,6 +1094,10 @@ fn open_new_private(path: &Path) -> std::io::Result<fs::File> {
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    ensure_private(dir, "backup directory", BACKUP_DIR_NOT_PRIVATE)
+}
+
+fn ensure_private(dir: &Path, label: &str, not_private: &str) -> Result<(), String> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -505,9 +1107,9 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     }
     builder
         .create(dir)
-        .map_err(|e| format!("cannot create backup directory {}: {e}", dir.display()))?;
+        .map_err(|e| format!("cannot create {label} {}: {e}", dir.display()))?;
     let meta = fs::symlink_metadata(dir)
-        .map_err(|e| format!("cannot inspect backup directory {}: {e}", dir.display()))?;
+        .map_err(|e| format!("cannot inspect {label} {}: {e}", dir.display()))?;
     let private = meta.is_dir() && !meta.file_type().is_symlink();
     #[cfg(unix)]
     let private = {
@@ -517,7 +1119,64 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     if private {
         Ok(())
     } else {
-        Err(BACKUP_DIR_NOT_PRIVATE.to_string())
+        Err(not_private.to_string())
+    }
+}
+
+fn credentials_dir(home: &Path, workspace: &Path) -> PathBuf {
+    let project = workspace
+        .file_name()
+        .map_or_else(|| "workspace".into(), |name| name.to_os_string());
+    home.join(".zs-credentials").join(project)
+}
+
+fn write_credentials(dir: &Path, credentials: &[ScannedCredential]) -> Result<(), String> {
+    ensure_private(dir, "credential directory", CREDENTIALS_DIR_NOT_PRIVATE)?;
+    let mut pending = Vec::new();
+    for credential in credentials {
+        let path = dir.join(&credential.resource);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                return Err(format!(
+                    "credential path {} is not a regular file",
+                    path.display()
+                ));
+            }
+            Ok(_) => {
+                let existing = Zeroizing::new(
+                    fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+                );
+                if existing.as_slice() != credential.value().as_bytes() {
+                    return Err(format!(
+                        "credential file {} already holds another value; move it away first",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => pending.push((path, credential)),
+            Err(e) => return Err(format!("cannot inspect {}: {e}", path.display())),
+        }
+    }
+    for (path, credential) in pending {
+        let mut file = open_new_private(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        file.write_all(credential.value().as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn tilde_path(home: &Path, path: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => {
+            let parts: Vec<String> = rest
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            format!("~/{}", parts.join("/"))
+        }
+        Err(_) => path.display().to_string(),
     }
 }
 
@@ -578,9 +1237,36 @@ fn find_env_file(opts: &InitOptions) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+fn binding_operations(binding: &ScannedBinding) -> String {
+    if binding.listen_port.is_some() {
+        "connect".into()
+    } else if binding.operations.is_empty() {
+        "GET".into()
+    } else {
+        binding.operations.join(",")
+    }
+}
+
 fn print_report(report: &ScanReport, env_path: &Path) {
     for binding in &report.bindings {
-        stdout_line!("zs: binding {} -> {}", binding.resource, binding.host);
+        match binding.listen_port {
+            Some(port) => stdout_line!(
+                "zs: binding {} -> {} (listener 127.0.0.1:{port})",
+                binding.resource,
+                binding.host
+            ),
+            None => stdout_line!("zs: binding {} -> {}", binding.resource, binding.host),
+        }
+    }
+    for binding in &report.bindings {
+        stdout_line!(
+            "zs: control plane resource: name={} host={} protocol={} operations={} credential_ref={}",
+            binding.resource,
+            binding.host,
+            binding.protocol,
+            binding_operations(binding),
+            binding.resource
+        );
     }
     if !report.replaced.is_empty() {
         stdout_line!(
@@ -627,7 +1313,7 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         return 1;
     }
 
-    let report = match scan_and_sanitize(&env_content, opts.listen_port_start) {
+    let report = match scan_with(&env_content, opts.listen_port_start, &opts.overrides) {
         Ok(report) => report,
         Err(e) => {
             stderr_line!("zs: {}: {e}", env_path.display());
@@ -635,11 +1321,33 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         }
     };
 
+    let needs_home = !report.replaced.is_empty() || !report.credentials.is_empty();
+    let (home, workspace) = if needs_home {
+        let Some(home) = home_dir() else {
+            stderr_line!("zs: {NO_HOME}");
+            return 2;
+        };
+        match std::env::current_dir() {
+            Ok(dir) => (home, dir),
+            Err(e) => {
+                stderr_line!("zs: cannot read the working directory: {e}");
+                return 2;
+            }
+        }
+    } else {
+        (PathBuf::new(), PathBuf::new())
+    };
+    let creds_dir = credentials_dir(&home, &workspace);
+
+    let mut run = serde_json::json!({
+        "control": opts.control.as_deref().unwrap_or("http://127.0.0.1:8443"),
+        "control_ca": "zerosecret/control-ca.crt"
+    });
+    if !report.credentials.is_empty() {
+        run["credentials_dir"] = serde_json::Value::String(tilde_path(&home, &creds_dir));
+    }
     let policy_val = serde_json::json!({
-        "run": {
-            "control": opts.control.as_deref().unwrap_or("http://127.0.0.1:8443"),
-            "control_ca": "zerosecret/control-ca.crt"
-        },
+        "run": run,
         "bindings": report.bindings
     });
     let policy_str = match serde_json::to_string_pretty(&policy_val) {
@@ -656,23 +1364,18 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         stdout_line!("--- {} (dry-run) ---", env_path.display());
         stdout_line!("{}", report.masked);
         print_report(&report, &env_path);
+        for credential in &report.credentials {
+            stdout_line!(
+                "zs: would write credential {} (0600)",
+                tilde_path(&home, &creds_dir.join(&credential.resource))
+            );
+        }
         return 0;
     }
 
     let backup_path = if report.replaced.is_empty() {
         None
     } else {
-        let Some(home) = home_dir() else {
-            stderr_line!("zs: {NO_HOME}");
-            return 2;
-        };
-        let workspace = match std::env::current_dir() {
-            Ok(dir) => dir,
-            Err(e) => {
-                stderr_line!("zs: cannot read the working directory: {e}");
-                return 2;
-            }
-        };
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -695,6 +1398,19 @@ pub fn run_init(opts: &InitOptions) -> i32 {
         }
         Some(backup)
     };
+
+    if !report.credentials.is_empty() {
+        if let Err(e) = write_credentials(&creds_dir, &report.credentials) {
+            stderr_line!("zs: {e}");
+            return 2;
+        }
+        for credential in &report.credentials {
+            stdout_line!(
+                "zs: credential {} written (0600)",
+                tilde_path(&home, &creds_dir.join(&credential.resource))
+            );
+        }
+    }
 
     if let Err(e) = fs::write(policy_path, format!("{policy_str}\n")) {
         stderr_line!("zs: cannot write zs-policy.json: {e}");
@@ -730,6 +1446,308 @@ mod tests {
 
     fn scan(content: &str) -> ScanReport {
         scan_and_sanitize(content, 54320).unwrap()
+    }
+
+    fn scan_err(content: &str, port: u16) -> String {
+        scan_and_sanitize(content, port)
+            .err()
+            .expect("the scan must fail")
+    }
+
+    fn scan_overridden(content: &str, overrides: &ScanOverrides) -> ScanReport {
+        scan_with(content, 54320, overrides).unwrap()
+    }
+
+    fn credential<'a>(report: &'a ScanReport, resource: &str) -> &'a str {
+        report
+            .credentials
+            .iter()
+            .find(|c| c.resource == resource)
+            .expect("credential")
+            .value()
+    }
+
+    fn reason<'a>(report: &'a ScanReport, key: &str) -> &'a str {
+        &report
+            .unbrokered
+            .iter()
+            .find(|u| u.key == key)
+            .expect("unbrokered key")
+            .reason
+    }
+
+    #[test]
+    fn split_postgres_keys_become_one_binding_on_the_app_port() {
+        let report = scan(
+            "STORAGE_POSTGRE_HOST=db.example.internal\nSTORAGE_POSTGRE_PORT=5432\nSTORAGE_POSTGRE_USER=svc\nSTORAGE_POSTGRE_PASSWORD=pg-secret-1\nSTORAGE_POSTGRE_DATABASE=app\n",
+        );
+        assert_eq!(report.bindings.len(), 1);
+        let b = &report.bindings[0];
+        assert_eq!(b.resource, "storage-postgre");
+        assert_eq!(b.protocol, "postgres");
+        assert_eq!(b.host, "db.example.internal");
+        assert_eq!(b.listen_port, Some(5432));
+        assert_eq!(b.upstream_port, Some(5432));
+        assert_eq!(credential(&report, "storage-postgre"), "pg-secret-1");
+        assert!(
+            report
+                .sanitized
+                .contains("STORAGE_POSTGRE_HOST=127.0.0.1\n")
+        );
+        assert!(report.sanitized.contains("STORAGE_POSTGRE_PORT=5432\n"));
+        assert!(
+            report
+                .sanitized
+                .contains("STORAGE_POSTGRE_PASSWORD=placeholder_managed_by_zerosecret\n")
+        );
+        assert!(!report.sanitized.contains("pg-secret-1"));
+        assert!(!report.masked.contains("pg-secret-1"));
+        assert!(report.unbrokered.is_empty());
+    }
+
+    #[test]
+    fn unnamed_db_keys_need_db_and_then_share_one_listener_with_the_replica() {
+        let content = "DB_DATABASE=app\nDB_USER=svc\nDB_PASSWORD=my-secret-1\nDB_HOST=cluster.example.internal\nDB_REPLICA_HOST=cluster.example.internal\n";
+        let report = scan(content);
+        assert!(report.bindings.is_empty());
+        assert_eq!(report.sanitized, content);
+        assert!(reason(&report, "DB_PASSWORD").contains("--db DB=mysql"));
+
+        let overrides = ScanOverrides {
+            db: vec![("DB".into(), "mysql".into())],
+            ..ScanOverrides::default()
+        };
+        let report = scan_overridden(content, &overrides);
+        assert_eq!(report.bindings.len(), 1);
+        let b = &report.bindings[0];
+        assert_eq!(
+            (b.resource.as_str(), b.protocol.as_str()),
+            ("mysql-db", "mysql")
+        );
+        assert_eq!(b.listen_port, Some(3306));
+        assert_eq!(b.upstream_port, Some(3306));
+        assert!(report.sanitized.contains("DB_HOST=127.0.0.1\n"));
+        assert!(report.sanitized.contains("DB_REPLICA_HOST=127.0.0.1\n"));
+        assert_eq!(credential(&report, "mysql-db"), "my-secret-1");
+        assert!(report.unbrokered.is_empty());
+    }
+
+    #[test]
+    fn a_db_port_names_the_protocol_and_a_taken_port_moves() {
+        let report = scan(
+            "A_HOST=a.example\nA_PORT=5432\nA_PASSWORD=pa\nB_HOST=b.example\nB_PORT=5432\nB_PASSWORD=pb\n",
+        );
+        assert_eq!(report.bindings.len(), 2);
+        assert_eq!(report.bindings[0].listen_port, Some(5432));
+        assert_eq!(report.bindings[1].listen_port, Some(54320));
+        assert_eq!(report.bindings[1].upstream_port, Some(5432));
+        assert!(report.sanitized.contains("B_PORT=54320\n"));
+    }
+
+    #[test]
+    fn redis_and_userless_mongo_groups_are_reported() {
+        let report = scan(
+            "STORAGE_REDIS_HOST=cache.example\nSTORAGE_REDIS_PASSWORD=rs\nMONGO_HOST=m.example\nMONGO_PASSWORD=ms\n",
+        );
+        assert!(report.bindings.is_empty());
+        assert_eq!(reason(&report, "STORAGE_REDIS_PASSWORD"), REDIS_REASON);
+        assert!(reason(&report, "MONGO_PASSWORD").contains("MONGO_USER"));
+        assert_eq!(report.unbrokered.len(), 2);
+    }
+
+    #[test]
+    fn basic_pairs_become_basic_bindings_and_keep_the_user() {
+        let report = scan(
+            "TOOL_OAUTH_URL=https://auth.example/oauth\nTOOL_OAUTH_CLIENT_ID=tool\nTOOL_OAUTH_CLIENT_SECRET=s1\nPARTNER_API_URL=https://partner.example\nPARTNER_API_USERNAME=client\nPARTNER_API_PASSWORD=s2\nPIGEON_BASE_URL=https://pigeon.example/\nPIGEON_AUTH_USER=pu\nPIGEON_AUTH_PASSWORD=s3\n",
+        );
+        let names: Vec<&str> = report
+            .bindings
+            .iter()
+            .map(|b| b.resource.as_str())
+            .collect();
+        assert_eq!(names, ["tool-oauth", "partner-api", "pigeon"]);
+        for b in &report.bindings {
+            assert_eq!(b.auth, Some(ScannedAuth::Basic));
+            assert_eq!(b.operations, ["GET", "POST"]);
+        }
+        assert_eq!(report.bindings[0].host, "auth.example");
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        assert_eq!(credential(&report, "tool-oauth"), b64("tool:s1"));
+        assert_eq!(credential(&report, "partner-api"), b64("client:s2"));
+        assert_eq!(credential(&report, "pigeon"), b64("pu:s3"));
+        assert!(report.sanitized.contains("TOOL_OAUTH_CLIENT_ID=tool\n"));
+        assert!(
+            report
+                .sanitized
+                .contains("TOOL_OAUTH_CLIENT_SECRET=placeholder_managed_by_zerosecret\n")
+        );
+        let policy = serde_json::to_string(&report.bindings).unwrap();
+        assert!(policy.contains(r#""auth":{"scheme":"basic"}"#), "{policy}");
+        for secret in ["s1", "s2", "s3"] {
+            assert!(!report.sanitized.contains(&format!("={secret}\n")));
+        }
+    }
+
+    #[test]
+    fn a_loopback_url_is_the_app_itself_and_is_never_brokered() {
+        let report = scan(
+            "PUBLIC_URL=http://localhost:8000\nPUBLIC_USERNAME=u\nPUBLIC_PASSWORD=inbound-check\nIP_URL=http://127.0.0.1:9/x\nIP_ID=a\nIP_SECRET=s\n",
+        );
+        assert!(report.bindings.is_empty());
+        assert!(report.sanitized.contains("PUBLIC_PASSWORD=inbound-check\n"));
+        assert!(reason(&report, "PUBLIC_PASSWORD").contains("cannot broker"));
+        let overrides = ScanOverrides {
+            auth: vec![("PUBLIC_PASSWORD".into(), AuthOverride::Bearer)],
+            ..ScanOverrides::default()
+        };
+        let err = scan_with(
+            "PUBLIC_URL=http://localhost:8000\nPUBLIC_PASSWORD=inbound-check\n",
+            54320,
+            &overrides,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.contains("loopback") && !err.contains("inbound-check"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_second_credential_for_one_host_is_reported() {
+        let report = scan(
+            "OAUTH_URL=https://auth.example\nOAUTH_CLIENT_ID=a\nOAUTH_CLIENT_SECRET=s1\nOTHER_OAUTH_URL=https://auth.example/x\nOTHER_OAUTH_CLIENT_ID=b\nOTHER_OAUTH_CLIENT_SECRET=s2\n",
+        );
+        assert!(report.bindings.is_empty());
+        assert!(report.credentials.is_empty());
+        for key in ["OAUTH_CLIENT_SECRET", "OTHER_OAUTH_CLIENT_SECRET"] {
+            assert_eq!(reason(&report, key), ONE_PER_HOST_REASON);
+        }
+        assert!(report.sanitized.contains("OAUTH_CLIENT_SECRET=s1\n"));
+        assert!(report.sanitized.contains("OTHER_OAUTH_CLIENT_SECRET=s2\n"));
+    }
+
+    #[test]
+    fn auth_overrides_broker_a_named_header_or_a_bearer() {
+        let content = "SQUID_URL=https://squid.example\nSQUID_KEY=k1\nB2B_NOTIF_BASE_URL=https://notif.example\nB2B_NOTIF_AUTH_TOKEN=t1\n";
+        let report = scan(content);
+        assert!(report.bindings.is_empty());
+        assert!(reason(&report, "SQUID_KEY").contains("--auth"));
+
+        let overrides = ScanOverrides {
+            auth: vec![
+                ("SQUID_KEY".into(), AuthOverride::Header("app-key".into())),
+                ("B2B_NOTIF_AUTH_TOKEN".into(), AuthOverride::Bearer),
+            ],
+            ..ScanOverrides::default()
+        };
+        let report = scan_overridden(content, &overrides);
+        assert_eq!(report.bindings.len(), 2);
+        assert_eq!(
+            report.bindings[0].auth,
+            Some(ScannedAuth::ApiKeyHeader {
+                header: "app-key".into()
+            })
+        );
+        assert_eq!(report.bindings[0].host, "squid.example");
+        assert_eq!(report.bindings[1].resource, "b2b-notif");
+        assert_eq!(report.bindings[1].auth, Some(ScannedAuth::Bearer));
+        assert_eq!(credential(&report, "squid"), "k1");
+        assert!(report.unbrokered.is_empty());
+        assert!(!report.sanitized.contains("=k1\n") && !report.sanitized.contains("=t1\n"));
+    }
+
+    #[test]
+    fn a_bad_auth_override_stops_without_naming_a_value() {
+        let missing = ScanOverrides {
+            auth: vec![("NOPE_KEY".into(), AuthOverride::Bearer)],
+            ..ScanOverrides::default()
+        };
+        let err = scan_with("A=secret-a\n", 54320, &missing).err().unwrap();
+        assert!(
+            err.contains("NOPE_KEY") && !err.contains("secret-a"),
+            "{err}"
+        );
+        let no_url = ScanOverrides {
+            auth: vec![("LONE_TOKEN".into(), AuthOverride::Bearer)],
+            ..ScanOverrides::default()
+        };
+        let err = scan_with("LONE_TOKEN=secret-b\n", 54320, &no_url)
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("LONE_URL") && !err.contains("secret-b"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn placeholder_values_are_skipped_silently() {
+        let report = scan(
+            "DB_HOST=db.example\nDB_PORT=3306\nDB_PASSWORD=zs-brokered\nX_URL=https://x.example\nX_USER=u\nX_PASSWORD=zs-brokered\n",
+        );
+        assert!(report.bindings.is_empty());
+        assert!(report.credentials.is_empty());
+        assert!(report.unbrokered.is_empty());
+    }
+
+    #[test]
+    fn overrides_parse_and_refuse_bad_input() {
+        assert_eq!(
+            parse_db_override("db=MySQL").unwrap(),
+            ("DB".to_string(), "mysql".to_string())
+        );
+        assert!(parse_db_override("DB=oracle").is_err());
+        assert!(parse_db_override("=mysql").is_err());
+        assert_eq!(
+            parse_auth_override("SQUID_KEY=header:app-key").unwrap(),
+            (
+                "SQUID_KEY".to_string(),
+                AuthOverride::Header("app-key".into())
+            )
+        );
+        assert_eq!(
+            parse_auth_override("T=bearer").unwrap().1,
+            AuthOverride::Bearer
+        );
+        assert!(parse_auth_override("T=header:").is_err());
+        assert!(parse_auth_override("T=header:bad name").is_err());
+        assert!(parse_auth_override("T=basic").is_err());
+    }
+
+    #[test]
+    fn credentials_are_written_private_and_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join("home/.zs-credentials/proj");
+        let first = [ScannedCredential::new("db", "v1")];
+        write_credentials(&creds, &first).unwrap();
+        assert_eq!(fs::read_to_string(creds.join("db")).unwrap(), "v1");
+        write_credentials(&creds, &first).unwrap();
+        let other = [ScannedCredential::new("db", "v2")];
+        let err = write_credentials(&creds, &other).unwrap_err();
+        assert!(err.contains("another value") && !err.contains("v1") && !err.contains("v2"));
+        assert_eq!(fs::read_to_string(creds.join("db")).unwrap(), "v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file = fs::metadata(creds.join("db")).unwrap().permissions().mode();
+            let directory = fs::metadata(&creds).unwrap().permissions().mode();
+            assert_eq!((file & 0o777, directory & 0o777), (0o600, 0o700));
+            let target = dir.path().join("victim");
+            fs::write(&target, "KEEP").unwrap();
+            std::os::unix::fs::symlink(&target, creds.join("link")).unwrap();
+            let linked = [ScannedCredential::new("link", "v3")];
+            assert!(write_credentials(&creds, &linked).is_err());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "KEEP");
+        }
+    }
+
+    #[test]
+    fn tilde_path_names_the_home_relative_directory() {
+        assert_eq!(
+            tilde_path(Path::new("/h"), Path::new("/h/.zs-credentials/p")),
+            "~/.zs-credentials/p"
+        );
     }
 
     #[test]
@@ -932,12 +1950,11 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
 
     #[test]
     fn test_malformed_lines_stop_the_scan_without_echoing_content() {
-        let err = scan_and_sanitize("A=1\nnot a pair\n", 54320).unwrap_err();
+        let err = scan_err("A=1\nnot a pair\n", 54320);
         assert_eq!(err, "line 2: expected KEY=VALUE");
-        let err = scan_and_sanitize("=value\n", 54320).unwrap_err();
+        let err = scan_err("=value\n", 54320);
         assert_eq!(err, "line 1: expected KEY=VALUE");
-        let err = scan_and_sanitize("KEY=\"-----BEGIN KEY-----\nabc==\n-----END-----\"\n", 54320)
-            .unwrap_err();
+        let err = scan_err("KEY=\"-----BEGIN KEY-----\nabc==\n-----END-----\"\n", 54320);
         assert!(err.starts_with("line 1: multi-line"), "{err}");
         assert!(!err.contains("BEGIN"));
     }
@@ -947,11 +1964,10 @@ PG_FARM=postgres://u:pw@h1:5432,h2:5432/app\n";
         let content = "A=postgres://u:p@h1:5432/a\nB=postgres://u:p@h2:5432/b\n";
         let report = scan_and_sanitize(content, 65534).unwrap();
         assert_eq!(report.bindings[1].listen_port, Some(65535));
-        let err = scan_and_sanitize(
+        let err = scan_err(
             "A=postgres://u:p@h1/a\nB=postgres://u:p@h2/b\nC=postgres://u:p@h3/c\n",
             65534,
-        )
-        .unwrap_err();
+        );
         assert!(err.contains("65535"), "{err}");
     }
 
