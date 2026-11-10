@@ -860,6 +860,7 @@ pub fn spawn_agent_with_env<C: AsRef<std::ffi::OsStr>>(
     arguments.extend(child.iter().map(|arg| arg.as_ref().to_owned()));
     let mut cmd = Command::new(bin);
     cmd.args(&arguments)
+        .env("ZS_HOME", policy.parent().unwrap())
         .envs(env.iter().copied())
         .env("ZS_TEST_ENV_FILE", &env_file)
         .stdout(Stdio::piped())
@@ -1400,6 +1401,7 @@ pub fn spawn_agent_capturing_with_env<C: AsRef<std::ffi::OsStr>>(
             "--",
         ])
         .args(child.iter().map(|arg| arg.as_ref()))
+        .env("ZS_HOME", policy.parent().unwrap())
         .envs(env.iter().copied())
         // The Windows runner image exports PGPASSWORD; these tests prove that `zs run` does
         // not add it, not that the host has none.
