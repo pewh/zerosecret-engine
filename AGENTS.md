@@ -45,6 +45,23 @@ cargo deny check
 - Compile-fail fixtures encode source line numbers. Review `.stderr` snapshots after any line
   movement; never add a blanket preamble.
 
+### Disk
+
+`target/` grows without bound: every build variant (`-p zs` against `--workspace` feature
+unification, `ZS_BUILD_TEST_ENDPOINTS`, a toolchain update, a cross target) writes new hashed
+copies and cargo keeps the old ones, and each test executable carries full DWARF plus a packed
+`.dSYM`. A full host disk also corrupts the Docker VM, whose disk is a sparse file on the host.
+
+1. Before a large build, check `df -h` and `du -sh target`.
+2. Build with `CARGO_INCREMENTAL=0`, and set `[profile.dev] debug = "line-tables-only"` in your
+   local, git-excluded `.cargo/config.toml`; panics keep file and line.
+3. At the end of every session that built, clean up: `cargo clean` when `target/` is over 20 GB,
+   and delete every one-off target directory you created (cross builds, container builds).
+   After removing images or volumes in a Docker VM, run `fstrim` inside it so the host gets the
+   space back. Done when `target/` is under 20 GB and the host has at least 20 GB free.
+4. When a test fails with `ENOSPC`, an I/O error or a database in recovery, check the host disk
+   and the Docker VM disk before you read the test.
+
 The conformance suite (Docker and real PostgreSQL, MySQL and MongoDB) is in
 [README.md](README.md#run-the-conformance-suite). Its spec is
 [docs/specs/2026-10-26-conformance-suite.md](docs/specs/2026-10-26-conformance-suite.md).
