@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
 - A `redis` binding brokers Redis logins through `RedisListener` (ADR-0057). The agent
   authenticates upstream before it reads the client, rewrites `AUTH` and `HELLO AUTH` in place,
   and never forwards the client's password. It refuses another user's `AUTH`, a non-RESP frame,
