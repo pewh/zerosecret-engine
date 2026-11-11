@@ -85,7 +85,7 @@ fn workspace(https_mode: zs_policy::Materialization) -> tempfile::TempDir {
         r#"{{"bindings":[
             {{"resource":"stripe-production","host":"api.stripe.com","protocol":"https","auth":{{"scheme":"bearer"}}}},
             {{"resource":"analytics-db","host":"db.internal","protocol":"postgres","upstream_host":"127.0.0.1","upstream_port":5432}},
-            {{"resource":"session-cache","host":"cache.internal","protocol":"redis"}}
+            {{"resource":"session-cache","host":"cache.internal","protocol":"cassandra"}}
         ],
         "signing_keys":[{{"key_id":"test-k1","verifying_key_hex":"{verifying_hex}"}}],
         "grants":[{}, {}, {}]}}"#,
@@ -98,7 +98,7 @@ fn workspace(https_mode: zs_policy::Materialization) -> tempfile::TempDir {
         ),
         grant(
             "session-cache",
-            "redis",
+            "cassandra",
             "GET",
             zs_policy::Materialization::Exchange
         ),
@@ -191,7 +191,7 @@ fn an_unintercepted_protocol_is_not_strict() {
     assert_eq!(
         verdict_for(&out, "session-cache"),
         "not-strict",
-        "no interception layer carries redis, so it cannot be strict:\n{out}"
+        "no interception layer carries cassandra, so it cannot be strict:\n{out}"
     );
 }
 

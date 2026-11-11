@@ -200,23 +200,25 @@ impl Connection {
         if self.local_endpoint && !https {
             return Err("local_endpoint is allowed only on an https resource".to_string());
         }
-        let l3 = ["postgres", "mysql", "mongo"]
+        let l3 = ["postgres", "mysql", "mongo", "redis"]
             .iter()
             .any(|name| protocol.eq_ignore_ascii_case(name));
         match self.upstream_tls {
             UpstreamTlsMode::Default => Ok(()),
             UpstreamTlsMode::CaSha256(_) | UpstreamTlsMode::PinSha256(_) if l3 => Ok(()),
             UpstreamTlsMode::CaSha256(_) | UpstreamTlsMode::PinSha256(_) => Err(
-                "upstream_tls ca-sha256 and pin-sha256 are allowed only on postgres, mysql and mongo"
+                "upstream_tls ca-sha256 and pin-sha256 are allowed only on postgres, mysql, mongo and redis"
                     .to_string(),
             ),
             UpstreamTlsMode::Plaintext => {
                 let upstream = self.upstream_host.as_deref().unwrap_or(host);
-                if protocol.eq_ignore_ascii_case("mongo") || (https && is_loopback_host(upstream))
+                if protocol.eq_ignore_ascii_case("mongo")
+                    || protocol.eq_ignore_ascii_case("redis")
+                    || (https && is_loopback_host(upstream))
                 {
                     Ok(())
                 } else {
-                    Err("upstream_tls plaintext is allowed only on mongo, or on https with a loopback upstream_host".to_string())
+                    Err("upstream_tls plaintext is allowed only on mongo and redis, or on https with a loopback upstream_host".to_string())
                 }
             }
         }

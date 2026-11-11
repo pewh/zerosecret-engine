@@ -14,6 +14,7 @@ members = [
     "crates/zs-proto-postgres",
     "crates/zs-proto-mysql",
     "crates/zs-proto-mongo",
+    "crates/zs-proto-redis",
     "crates/zs-materializer",
     "crates/zs-audit",
     "crates/zs-mitm",
@@ -48,6 +49,7 @@ zs-wire = { path = "crates/zs-wire" }
 zs-proto-postgres = { path = "crates/zs-proto-postgres" }
 zs-proto-mysql = { path = "crates/zs-proto-mysql" }
 zs-proto-mongo = { path = "crates/zs-proto-mongo" }
+zs-proto-redis = { path = "crates/zs-proto-redis" }
 md-5 = "0.10"
 zs-upstream = { path = "crates/zs-upstream" }
 sha1 = "0.10"

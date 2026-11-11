@@ -182,7 +182,7 @@ claimed for unintercepted traffic.
 Only after v1's exit criteria are met.
 
 - Gateway: private resource connectivity, resource-side materialization
-- Database protocols for a customer's wider adoption, each with its own spec, plan and review: MySQL (ADR-0029), then MongoDB (ADR-0031), then Redis
+- Database protocols for a customer's wider adoption, each with its own spec, plan and review: MySQL (ADR-0029), then MongoDB (ADR-0031)
 - Cryptographic workload identity, replacing the declared label
 - Approvals for production operations
 - Device posture

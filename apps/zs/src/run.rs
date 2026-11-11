@@ -1130,6 +1130,53 @@ async fn start_services(
         l3.push((binding.env_prefix(), local));
     }
 
+    for binding in prepared.file.bindings.iter().filter(|b| b.is_redis()) {
+        let (upstream_host, upstream_port) = binding.upstream();
+        let endpoint = match zs_proto_redis::UpstreamEndpoint::new(upstream_host, upstream_port) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                stderr_line!(
+                    "zs: invalid redis upstream for {}: {error}",
+                    binding.resource
+                );
+                return Err(refuse_run(&prepared.diag, "redis_upstream", 1));
+            }
+        };
+        let tls = match binding.redis_tls() {
+            Ok(tls) => tls,
+            Err(error) => {
+                stderr_line!("zs: {error}");
+                return Err(refuse_run(&prepared.diag, "redis_tls", 1));
+            }
+        };
+        let audit = L3Audit::new(prepared, &binding.resource, "redis", l3_handler.clone());
+        let refusal_audit = l3_refusal_audit(audit.clone());
+        let redis = match zs_proto_redis::RedisListener::bind_endpoint(
+            &binding.listen_addr(),
+            endpoint,
+            tls,
+            binding.redis_auth(),
+            l3_materialize(audit),
+        )
+        .await
+        {
+            Ok(listener) => listener
+                .with_diag(prepared.diag.clone(), &binding.resource)
+                .with_refusal_audit(refusal_audit)
+                .with_caller_check(crate::peer::caller_check()),
+            Err(e) => {
+                stderr_line!("zs: redis listener for {}: {e}", binding.resource);
+                return Err(refuse_run(&prepared.diag, "redis_bind", 1));
+            }
+        };
+        let local = redis.local_addr();
+        announce_l3(prepared, "redis", &binding.resource, local);
+        tasks.push(tokio::spawn(async move {
+            let _ = redis.serve().await;
+        }));
+        l3.push((binding.env_prefix(), local));
+    }
+
     let mut endpoints = Vec::new();
     for binding in prepared.file.bindings.iter().filter(|b| b.local_endpoint) {
         let endpoint = match zs_mitm::EndpointServer::bind(

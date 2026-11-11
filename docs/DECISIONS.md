@@ -7,6 +7,91 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0058 — Redis broker: an upstream with no password, empty lines, refusal delivery
+
+**2026-11-11 · Accepted** · spec `docs/specs/2026-11-11-redis-broker-amendments.md`, owner choice
+2026-11-11 (opt-in per binding) · amends ADR-0057 R1, R2 and R4
+
+A development Redis often has no password while staging and production have one, and R1 refused
+the open one, so one application configuration could not go through the agent in both places.
+R1 also served an open Redis when the binding named `user: "default"`, because such a server
+accepts `AUTH default <anything>`.
+
+**Decision.**
+- **One-argument AUTH for `default` (O1).** For a binding without `user`, or with
+  `user: "default"`, the agent sends `AUTH <credential>`. An open Redis answers it with a fixed
+  text (Redis 6+: `called without any password configured for the default user`; Redis 5 and
+  earlier: `Client sent AUTH, but no password is set`).
+- **Opt-in (O2, O3).** A `redis` binding with `upstream_auth_optional: true` serves that answer:
+  diag `upstream_auth_not_required`, the grant and the `connect` record unchanged. Without it the
+  answer is refused as before (SECURITY §7 row 122).
+- **Nothing else (O4, O5).** Every other error, `WRONGPASS` included, is refused. The field is a
+  local binding field, allowed only on `redis`.
+- **Relay (E1-E3).** A bare `\r\n` between client frames is skipped, as Redis does. A refused
+  client frame waits up to 2 s for the replies to frames already forwarded, so replies keep
+  pipeline order. After a fixed error the agent half-closes and drains the client for up to 2 s
+  and 64 MiB, so a client still writing reads the error instead of a reset.
+
+**Consequence.** One binding works against a development Redis without a password and a
+production Redis with one. The credential is still materialized and sent first, so a credential
+source is still required; it reaches only the signed host. An operator who removes the password
+from a production Redis still sees refusals unless the binding opted in.
+
+**Reverse it if** a supported server answers an open `AUTH` with another text, or the owner
+wants an open upstream served without a credential source. Then a new spec replaces O1-O2.
+
+---
+
+## ADR-0057 — Redis broker
+
+**2026-11-11 · Accepted** · spec `docs/specs/2026-11-10-redis-broker.md`, accepted by the owner
+2026-11-11
+
+An application that talks to Redis holds the Redis password in its environment. The agent brokers
+PostgreSQL, MySQL and MongoDB logins, but not Redis, so that password stays in `.env`. A Go service
+on `go-redis` v9 against a managed single-node Redis is the first user. The
+[spec](specs/2026-11-10-redis-broker.md) fixes R1-R9, the fixed client errors and the non-goals.
+
+**Decision.**
+- **Listener.** `zs-proto-redis` adds `RedisListener`, a plaintext loopback listener per `redis`
+  binding on `127.0.0.1`, with `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT` and default port
+  6379 (L3, as the other database protocols).
+- **Upstream first (R1).** The agent opens the upstream connection (TCP, then TLS per the
+  binding), sends `AUTH [<user>] <credential>` and reads no client byte until `+OK`. An error
+  answers the client with the fixed text and closes. The step is bounded by a 15 s handshake
+  budget; a timeout answers the upstream-unavailable text and audits `deny` `connect`, reason
+  `handshake timed out`.
+- **Rewrite (R2).** Every `AUTH` frame, and the `AUTH` arguments of `HELLO`, are rewritten in
+  place to the binding user and the credential. The client's password is discarded unread and
+  never forwarded. A `HELLO` with a second `AUTH` clause is refused, because the server applies
+  the last clause and the agent checked only the first. A one-argument `AUTH` carries no
+  password and is forwarded; an `AUTH` with four or more arguments is refused.
+- **User (R3).** Only the binding `user`, or `default` when the binding names no user, is
+  accepted. Any other name in `AUTH` or `HELLO AUTH` is refused and never reaches the upstream.
+- **Framing (R4).** A frame that is not a RESP array of bulk strings is refused: an inline
+  command, a RESP3 attribute, a non-bulk element or an oversized frame.
+- **No echo (R5).** The agent scans upstream bytes before it writes them. An 8-byte window of
+  the credential (the whole credential when it is shorter) closes the connection before those
+  bytes reach the client.
+- **No cluster (R6).** A top-level `-MOVED` or `-ASK` reply closes the connection: cluster
+  redirects name nodes the agent does not broker.
+- **TLS (R7).** Client TLS to the listener is refused. Upstream TLS is verified by default,
+  `ca-sha256` and `pin-sha256` are allowed, and plaintext only with `upstream_plaintext: true`.
+- **Everything else (R8).** Every other command is relayed unchanged, including `SELECT`,
+  `CLIENT SETINFO`, `MULTI`, scripts and pub/sub.
+- **Grant (R9).** A `redis` grant carries the operation `connect`; one `connect` record is
+  written per admitted connection, and each refusal is audited with a fixed reason.
+
+**Consequence.** Redis joins PostgreSQL, MySQL and MongoDB on the L3 path, and a client points at
+the binding's loopback port with no password. Each refusal is a row in
+[SECURITY.md §7](SECURITY.md#7-fail-closed-matrix), and the spec's non-goals stay limits.
+
+**Reverse it if** a supported client cannot be served without a password frame the agent cannot
+rewrite, or the first user needs Cluster or client TLS to the listener. Then a new spec replaces
+R2, R6 or R7.
+
+---
+
 ## ADR-0056 — Binary releases (lifts ADR-0045 D6)
 
 **2026-11-08 · Accepted** · owner request 2026-11-08 (DS1 of the distribution spec) · supersedes

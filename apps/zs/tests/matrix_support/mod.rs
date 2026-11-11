@@ -57,6 +57,7 @@ pub fn binding() -> ResourceBinding {
         upstream_host: None,
         upstream_port: None,
         upstream_plaintext: false,
+        upstream_auth_optional: false,
         listen_port: None,
         local_endpoint: false,
         operations: Vec::new(),
@@ -472,7 +473,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly one hundred and fifteen.
+/// exactly one hundred and twenty-two.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -496,8 +497,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        116,
-        "SECURITY §7 must have one hundred and sixteen rows; found {}:\n{}",
+        122,
+        "SECURITY §7 must have one hundred and twenty-two rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

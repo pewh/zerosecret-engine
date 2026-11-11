@@ -14,6 +14,7 @@ pub enum Protocol {
     Mysql,
     Mongodb,
     Http,
+    Redis,
 }
 
 impl Protocol {
@@ -23,6 +24,7 @@ impl Protocol {
             Protocol::Mysql => "mysql",
             Protocol::Mongodb => "mongodb",
             Protocol::Http => "http",
+            Protocol::Redis => "redis",
         }
     }
 }
@@ -52,6 +54,8 @@ pub struct Fixtures {
     pub postgres_tls: Option<SocketAddr>,
     pub mysql: Option<SocketAddr>,
     pub mongodb: Option<SocketAddr>,
+    pub redis: Option<SocketAddr>,
+    pub redis_tls: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -107,6 +111,8 @@ struct RawFixtures {
     postgres_tls: Option<String>,
     mysql: Option<String>,
     mongodb: Option<String>,
+    redis: Option<String>,
+    redis_tls: Option<String>,
 }
 
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -129,6 +135,8 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             postgres_tls: address("postgres_tls", &raw.fixtures.postgres_tls)?,
             mysql: address("mysql", &raw.fixtures.mysql)?,
             mongodb: address("mongodb", &raw.fixtures.mongodb)?,
+            redis: address("redis", &raw.fixtures.redis)?,
+            redis_tls: address("redis_tls", &raw.fixtures.redis_tls)?,
         },
     })
 }

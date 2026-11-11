@@ -57,7 +57,7 @@
       "input": "{\"version\":1,\"resources\":[{\"name\":\"api\",\"host\":\"api.example.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"connection\":{\"upstream_tls\":\"plaintext\"}}],\"grants\":[]}",
       "expect": {
         "accepted": false,
-        "error": "resource api: upstream_tls plaintext is allowed only on mongo, or on https with a loopback upstream_host"
+        "error": "resource api: upstream_tls plaintext is allowed only on mongo and redis, or on https with a loopback upstream_host"
       }
     },
     {
@@ -65,7 +65,7 @@
       "input": "{\"version\":1,\"resources\":[{\"name\":\"api\",\"host\":\"api.example.com\",\"protocol\":\"https\",\"operations\":[\"GET\"],\"connection\":{\"upstream_tls\":\"ca-sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"}}],\"grants\":[]}",
       "expect": {
         "accepted": false,
-        "error": "resource api: upstream_tls ca-sha256 and pin-sha256 are allowed only on postgres, mysql and mongo"
+        "error": "resource api: upstream_tls ca-sha256 and pin-sha256 are allowed only on postgres, mysql, mongo and redis"
       }
     },
     {

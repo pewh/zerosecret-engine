@@ -89,6 +89,14 @@ fn provision_uncached(protocol: Protocol, fixture: SocketAddr) -> Result<Roles, 
         Protocol::Http => Err(ProvisionError::Failed(
             "the http protocol has no fixture roles".to_string(),
         )),
+        Protocol::Redis => {
+            let (user, password) = administrator(Protocol::Redis)?;
+            Ok(Roles {
+                user,
+                password,
+                database: String::new(),
+            })
+        }
     }
 }
 
@@ -255,6 +263,7 @@ fn administrator(protocol: Protocol) -> Result<(String, String), ProvisionError>
         Protocol::Mysql => ("ZS_CONFORMANCE_MYSQL_ADMIN", "root", "zs-test-root"),
         Protocol::Mongodb => ("ZS_CONFORMANCE_MONGO_ADMIN", "root", "zs-test-root"),
         Protocol::Http => ("ZS_CONFORMANCE_HTTP_ADMIN", "none", "none"),
+        Protocol::Redis => ("ZS_CONFORMANCE_REDIS_ADMIN", "default", "zs-test-redis"),
     };
     match std::env::var(variable) {
         Ok(value) => match value.split_once(':') {
@@ -274,6 +283,7 @@ pub(crate) fn compose_command(protocol: Protocol) -> &'static str {
         Protocol::Mysql => "docker compose --profile mysql up -d mysql",
         Protocol::Mongodb => "docker compose --profile mongo up -d mongo",
         Protocol::Http => "no fixture: the suite serves its own http upstream",
+        Protocol::Redis => "docker compose --profile redis up -d redis",
     }
 }
 

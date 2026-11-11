@@ -19,6 +19,7 @@ zs-proto-http.workspace = true
 zs-proto-postgres.workspace = true
 zs-proto-mysql.workspace = true
 zs-proto-mongo.workspace = true
+zs-proto-redis.workspace = true
 zs-upstream = { workspace = true, features = ["reqwest"] }
 rustls-pki-types.workspace = true
 zs-wire.workspace = true

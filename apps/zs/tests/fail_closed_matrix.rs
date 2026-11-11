@@ -23,6 +23,9 @@ mod pg_fake;
 #[path = "../../../crates/zs-proto-mongo/tests/fake/mod.rs"]
 mod mongo_fake;
 
+#[path = "../../../crates/zs-proto-redis/tests/fake/mod.rs"]
+mod redis_fake;
+
 use zs_proto_mysql::packet;
 use zs_proto_mysql::{
     CHANGE_USER_REFUSED, CLIENT_REFUSED, METHOD_REFUSED, TLS_REFUSED, UpstreamTls,
@@ -1641,6 +1644,467 @@ async fn row_32_a_mongo_redirect_outside_the_seed_hosts_is_refused() {
             set.sasl_total(),
             0,
             "row 32: authenticated after a refused discovery"
+        );
+    }
+}
+
+async fn redis_listen(
+    fake: &redis_fake::Fake,
+    diag: zs_diag::DiagLog,
+    audit: Option<zs_proto_redis::AuditRefusal>,
+) -> std::net::SocketAddr {
+    redis_fake::listen(
+        fake.addr,
+        None,
+        redis_fake::auth(),
+        redis_fake::materialize(redis_fake::PASSWORD),
+        diag,
+        audit,
+    )
+    .await
+}
+
+fn redis_args(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+    parts.iter().map(|part| part.to_vec()).collect()
+}
+
+fn redis_refused<'a>(events: &'a [serde_json::Value], reason: &str) -> Vec<&'a serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event["event"] == "client_refused"
+                && event["component"] == "redis"
+                && event["fields"]["reason"] == reason
+        })
+        .collect()
+}
+
+fn has_window(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let width = needle.len().min(8);
+    needle
+        .windows(width)
+        .any(|window| haystack.windows(width).any(|candidate| candidate == window))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_117_a_redis_upstream_auth_refusal_is_reported_and_never_authenticated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, diag) = redis_fake::diag_log(dir.path());
+
+    let accepting = redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await;
+    let local = redis_listen(&accepting, diag.clone(), None).await;
+    let mut control = redis_fake::logged_in(local).await;
+    assert_eq!(control.command(&[b"GET", b"k"]).await, redis_fake::OK);
+    assert!(
+        accepting.authenticated(),
+        "row 117 positive control: the upstream accepted the broker's AUTH"
+    );
+
+    let refusing = redis_fake::start(redis_fake::Script::refusing_auth()).await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_listen(&refusing, diag.clone(), Some(audit)).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    let reply = client.read_reply().await;
+    assert_eq!(
+        redis_fake::error_text(&reply),
+        zs_proto_redis::UPSTREAM_AUTH_FAILED.message,
+        "row 117: the fixed text"
+    );
+    assert_eq!(
+        reply,
+        zs_proto_redis::UPSTREAM_AUTH_FAILED.frame(),
+        "row 117: the reply carries no argument"
+    );
+    assert!(client.closed().await, "row 117: the connection closes");
+    assert!(
+        !refusing.authenticated(),
+        "row 117: the fake accepted the login"
+    );
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_redis::UPSTREAM_AUTH_REFUSED_REASON)],
+        "row 117: not audited"
+    );
+
+    let (log, events) = redis_fake::read_diag(&path, diag).await;
+    let refused = redis_refused(&events, "upstream_auth");
+    assert_eq!(refused.len(), 1, "{log}");
+    assert_eq!(refused[0]["audit_seq"], 7, "{log}");
+    let conn = refused[0]["conn"].as_u64().unwrap();
+    assert!(
+        redis_fake::in_conn(&events, "upstream_auth_ok", conn).is_empty(),
+        "row 117: the refused connection authenticated upstream: {log}"
+    );
+    let authenticated: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "upstream_auth_ok" && event["component"] == "redis")
+        .collect();
+    assert_eq!(
+        authenticated.len(),
+        1,
+        "row 117 positive control: the accepted connection emitted upstream_auth_ok: {log}"
+    );
+    assert_ne!(authenticated[0]["conn"], refused[0]["conn"], "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_118_a_redis_auth_for_another_user_is_refused_and_never_forwarded() {
+    let fake = redis_fake::start(redis_fake::Script::new()).await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let dir = tempfile::tempdir().unwrap();
+    let (path, diag) = redis_fake::diag_log(dir.path());
+    let local = redis_listen(&fake, diag.clone(), Some(audit)).await;
+
+    let mut control = redis_fake::logged_in(local).await;
+    assert_eq!(control.command(&[b"PING"]).await, redis_fake::OK);
+    let auths = fake.auths();
+    assert_eq!(
+        auths.len(),
+        1,
+        "row 118 positive control: one AUTH, the agent's own"
+    );
+    assert_eq!(
+        auths[0],
+        redis_args(&[
+            b"AUTH",
+            redis_fake::USER.as_bytes(),
+            redis_fake::PASSWORD.as_bytes()
+        ]),
+        "row 118 positive control: the agent's own AUTH"
+    );
+
+    for frame in [
+        vec![
+            b"AUTH".as_slice(),
+            b"mallory".as_slice(),
+            redis_fake::CLIENT_PASSWORD.as_bytes(),
+        ],
+        vec![
+            b"HELLO".as_slice(),
+            b"3".as_slice(),
+            b"AUTH".as_slice(),
+            b"mallory".as_slice(),
+            redis_fake::CLIENT_PASSWORD.as_bytes(),
+        ],
+        vec![
+            b"HELLO".as_slice(),
+            b"3".as_slice(),
+            b"AUTH".as_slice(),
+            redis_fake::USER.as_bytes(),
+            redis_fake::PASSWORD.as_bytes(),
+            b"AUTH".as_slice(),
+            b"mallory".as_slice(),
+            redis_fake::CLIENT_PASSWORD.as_bytes(),
+        ],
+    ] {
+        let before = fake.auths().len();
+        let mut client = redis_fake::Client::connect(local).await;
+        assert_eq!(
+            client.command(&frame).await,
+            zs_proto_redis::USER_MISMATCH.frame(),
+            "row 118: the fixed text"
+        );
+        assert!(client.closed().await, "row 118: the connection closes");
+        let auths = fake.auths();
+        assert_eq!(
+            auths.len(),
+            before + 1,
+            "row 118: one more AUTH reached the upstream"
+        );
+        assert_eq!(
+            auths[before],
+            redis_args(&[
+                b"AUTH",
+                redis_fake::USER.as_bytes(),
+                redis_fake::PASSWORD.as_bytes()
+            ]),
+            "row 118: the only new AUTH is the agent's own"
+        );
+        assert!(
+            !fake.saw_bytes(b"mallory"),
+            "row 118: the refused user reached the upstream"
+        );
+        assert!(
+            !fake.saw_bytes(redis_fake::CLIENT_PASSWORD.as_bytes()),
+            "row 118: the client password reached the upstream"
+        );
+    }
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_redis::USER_MISMATCH_REASON); 3],
+        "row 118: not audited"
+    );
+
+    let (log, events) = redis_fake::read_diag(&path, diag).await;
+    let refused = redis_refused(&events, "user_mismatch");
+    assert_eq!(refused.len(), 3, "{log}");
+    for event in refused {
+        assert_eq!(event["audit_seq"], 7, "{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_119_a_redis_non_resp_frame_is_refused_and_never_forwarded() {
+    let fake = redis_fake::start(redis_fake::Script::new()).await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let dir = tempfile::tempdir().unwrap();
+    let (path, diag) = redis_fake::diag_log(dir.path());
+    let local = redis_listen(&fake, diag.clone(), Some(audit)).await;
+
+    let mut control = redis_fake::logged_in(local).await;
+    assert_eq!(control.command(&[b"GET", b"k"]).await, redis_fake::OK);
+    let forwarded = fake.commands();
+    assert_eq!(
+        forwarded,
+        vec![redis_args(&[b"PING"]), redis_args(&[b"GET", b"k"])],
+        "row 119 positive control: the PING and the GET are relayed"
+    );
+
+    for frame in [
+        b"AUTH client-password\r\n".to_vec(),
+        b"|1\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+    ] {
+        let before = fake.frames().len();
+        let mut client = redis_fake::Client::connect(local).await;
+        client.send(&frame).await.unwrap();
+        assert_eq!(
+            client.read_reply().await,
+            zs_proto_redis::NON_RESP.frame(),
+            "row 119: the fixed text"
+        );
+        assert!(client.closed().await, "row 119: the connection closes");
+        assert_eq!(
+            fake.frames().len(),
+            before + 1,
+            "row 119: only the agent's own AUTH reached the upstream"
+        );
+        assert_eq!(
+            fake.commands(),
+            forwarded,
+            "row 119: a refused frame reached the upstream"
+        );
+        assert!(
+            !fake.saw_bytes(b"client-password"),
+            "row 119: the inline password reached the upstream"
+        );
+    }
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_redis::NON_RESP_REFUSED_REASON); 2],
+        "row 119: not audited"
+    );
+
+    let (log, events) = redis_fake::read_diag(&path, diag).await;
+    let refused = redis_refused(&events, "non_resp");
+    assert_eq!(refused.len(), 2, "{log}");
+    for event in refused {
+        assert_eq!(event["audit_seq"], 7, "{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_120_a_redis_reply_window_of_the_credential_closes_before_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, diag) = redis_fake::diag_log(dir.path());
+    let password = redis_fake::PASSWORD.as_bytes();
+    assert!(
+        has_window(password, password),
+        "row 120: the window check can match"
+    );
+    assert!(
+        !has_window(b"+OK\r\n", password),
+        "row 120: a clean reply has no window"
+    );
+    assert!(
+        has_window(&redis_fake::echo_reply(password), password),
+        "row 120: the fake's scripted reply carries the window, so the refusal is not vacuous"
+    );
+
+    let accepting = redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await;
+    let local = redis_listen(&accepting, diag.clone(), None).await;
+    let mut control = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        control.command(&[b"GET", b"k"]).await,
+        redis_fake::OK,
+        "row 120 positive control: a clean reply is relayed"
+    );
+    assert_eq!(
+        accepting.commands(),
+        vec![redis_args(&[b"GET", b"k"])],
+        "row 120 positive control: the command reached the upstream"
+    );
+
+    let (audit, refusals) = redis_fake::audit_recorder();
+    for script in [
+        redis_fake::Script::echoing(redis_fake::PASSWORD),
+        redis_fake::Script::echoing_split(redis_fake::PASSWORD, 3),
+    ] {
+        let fake = redis_fake::start(script).await;
+        let local = redis_listen(&fake, diag.clone(), Some(audit.clone())).await;
+        let mut client = redis_fake::Client::connect(local).await;
+        client.send_command(&[b"GET", b"secret"]).await.unwrap();
+        assert!(
+            redis_fake::eventually(|| fake.seen(|seen| seen.names.len() == 2)).await,
+            "row 120 positive control: the command reached the upstream"
+        );
+        let received = client.read_to_end().await;
+        assert!(
+            !has_window(&received, password),
+            "row 120: a credential window reached the client"
+        );
+        assert!(client.closed().await, "row 120: the connection closes");
+    }
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_redis::CREDENTIAL_ECHO_REASON); 2],
+        "row 120: not audited"
+    );
+
+    let (log, events) = redis_fake::read_diag(&path, diag).await;
+    let refused = redis_refused(&events, "credential_echo");
+    assert_eq!(refused.len(), 2, "{log}");
+    for event in refused {
+        assert_eq!(event["audit_seq"], 7, "{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_121_a_redis_cluster_redirect_is_refused_and_a_nested_one_is_relayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, diag) = redis_fake::diag_log(dir.path());
+
+    let nested =
+        redis_fake::start(redis_fake::Script::nested_moved(redis_fake::MOVED_TARGET)).await;
+    let local = redis_listen(&nested, diag.clone(), None).await;
+    let mut control = redis_fake::Client::connect(local).await;
+    let array = format!("*1\r\n-MOVED {}\r\n", redis_fake::MOVED_TARGET).into_bytes();
+    assert_eq!(
+        control.command(&[b"GET", b"k"]).await,
+        array,
+        "row 121 positive control: a nested redirect is relayed unchanged"
+    );
+    assert_eq!(
+        control.command(&[b"PING"]).await,
+        redis_fake::OK,
+        "row 121 positive control: the connection stays open"
+    );
+
+    let moved = redis_fake::start(redis_fake::Script::top_level_moved(
+        redis_fake::MOVED_TARGET,
+    ))
+    .await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_listen(&moved, diag.clone(), Some(audit.clone())).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        client.command(&[b"GET", b"k"]).await,
+        zs_proto_redis::CLUSTER_REDIRECT.frame(),
+        "row 121: the fixed text"
+    );
+    assert!(client.closed().await, "row 121: the connection closes");
+    assert!(
+        client.read_to_end().await.is_empty(),
+        "row 121: nothing follows the fixed text"
+    );
+
+    let ask = redis_fake::start(
+        redis_fake::Script::new().with_reply(b"-ASK 10.255.0.8:6379\r\n".to_vec()),
+    )
+    .await;
+    let local = redis_listen(&ask, diag.clone(), Some(audit)).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        client.command(&[b"GET", b"k"]).await,
+        zs_proto_redis::CLUSTER_REDIRECT.frame(),
+        "row 121: -ASK uses the same fixed text"
+    );
+    assert!(client.closed().await, "row 121: the connection closes");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", zs_proto_redis::CLUSTER_REDIRECT_REASON); 2],
+        "row 121: not audited"
+    );
+
+    let (log, events) = redis_fake::read_diag(&path, diag).await;
+    let refused = redis_refused(&events, "cluster_redirect");
+    assert_eq!(refused.len(), 2, "{log}");
+    for event in refused {
+        assert_eq!(event["audit_seq"], 7, "{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_122_a_redis_upstream_with_no_password_is_refused_without_the_opt_in() {
+    let open = redis_fake::start(redis_fake::Script::open()).await;
+    let opted_in = redis_fake::listen(
+        open.addr,
+        None,
+        zs_proto_redis::Auth::new(None).with_upstream_optional(true),
+        redis_fake::materialize(redis_fake::PASSWORD),
+        zs_diag::DiagLog::disabled(),
+        None,
+    )
+    .await;
+    let mut control = redis_fake::Client::connect(opted_in).await;
+    assert_eq!(
+        control.command(&[b"GET", b"k"]).await,
+        redis_fake::OK,
+        "row 122 positive control: with upstream_auth_optional the open upstream serves"
+    );
+
+    for auth in [
+        zs_proto_redis::Auth::new(None),
+        zs_proto_redis::Auth::new(Some("default".to_string())),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, diag) = redis_fake::diag_log(dir.path());
+        let open = redis_fake::start(redis_fake::Script::open()).await;
+        let (audit, refusals) = redis_fake::audit_recorder();
+        let local = redis_fake::listen(
+            open.addr,
+            None,
+            auth.clone(),
+            redis_fake::materialize(redis_fake::PASSWORD),
+            diag.clone(),
+            Some(audit),
+        )
+        .await;
+        let mut client = redis_fake::Client::connect(local).await;
+        assert_eq!(
+            client.read_reply().await,
+            zs_proto_redis::UPSTREAM_AUTH_FAILED.frame(),
+            "row 122: the fixed text ({auth:?})"
+        );
+        assert!(client.closed().await, "row 122: the connection closes");
+        assert_eq!(
+            open.names(),
+            vec!["AUTH"],
+            "row 122: no client command reached the open upstream ({auth:?})"
+        );
+        assert_eq!(
+            *refusals.lock().unwrap(),
+            vec![("connect", zs_proto_redis::UPSTREAM_AUTH_REFUSED_REASON)],
+            "row 122: not audited ({auth:?})"
+        );
+        let (log, events) = redis_fake::read_diag(&path, diag).await;
+        assert_eq!(redis_refused(&events, "upstream_auth").len(), 1, "{log}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "upstream_auth_ok"
+                    || event["event"] == "upstream_auth_not_required"),
+            "row 122: {log}"
         );
     }
 }

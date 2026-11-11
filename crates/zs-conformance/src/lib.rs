@@ -16,6 +16,7 @@ pub fn registry() -> Vec<Case> {
     cases.extend(cases::mysql::cases());
     cases.extend(cases::mongodb::cases());
     cases.extend(cases::sigv4::cases());
+    cases.extend(cases::redis::cases());
     cases
 }
 

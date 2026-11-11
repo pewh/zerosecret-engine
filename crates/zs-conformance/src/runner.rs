@@ -103,20 +103,23 @@ pub fn report_path() -> PathBuf {
 fn execute(case: &Case, config: &Config, roles: &Roles, fixture: SocketAddr) -> CaseReport {
     let positive = run_variant(case, config, roles, fixture, Variant::Positive, None);
     let wrong_password = run_variant(case, config, roles, fixture, Variant::WrongPassword, None);
-    let wrong_ca = match wrong_ca_fixture(case, config, fixture) {
-        Ok(target) => run_variant(case, config, roles, target, Variant::WrongCa, None),
-        Err(outcome) => outcome,
-    };
+    let mut controls = vec![("wrongpass", wrong_password)];
+    if has_tls_identity(case) {
+        let wrong_ca = match wrong_ca_fixture(case, config, fixture) {
+            Ok(target) => run_variant(case, config, roles, target, Variant::WrongCa, None),
+            Err(outcome) => outcome,
+        };
+        controls.push(("wrongca", wrong_ca));
+    }
     let mut secrets = vec![roles.password.clone()];
     if let Some(credential) = case.credential {
         secrets.push(credential.to_string());
     }
-    assemble(
-        case,
-        positive,
-        vec![("wrongpass", wrong_password), ("wrongca", wrong_ca)],
-        &secrets,
-    )
+    assemble(case, positive, controls, &secrets)
+}
+
+fn has_tls_identity(case: &Case) -> bool {
+    case.protocol != Protocol::Redis || case.upstream == Upstream::Tls
 }
 
 fn execute_http(case: &Case, config: &Config) -> CaseReport {
@@ -250,7 +253,7 @@ fn run_variant(
         Err(reason) => return (Outcome::Fail(reason.clone()), reason),
     };
     let (upstream_ca, upstream_tls) = match tls {
-        Some(tls) => (Some(tls.ca), Some(tls.mode)),
+        Some(tls) => (tls.ca, Some(tls.mode)),
         None => (None, None),
     };
     let auth = match case.protocol {
@@ -404,6 +407,8 @@ fn fixture_for(case: &Case, config: &Config) -> Option<SocketAddr> {
         (Protocol::Mysql, _) => config.fixtures.mysql,
         (Protocol::Mongodb, _) => config.fixtures.mongodb,
         (Protocol::Http, _) => None,
+        (Protocol::Redis, Upstream::Tls) => config.fixtures.redis_tls,
+        (Protocol::Redis, Upstream::Primary) => config.fixtures.redis,
     }
 }
 
@@ -426,6 +431,7 @@ fn unreachable_fixture(case: &Case, fixture: SocketAddr) -> String {
 fn compose_command(case: &Case) -> &'static str {
     match (case.protocol, case.upstream) {
         (Protocol::Postgres, Upstream::Tls) => "docker compose --profile pgtls up -d postgres-tls",
+        (Protocol::Redis, Upstream::Tls) => "docker compose --profile redis up -d redis-tls",
         (protocol, _) => provision::compose_command(protocol),
     }
 }
@@ -440,12 +446,17 @@ fn skipped(case: &Case, reason: String) -> CaseReport {
 }
 
 struct TlsSetup {
-    ca: PathBuf,
+    ca: Option<PathBuf>,
     mode: String,
 }
 
 fn tls_setup(case: &Case, variant: Variant) -> Result<Option<TlsSetup>, String> {
-    let path = if variant == Variant::WrongCa {
+    let path = if !has_tls_identity(case) {
+        return Ok(Some(TlsSetup {
+            ca: None,
+            mode: "plaintext".to_string(),
+        }));
+    } else if variant == Variant::WrongCa {
         wrongca::wrong_ca().map_err(|error| format!("cannot write the wrong CA: {error}"))?
     } else if case.upstream == Upstream::Tls
         || matches!(case.protocol, Protocol::Mysql | Protocol::Mongodb)
@@ -456,12 +467,12 @@ fn tls_setup(case: &Case, variant: Variant) -> Result<Option<TlsSetup>, String> 
     };
     let pin = ca_pin(&path)?;
     Ok(Some(TlsSetup {
-        ca: path,
+        ca: Some(path),
         mode: format!("ca-sha256:{pin}"),
     }))
 }
 
-fn fixture_ca() -> PathBuf {
+pub(crate) fn fixture_ca() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/db-test-certs/ca.pem")
 }
 
@@ -569,13 +580,20 @@ mod tests {
             implementation: crate::Implementation {
                 name: "stub".to_string(),
                 adapter: fixture("stub-adapter.sh"),
-                capabilities: vec![Protocol::Postgres, Protocol::Mysql, Protocol::Mongodb],
+                capabilities: vec![
+                    Protocol::Postgres,
+                    Protocol::Mysql,
+                    Protocol::Mongodb,
+                    Protocol::Redis,
+                ],
             },
             fixtures: Fixtures {
                 postgres: Some("127.0.0.1:5434".parse().expect("postgres")),
                 postgres_tls: Some("127.0.0.1:5435".parse().expect("postgres tls")),
                 mysql: Some("127.0.0.1:3307".parse().expect("mysql")),
                 mongodb: Some("127.0.0.1:27018".parse().expect("mongodb")),
+                redis: Some("127.0.0.1:6380".parse().expect("redis")),
+                redis_tls: Some("127.0.0.1:6382".parse().expect("redis tls")),
             },
         }
     }
@@ -778,5 +796,58 @@ mod tests {
         let secret = SEEN.lock().expect("seen").clone().expect("secret");
         assert!(!report.evidence.contains(&secret));
         assert!(report.evidence.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn a_plaintext_redis_binding_has_no_ca_and_a_tls_one_is_pinned() {
+        let mut plaintext = case("X-14", accepts);
+        plaintext.protocol = Protocol::Redis;
+        let setup = tls_setup(&plaintext, Variant::Positive)
+            .expect("tls setup")
+            .expect("a plaintext mode");
+        assert_eq!(setup.mode, "plaintext");
+        assert!(setup.ca.is_none());
+        let mut tls = plaintext;
+        tls.upstream = Upstream::Tls;
+        if !fixture_ca().exists() {
+            return;
+        }
+        let setup = tls_setup(&tls, Variant::Positive)
+            .expect("tls setup")
+            .expect("a pinned mode");
+        assert!(setup.mode.starts_with("ca-sha256:"), "{}", setup.mode);
+        assert_eq!(setup.ca, Some(fixture_ca()));
+    }
+
+    #[test]
+    fn a_plaintext_redis_case_carries_only_the_wrongpass_control() {
+        let _lock = crate::test_lock::lock();
+        if !crate::test_fixtures::ready(&["127.0.0.1:6380", "127.0.0.1:6382"], &[&fixture_ca()]) {
+            return;
+        }
+        let mut plaintext = case("X-15", accepts);
+        plaintext.protocol = Protocol::Redis;
+        let report = run_case(&plaintext, &config());
+        let names: Vec<&str> = report
+            .controls
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["X-15-wrongpass"]);
+        let mut tls = case("X-16", accepts);
+        tls.protocol = Protocol::Redis;
+        tls.upstream = Upstream::Tls;
+        let report = run_case(&tls, &config());
+        let names: Vec<&str> = report
+            .controls
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["X-16-wrongpass", "X-16-wrongca"]);
+        assert!(
+            matches!(report.outcome, Outcome::Pass),
+            "{:?}",
+            report.outcome
+        );
     }
 }

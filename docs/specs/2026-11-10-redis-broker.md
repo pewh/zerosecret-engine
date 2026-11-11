@@ -1,6 +1,6 @@
 # Redis broker
 
-Status: proposed 2026-11-10, awaiting owner acceptance.
+Status: accepted 2026-11-11.
 
 ## Problem
 

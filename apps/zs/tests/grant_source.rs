@@ -61,6 +61,7 @@ fn binding() -> ResourceBinding {
         upstream_host: None,
         upstream_port: None,
         upstream_plaintext: false,
+        upstream_auth_optional: false,
         listen_port: None,
         local_endpoint: false,
         operations: Vec::new(),

@@ -156,7 +156,7 @@ fn validate_applies_the_agent_rules() {
     let ca = UpstreamTlsMode::CaSha256(bytes());
     let pin = UpstreamTlsMode::PinSha256(bytes());
 
-    for protocol in ["postgres", "mysql", "mongo"] {
+    for protocol in ["postgres", "mysql", "mongo", "redis"] {
         assert!(
             with_tls(ca).validate("db.x", protocol).is_ok(),
             "ca {protocol}"
@@ -176,11 +176,13 @@ fn validate_applies_the_agent_rules() {
     }
 
     let plain = UpstreamTlsMode::Plaintext;
-    assert!(
-        with_tls(plain)
-            .validate("mongo.example.com", "mongo")
-            .is_ok()
-    );
+    for protocol in ["mongo.example.com: mongo", "redis.example.com: redis"] {
+        let (host, protocol) = protocol.split_once(": ").unwrap();
+        assert!(
+            with_tls(plain).validate(host, protocol).is_ok(),
+            "{protocol}"
+        );
+    }
     for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
         assert!(
             with_host(Some(host), plain)
@@ -196,7 +198,7 @@ fn validate_applies_the_agent_rules() {
             .unwrap_err();
         assert_eq!(
             err,
-            "upstream_tls plaintext is allowed only on mongo, or on https with a loopback upstream_host"
+            "upstream_tls plaintext is allowed only on mongo and redis, or on https with a loopback upstream_host"
         );
     }
     assert!(
@@ -216,7 +218,7 @@ fn validate_applies_the_agent_rules() {
         ..Connection::default()
     };
     assert!(local.validate("api.x", "https").is_ok());
-    for protocol in ["http", "postgres", "mysql", "mongo"] {
+    for protocol in ["http", "postgres", "mysql", "mongo", "redis"] {
         let err = local.validate("db.x", protocol).unwrap_err();
         assert!(err.contains("local_endpoint"), "{err}");
     }

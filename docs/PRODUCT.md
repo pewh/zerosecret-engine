@@ -186,7 +186,7 @@ distinction this section exists to keep honest.
 $ zs resources
 stripe-production  api.stripe.com  https     L1  retrieve  strict
 analytics-db       db.internal     postgres  L3  exchange  strict
-session-cache      cache.internal  redis     -   exchange  not-strict
+mail-relay         mail.internal   smtp      -   exchange  not-strict
 ```
 
 The `exchange` rows are an illustration of the report format. Exchange materialization is
@@ -207,8 +207,8 @@ are not what this section's strict definition measures.
 
 The intercepted protocols are **enumerated, not negated**: a resource on a protocol no layer
 carries reports `not-strict` and no layer at all, **and the agent refuses it** rather than
-proxying it. A free-form protocol with an `else` branch would label `redis` strict by
-omission, which is the overclaim this section exists to prevent. A resource with no grant
+proxying it. A free-form protocol with an `else` branch would label an unbrokered protocol strict
+by omission, which is the overclaim this section exists to prevent. A resource with no grant
 reports `strict-unknown`, never `strict`, for the same reason: absence of evidence is not
 evidence.
 
@@ -263,8 +263,9 @@ authenticated call, which is exactly what this section's strict definition asks.
 resource now reports `strict`.
 
 The claim is scoped to intercepted paths — HTTPS through `zs-mitm`, PostgreSQL through
-`PostgresListener`, MySQL through `MysqlListener`, MongoDB through `MongoListener`. It is not
-a claim about unintercepted traffic, not a claim that the agent is a sandbox (SECURITY §3's
+`PostgresListener`, MySQL through `MysqlListener`, MongoDB through `MongoListener`, Redis through
+`RedisListener`. It is not a claim about unintercepted traffic, not a claim that the agent is a
+sandbox (SECURITY §3's
 local-process limit is narrowed to the OS user, not removed: every listener authenticates its
 caller, except the Windows database listeners, and a process of that user can still read the run
 token from the child's environment and gets the developer's access, ADR-0052), and strict mode reduces credential theft to session

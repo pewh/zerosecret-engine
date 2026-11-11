@@ -1,8 +1,8 @@
 # zs-conformance
 
-The conformance suite for a secretless proxy. Real `psql`, `mysql`, `mongosh` and `curl`
-clients reach real PostgreSQL, MySQL and MongoDB fixtures and a fake SigV4 upstream through
-the implementation under test. Each positive case also runs with a corrupted credential, and
+The conformance suite for a secretless proxy. Real `psql`, `mysql`, `mongosh`, `redis-cli` and
+`curl` clients reach real PostgreSQL, MySQL, MongoDB and Redis fixtures and a fake SigV4 upstream
+through the implementation under test. Each positive case also runs with a corrupted credential, and
 where the upstream has a TLS identity, with a wrong upstream CA. Both controls must be
 refused, or the case fails.
 
@@ -13,8 +13,8 @@ so the same cases run against any implementation.
 
 ```sh
 tools/db-test-certs.sh target/db-test-certs
-docker compose --profile pgtls --profile mysql --profile mongo up -d --wait \
-  postgres postgres-tls mysql mongo
+docker compose --profile pgtls --profile mysql --profile mongo --profile redis up -d --wait \
+  postgres postgres-tls mysql mongo redis redis-tls
 tools/mongo-test-setup.sh
 cargo build -p zs
 ZS_CONFORMANCE_MYSQL_ADMIN=zs_admin:zs-test-admin \
@@ -52,7 +52,7 @@ not in `capabilities` is also `SKIPPED`, never passed, so the exit code stays no
 Two subcommands, line-oriented, from the spec:
 
 ```
-<adapter> setup --protocol <postgres|mysql|mongodb|http>
+<adapter> setup --protocol <postgres|mysql|mongodb|http|redis>
                 --case <CASE-ID>
                 --upstream-host <host> --upstream-port <port>
                 --credential-file <path>
@@ -127,6 +127,26 @@ that.
 
 SigV4 positives carry one control, not two. They run over a plaintext `http` binding, where
 there is no upstream TLS identity to substitute.
+
+The Redis family is RD-01 to RD-07, driven by `redis-cli`:
+
+| Case | Proves |
+|---|---|
+| RD-01 | A client with no password gets `PONG`, `ACL WHOAMI` answers `default`, and `SET`, `GET` and `DEL` round-trip |
+| RD-02 | `AUTH zs_app <dummy>` and `HELLO 3 AUTH zs_app <dummy>` run as the ACL user: `ACL WHOAMI` answers `zs_app`, `CONFIG GET` answers `NOPERM` |
+| RD-03 | The round trip works against the TLS-only fixture with its CA pinned by `ca-sha256` |
+| RD-04 | `redis-cli --pipe` writes 1,001 commands without waiting; every reply comes back and the list is in order |
+| RD-05 | `MULTI`/`EXEC` and `EVAL` answer as the server does |
+| RD-06 | An 8 MiB value with CR, LF and NUL bytes round-trips byte-identical |
+| RD-07 | A `WRONGTYPE` error reaches the client unchanged and the connection still answers |
+
+RD-01, RD-02 and RD-04 to RD-07 run against the plaintext fixture on 6380 and carry the
+wrong-password control only. RD-03 runs against the TLS fixture on 6382 and carries both controls. A Redis
+endpoint may answer a TLS failure with the same error as an unreachable upstream, so the RD-03
+wrong-CA control also connects `redis-cli --tls` straight to the fixture: the fixture CA must get
+`NOAUTH` and the substituted CA must fail verification. The Redis fixture passwords come from
+`docker-compose.yml`; `ZS_CONFORMANCE_REDIS_ADMIN=default:<password>` overrides the default
+user's.
 
 The PostgreSQL fixture on 5434 does not serve TLS, so a wrong CA on it can only fail because
 the server declines TLS. The wrong-CA control of every plaintext PostgreSQL case therefore runs

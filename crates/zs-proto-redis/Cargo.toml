@@ -1,0 +1,25 @@
+[package]
+name = "zs-proto-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zs-protocol.workspace = true
+zs-diag.workspace = true
+zs-upstream.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+zs-credential.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+sha2.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true

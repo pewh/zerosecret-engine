@@ -37,6 +37,7 @@ pub enum Component {
     Postgres,
     Mysql,
     Mongo,
+    Redis,
 }
 
 impl Component {
@@ -48,6 +49,7 @@ impl Component {
             Component::Postgres => "postgres",
             Component::Mysql => "mysql",
             Component::Mongo => "mongo",
+            Component::Redis => "redis",
         }
     }
 }

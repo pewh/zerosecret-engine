@@ -238,8 +238,9 @@ and in local mode:
   wire (`bearer`, `basic`, `api-key-header`, `query-param`, `websocket-json-field`) or only a
   signature does (`aws-sigv4`, `hmac-body-signature`). The `header`, `param` or `field` decides
   where the secret goes. A `query-param` scheme puts the secret in the request URL, where
-  upstream access logs can record it. The host, port and TLS mode are the signed ones. A `mongo`
-  or `mysql` binding refuses a non-default `auth`. The owner accepted this limit on 2026-10-20.
+  upstream access logs can record it. The host, port and TLS mode are the signed ones. A `mongo`,
+  `mysql` or `redis` binding refuses a non-default `auth`. The owner accepted this limit on
+  2026-10-20.
   It can be signed later as one more field.
 - `listen_port`. It is the local listener port on loopback. It never carries the credential off
   the machine.
@@ -247,8 +248,13 @@ and in local mode:
   operations still bound every request.
 - `user` and `auth_source` on a `mongo` binding. They name the account and the database for SCRAM
   to the signed host. SCRAM never sends the password.
-- `user` on a `postgres` or `mysql` binding. It only narrows: the agent refuses a client that
-  names another user. A binding without it lets the workload choose the role.
+- `user` on a `postgres`, `mysql` or `redis` binding. On `postgres` and `mysql` it only narrows:
+  the agent refuses a client that names another user, and a binding without it lets the workload
+  choose the role. On `redis` it names the user the agent authenticates as; a client may name
+  only it, or `default` when the binding has no `user`.
+- `upstream_auth_optional` on a `redis` binding. It serves a signed upstream that answers the
+  agent's `AUTH` with no password configured (ADR-0058). The agent has already sent the credential
+  to the signed host, so it reaches nobody new; the grant and the audit record are unchanged.
 - `client_auth_plugin` on a `mysql` binding. It is the plugin between the local client and the
   agent. The upstream handshake does not change.
 
@@ -264,15 +270,17 @@ host (`ZS_CONTROL_POLICY`), which `control` validates the same way. Such a chang
 applies it only after a restart. A connection change can:
 
 - send the credential to another port of the granted host, where another service can listen;
-- turn off upstream TLS where the rules allow `plaintext`: a `mongo` resource on any host, or an
-  `https` resource whose upstream is loopback. SCRAM still never sends the MongoDB password, but
-  the session crosses the network unencrypted (below);
+- turn off upstream TLS where the rules allow `plaintext`: a `mongo` or `redis` resource on any
+  host, or an `https` resource whose upstream is loopback. SCRAM still never sends the MongoDB
+  password, but the session crosses the network unencrypted (below); a Redis session carries the
+  credential in its `AUTH`, so plaintext exposes it (below);
 - add a CA (`ca-sha256`), or replace the name and chain checks with a leaf pin (`pin-sha256`), on
-  a `mysql`, `postgres` or `mongo` resource. An attacker on the network path who has a
+  a `mysql`, `postgres`, `mongo` or `redis` resource. An attacker on the network path who has a
   certificate from that CA, or the pinned certificate's key, can then act as the server for the
-  granted host name. A MySQL server inside TLS can get the password. A PostgreSQL or MongoDB
-  server gets a SCRAM exchange, which allows offline password guessing, and the session. A
-  signed CA is added on top of the bundled public roots, and the binding names the CA file;
+  granted host name. A MySQL server inside TLS can get the password, and a Redis server inside
+  TLS can get the credential in `AUTH`. A PostgreSQL or MongoDB server gets a SCRAM exchange,
+  which allows offline password guessing, and the session. A signed CA is added on top of the
+  bundled public roots, and the binding names the CA file;
 - set the TLS mode of a `mysql` or `postgres` resource back to `default`. For a binding that
   names no CA and no pin, the plaintext fallback and the downgrade limits below for MySQL and
   PostgreSQL then apply again. A binding that still names one stops the run;
@@ -365,6 +373,17 @@ verified TLS and removes these risks.
 commands (PRODUCT §3). A client under `zs run` can do everything that the brokered user's
 roles allow. A user with user-administration roles can read the stored SCRAM keys of users
 (`usersInfo` with `showCredentials`). Give the brokered user the least role that the app needs.
+
+**Redis on plaintext does not protect the session.** A `redis` binding with
+`upstream_plaintext: true` connects without TLS (ADR-0057). The agent sends the credential in
+`AUTH`, so an observer on the path reads it, and every command and reply crosses the network
+unencrypted. A binding without `upstream_plaintext` uses verified TLS and removes that risk. The
+brokered ACL user must have no `@admin` or `@dangerous` rights, so the client cannot change the
+credential or read it back; R5 still closes the stream before a reply that carries it reaches the
+client. `-@dangerous` also removes `INFO`, which the ioredis ready check and Bull call; add
+`+info` back, which does not show the credential. Redis Cluster and Sentinel are not brokered, the listener refuses client TLS, and the
+agent does not broker a password that a command carries as data (`MIGRATE ... AUTH`,
+`ACL SETUSER`, `CONFIG SET requirepass`).
 
 **The workload chooses the PostgreSQL or MySQL database and role unless `user` is bound.** The
 agent sends the server the client's own startup packet or handshake response with the brokered
@@ -487,7 +506,10 @@ These are enforced in code review and in CI, not by convention.
    is checked the same way, so a Close reason that carries a fragment behind its status code
    ends the session too. An upstream Close ends the session once it is written: no later frame
    is read and held messages are dropped (reason `websocket withheld`). A signing scheme gives
-   the workload a signature, never the secret (ADR-0035).
+   the workload a signature, never the secret (ADR-0035). On a `redis` binding the same 8-byte
+   window rule applies to every upstream byte before it is written: the agent holds back only a
+   suffix that can start the credential, writes nothing from a buffer that completes a window,
+   and closes the connection (ADR-0057).
 9. An injected response whose head carries the credential (raw, percent-encoded, or an
    injected header or query value) is refused with 502 and audited `deny` `response echo`.
    `TRACE` is refused on an injected binding. The head check covers every header name and
@@ -1007,6 +1029,12 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `X-Forwarded-For` from a peer outside `ZS_CONTROL_TRUSTED_PROXIES` | Ignored: the limiter and the request log key on the TCP peer (commercial suite) |
 | Multi-org startup while a member, enrolment token or device row has no issuer | Startup refuses with the fixed text before any listener opens; a single-org start binds the rows (D-g) (commercial suite) |
 | A CLI login completed at one organization's host, confirmed or claimed at another organization's host | Refused: the claim answers 404 and issues no enrolment token; the login stays claimable at its own host (commercial suite) |
+| A Redis upstream refuses the broker's `AUTH` | Send `-ERR ZeroSecret upstream authentication failed` and close. No upstream authentication succeeds (`apps/zs/tests/fail_closed_matrix.rs` row 117; `crates/zs-proto-redis/tests/redis_real.rs`) |
+| A Redis client `AUTH` or `HELLO AUTH` names another user | Refuse with `-ERR ZeroSecret refused AUTH for another user`. Audit `deny` `connect`, reason `auth user mismatch`. Never forward it; close the connection (`apps/zs/tests/fail_closed_matrix.rs` row 118) |
+| A Redis client sends an inline command, a RESP3 attribute, a non-bulk element or an oversized frame | Refuse with `-ERR ZeroSecret refused a non-RESP command`. Audit `deny` `connect`, reason `non-resp command`. Close the connection (`apps/zs/tests/fail_closed_matrix.rs` row 119; `crates/zs-proto-redis/tests/listener.rs`) |
+| A Redis upstream reply carries an 8-byte window of the credential | Close the connection before those bytes reach the client. Audit `deny` `connect`, reason `credential echo` (`apps/zs/tests/fail_closed_matrix.rs` row 120) |
+| A Redis top-level reply is `-MOVED` or `-ASK` | Refuse with `-ERR ZeroSecret refused a cluster redirect`. Audit `deny` `connect`, reason `cluster redirect`. Close the connection (`apps/zs/tests/fail_closed_matrix.rs` row 121) |
+| A Redis upstream answers the broker's `AUTH` with no password configured, and the binding does not set `upstream_auth_optional` (with or without `user: "default"`) | Refuse with `-ERR ZeroSecret upstream authentication failed`. Audit `deny` `connect`, reason `upstream authentication failed`. No client command reaches the upstream (`apps/zs/tests/fail_closed_matrix.rs` row 122; `crates/zs-proto-redis/tests/redis_real.rs`) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository

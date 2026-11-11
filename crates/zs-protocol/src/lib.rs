@@ -165,15 +165,17 @@ pub enum InterceptedProtocol {
     Postgres,
     Mysql,
     Mongo,
+    Redis,
 }
 
 impl InterceptedProtocol {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Https,
         Self::Http,
         Self::Postgres,
         Self::Mysql,
         Self::Mongo,
+        Self::Redis,
     ];
 
     pub fn name(self) -> &'static str {
@@ -183,6 +185,7 @@ impl InterceptedProtocol {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Mongo => "mongo",
+            Self::Redis => "redis",
         }
     }
 
@@ -193,13 +196,14 @@ impl InterceptedProtocol {
             Self::Postgres => 5432,
             Self::Mysql => 3306,
             Self::Mongo => 27017,
+            Self::Redis => 6379,
         }
     }
 
     pub fn layer(self) -> Layer {
         match self {
             Self::Https | Self::Http => Layer::L7,
-            Self::Postgres | Self::Mysql | Self::Mongo => Layer::L3,
+            Self::Postgres | Self::Mysql | Self::Mongo | Self::Redis => Layer::L3,
         }
     }
 
@@ -261,6 +265,7 @@ mod tests {
             ),
             (["mysql", "MYSQL", "mYsQl"], InterceptedProtocol::Mysql),
             (["mongo", "MONGO", "mOnGo"], InterceptedProtocol::Mongo),
+            (["redis", "REDIS", "rEdIs"], InterceptedProtocol::Redis),
         ] {
             for value in values {
                 assert_eq!(classify_intercepted_protocol(value), Some(expected));
@@ -268,7 +273,6 @@ mod tests {
         }
         for value in [
             "",
-            "redis",
             " http",
             "http ",
             "postgresql",
@@ -294,7 +298,7 @@ mod tests {
                 Some(protocol)
             );
         }
-        assert_eq!(InterceptedProtocol::ALL.len(), 5);
+        assert_eq!(InterceptedProtocol::ALL.len(), 6);
     }
 
     #[test]
@@ -304,6 +308,7 @@ mod tests {
         assert_eq!(InterceptedProtocol::Postgres.default_port(), 5432);
         assert_eq!(InterceptedProtocol::Mysql.default_port(), 3306);
         assert_eq!(InterceptedProtocol::Mongo.default_port(), 27017);
+        assert_eq!(InterceptedProtocol::Redis.default_port(), 6379);
     }
 
     #[test]
@@ -313,5 +318,6 @@ mod tests {
         assert_eq!(InterceptedProtocol::Postgres.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Mysql.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Mongo.layer(), Layer::L3);
+        assert_eq!(InterceptedProtocol::Redis.layer(), Layer::L3);
     }
 }

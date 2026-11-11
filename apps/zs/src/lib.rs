@@ -41,6 +41,8 @@ pub struct ResourceBinding {
     #[serde(default)]
     pub upstream_plaintext: bool,
     #[serde(default)]
+    pub upstream_auth_optional: bool,
+    #[serde(default)]
     pub listen_port: Option<u16>,
     #[serde(default)]
     pub local_endpoint: bool,
@@ -232,6 +234,11 @@ impl ResourceBinding {
             == Some(zs_protocol::InterceptedProtocol::Mongo)
     }
 
+    pub fn is_redis(&self) -> bool {
+        zs_protocol::classify_intercepted_protocol(&self.protocol)
+            == Some(zs_protocol::InterceptedProtocol::Redis)
+    }
+
     pub fn is_l3(&self) -> bool {
         matches!(
             zs_protocol::classify_intercepted_protocol(&self.protocol),
@@ -239,6 +246,7 @@ impl ResourceBinding {
                 zs_protocol::InterceptedProtocol::Postgres
                     | zs_protocol::InterceptedProtocol::Mysql
                     | zs_protocol::InterceptedProtocol::Mongo
+                    | zs_protocol::InterceptedProtocol::Redis
             )
         )
     }
@@ -316,6 +324,24 @@ impl ResourceBinding {
         Ok(None)
     }
 
+    pub fn redis_auth(&self) -> zs_proto_redis::Auth {
+        zs_proto_redis::Auth::new(self.user.clone())
+            .with_upstream_optional(self.upstream_auth_optional)
+    }
+
+    pub fn redis_tls(&self) -> Result<Option<zs_upstream::UpstreamTls>, String> {
+        if !self.upstream_plaintext {
+            return self.upstream_tls().map(Some);
+        }
+        if self.upstream_ca.is_some() || self.upstream_cert_sha256.is_some() {
+            return Err(format!(
+                "{}: upstream_plaintext cannot be set with upstream_ca or upstream_cert_sha256",
+                self.resource
+            ));
+        }
+        Ok(None)
+    }
+
     pub fn listen_addr(&self) -> String {
         format!("127.0.0.1:{}", self.listen_port.unwrap_or(0))
     }
@@ -326,13 +352,19 @@ impl ResourceBinding {
         }
         if !self.is_l3() && self.listen_port.is_some() {
             return Err(format!(
-                "{}: listen_port is allowed only on a mysql, postgres or mongo binding",
+                "{}: listen_port is allowed only on a mysql, postgres, mongo or redis binding",
+                self.resource
+            ));
+        }
+        if !self.is_redis() && self.upstream_auth_optional {
+            return Err(format!(
+                "{}: upstream_auth_optional is allowed only on a redis binding",
                 self.resource
             ));
         }
         if !self.is_l3() && self.user.is_some() {
             return Err(format!(
-                "{}: user is allowed only on a mysql, postgres or mongo binding",
+                "{}: user is allowed only on a mysql, postgres, mongo or redis binding",
                 self.resource
             ));
         }
@@ -351,7 +383,7 @@ impl ResourceBinding {
                 || self.client_auth_plugin.is_some()
             {
                 return Err(format!(
-                    "{}: upstream_ca and upstream_cert_sha256 are allowed only on a mysql, postgres or mongo binding, and client_auth_plugin only on a mysql binding",
+                    "{}: upstream_ca and upstream_cert_sha256 are allowed only on a mysql, postgres, mongo or redis binding, and client_auth_plugin only on a mysql binding",
                     self.resource
                 ));
             }
@@ -372,6 +404,21 @@ impl ResourceBinding {
             }
             self.mongo_auth()?;
             return self.mongo_tls().map(|_| ());
+        }
+        if self.is_redis() {
+            if self.auth != HttpAuth::default() {
+                return Err(format!(
+                    "{}: auth is not allowed on a redis binding",
+                    self.resource
+                ));
+            }
+            if self.client_auth_plugin.is_some() {
+                return Err(format!(
+                    "{}: client_auth_plugin is allowed only on a mysql binding",
+                    self.resource
+                ));
+            }
+            return self.redis_tls().map(|_| ());
         }
         if self.upstream_plaintext {
             return Err(format!(
@@ -983,7 +1030,8 @@ impl AgentHandler {
                 Some(
                     zs_protocol::InterceptedProtocol::Postgres
                     | zs_protocol::InterceptedProtocol::Mysql
-                    | zs_protocol::InterceptedProtocol::Mongo,
+                    | zs_protocol::InterceptedProtocol::Mongo
+                    | zs_protocol::InterceptedProtocol::Redis,
                 ) => {
                     by_host.insert(binding.resource.clone(), binding);
                 }

@@ -113,6 +113,7 @@ case "$protocol" in
   mysql) kind=mysql; host_label=db.conformance ;;
   mongodb) kind=mongo; host_label=db.conformance ;;
   http) kind=http; host_label=${ZS_CONFORMANCE_HTTP_HOST:-example.amazonaws.com} ;;
+  redis) kind=redis; host_label=db.conformance ;;
   *) echo "unknown protocol: $protocol" >&2; exit 2 ;;
 esac
 
@@ -148,6 +149,9 @@ if [ "$protocol" = "mongodb" ]; then
     mongo_auth_source=zsdb
   fi
   extra_fields=$(printf '"user":"%s","auth_source":"%s",' "$mongo_user" "$mongo_auth_source")
+fi
+if [ "$protocol" = "redis" ] && [ "$case_id" = "RD-02" ]; then
+  extra_fields='"user":"zs_app",'
 fi
 if [ "$protocol" = "http" ] && [ "$auth_scheme" = "aws-sigv4" ]; then
   [ -n "$access_key_id" ] || { echo "--auth-scheme aws-sigv4 needs --access-key-id" >&2; exit 2; }

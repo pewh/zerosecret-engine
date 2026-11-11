@@ -35,7 +35,7 @@ The limits are in [docs/SECURITY.md](docs/SECURITY.md).
 ## What is in this repository
 
 This repository holds the open-source engine: the `zs` agent and CLI, the TLS interception
-engine, the HTTP, PostgreSQL, MySQL and MongoDB protocol code, the materializer, the policy
+engine, the HTTP, PostgreSQL, MySQL, MongoDB and Redis protocol code, the materializer, the policy
 evaluator, the audit primitives, `zs-verify` and the protocol conformance suite. The hosted
 control plane, SSO federation, organizations and the dashboard are the commercial edition and
 are not in this repository ([docs/PRODUCT.md](docs/PRODUCT.md) §8). Some sections below
@@ -92,12 +92,14 @@ dynamically; the platform table below lists the runtime requirements.
 
 ## Run the conformance suite
 
-The suite drives the agent against real PostgreSQL, MySQL and MongoDB servers in Docker and
-against the AWS SigV4 test vectors. It needs Docker, the `mysql` client and `mongosh`.
+The suite drives the agent against real PostgreSQL, MySQL, MongoDB and Redis servers in Docker
+and against the AWS SigV4 test vectors. It needs Docker, the `mysql` client, `mongosh` and
+`redis-cli` built with TLS (the `redis-tools` package on Debian and Ubuntu).
 
 ```bash
 tools/db-test-certs.sh target/db-test-certs
-docker compose --profile pgtls --profile mysql --profile mongo up -d --wait postgres postgres-tls mysql mongo
+docker compose --profile pgtls --profile mysql --profile mongo --profile redis up -d --wait \
+  postgres postgres-tls mysql mongo redis redis-tls
 tools/mongo-test-setup.sh
 cargo build --locked -p zs
 cargo run --locked -p zs-conformance -- run --config crates/zs-conformance/conformance.toml
@@ -258,7 +260,32 @@ ZS_TEST_MONGO=127.0.0.1:27018 ZS_TEST_MONGO_CERTS="$PWD/target/db-test-certs" \
 cargo test -p zs-proto-mongo --test mongo_real -- --test-threads=1
 ```
 
-Without these variables, the tests return early. The wrapper `tools/mysql-test-certs.sh` runs
+The Redis broker tests need the three compose Redis services: `redis` (a password for the
+default user and the ACL user `zs_app`), `redis-open` (no password) and `redis-tls` (TLS only,
+the same users, certificates from `tools/db-test-certs.sh`). The Redis tests stop with a message
+when a variable is missing:
+
+```bash
+tools/db-test-certs.sh target/db-test-certs
+docker compose --profile redis up -d --wait redis redis-open redis-tls
+ZS_TEST_REDIS_ADDR=127.0.0.1:6380 ZS_TEST_REDIS_PASSWORD=zs-test-redis \
+ZS_TEST_REDIS_ACL_USER=zs_app ZS_TEST_REDIS_ACL_PASSWORD=zs-test-redis-acl \
+ZS_TEST_REDIS_NOAUTH_ADDR=127.0.0.1:6381 \
+ZS_TEST_REDIS_TLS_ADDR=127.0.0.1:6382 ZS_TEST_REDIS_CERTS=$PWD/target/db-test-certs \
+cargo test -p zs-proto-redis --test redis_real -- --ignored --test-threads=1
+```
+
+`apps/zs/tests/redis_l3.rs` runs a real client through `zs run` against the same Redis. The
+client is any command that reads `ZS_ORDERS_REDIS_HOST` and `ZS_ORDERS_REDIS_PORT` and exits
+non-zero on failure; `ZS_TEST_REDIS_USER` binds an ACL user:
+
+```bash
+ZS_BUILD_TEST_ENDPOINTS=1 ZS_TEST_REDIS_ADDR=127.0.0.1:6380 ZS_TEST_REDIS_PASSWORD=zs-test-redis \
+ZS_TEST_REDIS_CLIENT='redis-cli -h "$ZS_ORDERS_REDIS_HOST" -p "$ZS_ORDERS_REDIS_PORT" PING | grep -q PONG' \
+cargo test -p zs --test redis_l3 a_real_client -- --ignored
+```
+
+Without their variables, the other real-server tests return early. The wrapper `tools/mysql-test-certs.sh` runs
 `tools/db-test-certs.sh`. Run it with no argument, or with `target/db-test-certs`. The old
 argument `target/mysql-test-certs` writes to a directory that compose no longer mounts.
 
@@ -331,8 +358,8 @@ flag is set.
 - `upstream_ca` is a PEM file. A relative path is read from the working directory of `zs run`.
   `upstream_cert_sha256` is the SHA-256 of the DER leaf certificate, 64 hex digits.
   Do not set both `upstream_ca` and `upstream_cert_sha256`: `zs run` stops at load.
-- `upstream_plaintext` is for `https` bindings (loopback only) and `mongo` bindings (any host).
-  On a `postgres` or `mysql` binding, `zs run` stops at load.
+- `upstream_plaintext` is for `https` bindings (loopback only), and `mongo` and `redis` bindings
+  (any host). On a `postgres` or `mysql` binding, `zs run` stops at load.
 - Change for `postgres` bindings (ADR-0030): the agent refuses a server that offers TLS with a
   private CA, for example every AWS RDS server, until the binding sets `upstream_ca` or a pin.
   Before, the agent connected in plaintext.
@@ -358,6 +385,49 @@ primary. A client that sends credentials gets `zs: authentication is brokered`.
 { "resource": "orders-mongo", "host": "mongo.example.internal", "protocol": "mongo",
   "user": "app", "auth_source": "appdb" }
 ```
+
+### Redis
+
+A `redis` binding uses TLS unless it sets `upstream_plaintext: true`. The agent opens the
+upstream connection and sends `AUTH [<user>] <credential>` before it reads a client frame; TLS
+comes first unless the binding is plaintext.
+
+| Binding fields | Redis upstream |
+|---|---|
+| none | TLS. Verify with the webpki roots and the name |
+| `upstream_ca` | TLS. Verify with the webpki roots, these certificates and the name |
+| `upstream_cert_sha256` | TLS. Accept only this leaf certificate. No name, chain or date check |
+| `upstream_plaintext: true` | Plaintext. The session carries the credential in `AUTH` |
+
+`user` is optional. When the binding leaves it out, the listener accepts only `default`, and the
+agent authenticates as `default`. Point the client at `ZS_<RESOURCE>_HOST` and
+`ZS_<RESOURCE>_PORT` with no password. The listener is plaintext loopback and refuses client TLS.
+The agent rewrites every `AUTH`, and the `AUTH` arguments of `HELLO`, to the binding user and the
+credential; it never forwards the client's password. A client that names another user, sends a
+non-RESP frame or meets a cluster redirect gets a fixed `-ERR` and the connection closes. A
+`HELLO` with a second `AUTH` clause is refused. An empty line between frames is skipped, as Redis
+does, and the replies to frames sent before a refused one arrive before the error. A one-argument `AUTH` carries no password and is
+forwarded; an `AUTH` with four or more arguments is refused. A handshake that exceeds 15 seconds
+answers `-ERR ZeroSecret upstream unavailable` and audits `deny` `connect`, reason
+`handshake timed out`.
+
+```json
+{ "resource": "orders-redis", "host": "redis.example.internal", "protocol": "redis",
+  "user": "app" }
+```
+
+A Redis with no password (a development server) is refused unless the binding sets
+`upstream_auth_optional: true` (ADR-0058). The agent still sends its `AUTH` first, so the binding
+still needs a credential; any value works against an open server:
+
+```json
+{ "resource": "orders-redis", "host": "redis.example.internal", "protocol": "redis",
+  "upstream_auth_optional": true }
+```
+
+Give the brokered user no admin rights, so the client cannot read or change the credential:
+`ACL SETUSER app on >… ~* &* +@all -@admin -@dangerous +info`. `INFO` is in `@dangerous`, and
+the ioredis ready check and Bull need it.
 
 ### AWS RDS behind a DNS alias
 
@@ -398,7 +468,7 @@ means the default:
 | Binding field | Signed as | Default |
 |---|---|---|
 | `upstream_host` | `upstream_host` | the resource `host` |
-| `upstream_port` | `upstream_port` | https 443, http 80, postgres 5432, mysql 3306, mongo 27017 |
+| `upstream_port` | `upstream_port` | https 443, http 80, postgres 5432, mysql 3306, mongo 27017, redis 6379 |
 | `upstream_plaintext: true` | `upstream_tls` `plaintext` | `default` |
 | `upstream_ca` | `upstream_tls` `ca-sha256:<hex>` | `default` |
 | `upstream_cert_sha256` | `upstream_tls` `pin-sha256:<hex>` | `default` |

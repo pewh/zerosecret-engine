@@ -147,12 +147,12 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
             workload: "default".into(),
             resource: "session-cache".into(),
             host: "cache.internal".into(),
-            protocol: "redis".into(),
+            protocol: "cassandra".into(),
             source: zs_policy::CredentialSource::file("cache-cred"),
             operations: vec!["GET".into()],
             environment: "development".into(),
             expires_at_ms: now_ms + 3_600_000,
-            grant_id: "g-redis".into(),
+            grant_id: "g-cassandra".into(),
             materialization: zs_policy::Materialization::Retrieve,
             upstream_host: connection.upstream_host,
             upstream_port: connection.upstream_port,
@@ -185,7 +185,7 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
     let port = upstream.addr.port();
     let https_port = https_upstream.addr.port();
     let policy = format!(
-        r#"{{"bindings": [{{"resource": "session-cache", "host": "cache.internal", "protocol": "redis", "upstream_host": "127.0.0.1", "upstream_port": {port}}}, {{"resource": "stripe-production", "host": "api.stripe.com", "protocol": "https", "upstream_host": "127.0.0.1", "upstream_port": {https_port}, "upstream_plaintext": true}}], "signing_keys": [{{"key_id": "test-k1", "verifying_key_hex": "{verifying_hex}"}}], "grants": [{}, {}]}}"#,
+        r#"{{"bindings": [{{"resource": "session-cache", "host": "cache.internal", "protocol": "cassandra", "upstream_host": "127.0.0.1", "upstream_port": {port}}}, {{"resource": "stripe-production", "host": "api.stripe.com", "protocol": "https", "upstream_host": "127.0.0.1", "upstream_port": {https_port}, "upstream_plaintext": true}}], "signing_keys": [{{"key_id": "test-k1", "verifying_key_hex": "{verifying_hex}"}}], "grants": [{}, {}]}}"#,
         serde_json::to_string(&signed).unwrap(),
         serde_json::to_string(&https_signed).unwrap()
     );

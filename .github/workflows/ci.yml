@@ -162,10 +162,10 @@ jobs:
         with:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring mysql-client-8.0
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus-daemon dbus-bin gnome-keyring mysql-client-8.0 redis-tools
       - run: npm install -g mongosh@2.14.1
       - run: tools/db-test-certs.sh target/db-test-certs
-      - run: docker compose --profile pgtls --profile mysql --profile mongo up -d --wait postgres postgres-tls mysql mongo
+      - run: docker compose --profile pgtls --profile mysql --profile mongo --profile redis up -d --wait postgres postgres-tls mysql mongo redis redis-tls
       - run: tools/mongo-test-setup.sh
       - run: cargo build --locked -p zs
       - name: Conformance suite on a private Secret Service
@@ -179,7 +179,7 @@ jobs:
             cargo run --locked -p zs-conformance -- run --config crates/zs-conformance/conformance.toml
           '
       - if: failure()
-        run: docker compose --profile pgtls --profile mysql --profile mongo logs postgres postgres-tls mysql mongo
+        run: docker compose --profile pgtls --profile mysql --profile mongo --profile redis logs postgres postgres-tls mysql mongo redis redis-tls
 
   # A private repository must fail here instead of skipping both macOS jobs without notice.
   macos-guard:
@@ -313,6 +313,19 @@ jobs:
       - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
         env:
           ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
+      - name: Redis real tests
+        env:
+          ZS_TEST_REDIS_ADDR: 127.0.0.1:6380
+          ZS_TEST_REDIS_PASSWORD: zs-test-redis
+          ZS_TEST_REDIS_ACL_USER: zs_app
+          ZS_TEST_REDIS_ACL_PASSWORD: zs-test-redis-acl
+          ZS_TEST_REDIS_NOAUTH_ADDR: 127.0.0.1:6381
+          ZS_TEST_REDIS_TLS_ADDR: 127.0.0.1:6382
+          ZS_TEST_REDIS_CERTS: ${{ github.workspace }}/target/db-test-certs
+        run: |
+          set -euo pipefail
+          docker compose --profile redis up -d --wait redis redis-open redis-tls
+          cargo test --locked -p zs-proto-redis --test redis_real -- --test-threads=1 --include-ignored --nocapture
       - name: PostgreSQL real tests on a private Secret Service
         run: |
           dbus-run-session -- bash -c '
@@ -321,7 +334,7 @@ jobs:
             cargo test --locked -p zs --test postgres_real -- --test-threads=1 --nocapture
           '
       - if: failure()
-        run: docker compose --profile mysql --profile pgtls --profile mongo logs postgres mysql mysql-plain postgres-tls mongo
+        run: docker compose --profile mysql --profile pgtls --profile mongo --profile redis logs postgres mysql mysql-plain postgres-tls mongo redis redis-open redis-tls
 
   # The Keychain tests are ignored by default and panic unless the run proves it targets a
   # disposable keychain: `ZS_CI_KEYCHAIN` must name a keychain file under RUNNER_TEMP that is

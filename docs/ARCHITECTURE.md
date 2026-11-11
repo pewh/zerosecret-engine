@@ -81,6 +81,7 @@ crates/
   zs-proto-postgres    wire protocol, SCRAM, upstream TLS negotiation. The dynamic role is not implemented
   zs-proto-mysql       wire protocol, native and caching_sha2 auth, upstream TLS negotiation
   zs-proto-mongo       wire protocol, SCRAM-SHA-1/256, one-member replica set view, upstream TLS
+  zs-proto-redis       wire protocol, RESP framing, AUTH and HELLO AUTH rewrite, upstream TLS
   zs-materializer      grant -> usable credential (retrieve; exchange is not implemented: the
                        agent wires `UnconfiguredExchange`, which refuses); `StoreRegistry`
                        routes the grant's source kind (`file`, `aws_ssm`) to one store and never
@@ -327,7 +328,7 @@ A binding field that is set must equal the signed value. A field that is left ou
 | `upstream_plaintext`, `upstream_ca`, `upstream_cert_sha256` | yes, as one `upstream_tls` mode | may be left out, except `upstream_ca` when the mode is `ca-sha256`: the CA bundle stays a file, and only its SHA-256 is signed (`zs ca-sha256 <file>`) |
 | `local_endpoint` | yes | may be left out |
 | `auth`, `listen_port`, `paths`, `auth_source`, `client_auth_plugin` | no | local; SECURITY §3 says why |
-| `user` | no | local. On `mongo`, the SCRAM user. On `postgres` and `mysql`, the only user a client may name; the agent refuses another before materialization (SECURITY §3) |
+| `user` | no | local. On `mongo`, the SCRAM user. On `postgres` and `mysql`, the only user a client may name; the agent refuses another before materialization. On `redis`, the user the agent authenticates as; a client may name only it, or `default` when the binding has no `user` (SECURITY §3) |
 
 The connection is fixed for the life of the run. A renewed grant with another connection is
 skipped, and a request whose grant differs is denied. For https and http, a CONNECT to a port
@@ -513,7 +514,7 @@ never a global mode.
 |---|---|---|
 | L1 | Explicit proxy — `HTTPS_PROXY` injected into the child process | Default. Dev containers work immediately |
 | L2 | Process-scoped `zs run <cmd>` — child environment plus local CA trust | The SDK ignores proxy variables. Validated 2026-09-06 by the synthetic hostname-routing probe and verifier (spike evidence, not published): an unchanged Node/Stripe fixture completes the mapped path with TLS verified on both legs, and the fail-closed controls held. Caveat carried from the probe: SDKs honor `HTTPS_PROXY` when a user or tool sets one, so the managed workspace must clear or pin proxy variables |
-| L3 | Protocol listener — a local TCP socket per resource | PostgreSQL, MySQL (ADR-0029), MongoDB (ADR-0031) and every future non-HTTP protocol |
+| L3 | Protocol listener — a local TCP socket per resource | PostgreSQL, MySQL (ADR-0029), MongoDB (ADR-0031), Redis (ADR-0057) and every future non-HTTP protocol |
 | L4 | Transparent TUN | Deferred. Only when L1–L3 cannot hold the invariant |
 
 Always use the least invasive mechanism that satisfies the invariant.

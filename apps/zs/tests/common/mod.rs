@@ -673,6 +673,7 @@ pub struct AgentProcess {
     pub postgres_port: Option<u16>,
     pub mysql_port: Option<u16>,
     pub mongo_port: Option<u16>,
+    pub redis_port: Option<u16>,
 }
 
 #[cfg(unix)]
@@ -936,6 +937,7 @@ pub fn spawn_agent_with_env<C: AsRef<std::ffi::OsStr>>(
                 postgres_port: port_of("zs: postgres "),
                 mysql_port: port_of("zs: mysql "),
                 mongo_port: port_of("zs: mongo "),
+                redis_port: port_of("zs: redis "),
             });
         }
     }

@@ -29,7 +29,7 @@ pub const POLICY_JSON_SCHEMA: &str = r#"{
           "host": { "type": "string" },
           "protocol": {
             "type": "string",
-            "enum": ["https", "http", "postgres", "mysql", "mongo"],
+            "enum": ["https", "http", "postgres", "mysql", "mongo", "redis"],
             "default": "https"
           },
           "listen_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
@@ -37,6 +37,11 @@ pub const POLICY_JSON_SCHEMA: &str = r#"{
           "upstream_host": { "type": "string" },
           "upstream_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "upstream_plaintext": { "type": "boolean", "default": false },
+          "upstream_auth_optional": {
+            "type": "boolean",
+            "default": false,
+            "description": "redis only: serve an upstream that answers AUTH with no password configured"
+          },
           "upstream_ca": { "type": "string" },
           "upstream_cert_sha256": { "type": "string" },
           "client_auth_plugin": {
@@ -52,7 +57,7 @@ pub const POLICY_JSON_SCHEMA: &str = r#"{
           "user": {
             "type": "string",
             "minLength": 1,
-            "description": "mongo: the SCRAM user; postgres and mysql: the only user a client may name"
+            "description": "mongo: the SCRAM user; postgres, mysql and redis: the only user a client may name"
           },
           "auth_source": {
             "type": "string",

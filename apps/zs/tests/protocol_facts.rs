@@ -10,6 +10,7 @@ fn binding(protocol: &str, port: Option<u16>) -> ResourceBinding {
         upstream_host: None,
         upstream_port: port,
         upstream_plaintext: false,
+        upstream_auth_optional: false,
         listen_port: None,
         local_endpoint: false,
         operations: Vec::new(),
@@ -27,17 +28,17 @@ fn binding(protocol: &str, port: Option<u16>) -> ResourceBinding {
 
 #[test]
 fn an_unknown_l3_protocol_has_no_upstream_port() {
-    let redis = binding("redis", None);
+    let unknown = binding("cassandra", None);
     assert_ne!(
-        redis.upstream().1,
+        unknown.upstream().1,
         5432,
         "an unknown protocol must not fall through to the postgres port"
     );
     assert!(
-        redis.l3_fields().is_ok(),
+        unknown.l3_fields().is_ok(),
         "an unknown protocol stays a valid load, and no layer carries it"
     );
-    assert!(!redis.is_l3());
+    assert!(!unknown.is_l3());
 }
 
 #[test]
@@ -53,6 +54,10 @@ fn each_l3_protocol_has_its_own_default_port() {
     assert_eq!(
         binding("mongo", None).upstream(),
         ("db.acme.internal".into(), 27017)
+    );
+    assert_eq!(
+        binding("redis", None).upstream(),
+        ("db.acme.internal".into(), 6379)
     );
     assert_eq!(
         binding("postgres", Some(6432)).upstream(),

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- A `redis` binding brokers Redis logins through `RedisListener` (ADR-0057). The agent
+  authenticates upstream before it reads the client, rewrites `AUTH` and `HELLO AUTH` in place,
+  and never forwards the client's password. It refuses another user's `AUTH`, a non-RESP frame,
+  a cluster redirect and a reply that carries an 8-byte window of the credential, with the fixed
+  `-ERR` text and a `deny` `connect` audit reason. The grant operation is `connect`.
+- A `redis` binding with `upstream_auth_optional: true` serves a Redis that has no password
+  (ADR-0058); without it such a server is refused, also when the binding names `user: "default"`.
+  An empty line between client frames is skipped, replies to earlier frames arrive before a
+  refusal, and a refused client is drained so it reads the error.
+
 ## [0.5.0] - 2026-11-08
 
 - Releases publish binaries for five targets (ADR-0056, which lifts ADR-0045 D6):

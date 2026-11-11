@@ -3959,6 +3959,7 @@ dependencies = [
  "zs-proto-mongo",
  "zs-proto-mysql",
  "zs-proto-postgres",
+ "zs-proto-redis",
  "zs-protocol",
  "zs-test-aws",
  "zs-test-keychain",
@@ -4182,6 +4183,24 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
+ "zs-credential",
+ "zs-diag",
+ "zs-protocol",
+ "zs-upstream",
+]
+
+[[package]]
+name = "zs-proto-redis"
+version = "0.5.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "zeroize",

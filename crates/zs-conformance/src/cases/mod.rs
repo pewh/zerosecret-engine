@@ -1,6 +1,7 @@
 pub mod mongodb;
 pub mod mysql;
 pub mod postgres;
+pub mod redis;
 pub mod sigv4;
 
 use std::io::{Read, Write};
