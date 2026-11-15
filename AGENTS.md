@@ -103,8 +103,9 @@ The conformance suite (Docker and real PostgreSQL, MySQL and MongoDB) is in
 - `docs/specs/*.md` are immutable dated records; a later change is a new spec or an ADR.
 - `docs/DECISIONS.md` is newest first; change a decision with a new entry, never by editing
   history.
-- The five owner documents exist in both repositories and can drift. An engine-facing change
-  to one is made here, and in the commercial copy when it describes the engine.
+- `PRODUCT.md` and `ROADMAP.md` have one copy, here. `ARCHITECTURE.md`, `SECURITY.md` and
+  `DECISIONS.md` have a second copy in the commercial repository. After a change to one of
+  them, make the change there too and run its `tools/owner-docs-check.sh`.
 - The marketing site repeats PRODUCT §7 and the lists of protocols, sources and
   materialization modes. A change to one of these is also made in the `zerosecret-site`
   repository.

@@ -83,7 +83,8 @@ crates/
   zs-proto-postgres    wire protocol, SCRAM, upstream TLS negotiation. The dynamic role is not implemented
   zs-proto-mysql       wire protocol, native and caching_sha2 auth, upstream TLS negotiation
   zs-proto-mongo       wire protocol, SCRAM-SHA-1/256, one-member replica set view, upstream TLS
-  zs-proto-redis       wire protocol, RESP framing, AUTH and HELLO AUTH rewrite, upstream TLS
+  zs-proto-redis       RESP framing, `AUTH` and `HELLO AUTH` rewrite to the binding user and the
+                       credential, upstream TLS (ADR-0057)
   zs-materializer      grant -> usable credential (retrieve; exchange is not implemented: the
                        agent wires `UnconfiguredExchange`, which refuses); `StoreRegistry`
                        routes the grant's source kind (`file`, `aws_ssm`) to one store and never
