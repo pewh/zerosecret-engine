@@ -1218,7 +1218,10 @@ impl AgentHandler {
 
 impl FlowHandler for AgentHandler {
     fn classify(&self, destination: &Destination) -> Flow {
-        let Some(binding) = self.binding_for(&destination.host) else {
+        let Some(binding) = self
+            .binding_for(&destination.host)
+            .filter(|binding| !binding.is_l3())
+        else {
             return Flow::Passthrough;
         };
         let denied = |reason: String| Flow::Deny {

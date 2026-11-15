@@ -126,10 +126,10 @@ Rewritten 2026-11-15 after the owner accepted the [session-end spec](../specs/20
 - Modify: `apps/zs/src/lib.rs:1219-1223` (`classify`)
 - Test (copy): `apps/zs/tests/review_database_name_as_proxy_host.rs`, renamed to `database_name_is_not_a_proxy_host.rs`
 
-- [ ] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test database_name_is_not_a_proxy_host`. Expected: 3 FAIL.
-- [ ] **Step 2: Implement.** In `classify`, a binding found by `binding_for` is used only when `!binding.is_l3()`; else return `Flow::Passthrough`. Leave `credential_ref` (`:1332-1339`) unchanged.
-- [ ] **Step 3: Run.** The same command. Expected: 3 PASS. Then `cargo test -p zs --lib`: all pass.
-- [ ] **Step 4: Gate and commit.** `fix(proxy): a database resource name is not a proxy host`.
+- [x] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test database_name_is_not_a_proxy_host`. Expected: 3 FAIL.
+- [x] **Step 2: Implement.** In `classify`, a binding found by `binding_for` is used only when `!binding.is_l3()`; else return `Flow::Passthrough`. Leave `credential_ref` (`:1332-1339`) unchanged.
+- [x] **Step 3: Run.** The same command. Expected: 3 PASS. Then `cargo test -p zs --lib`: all pass.
+- [x] **Step 4: Gate and commit.** `fix(proxy): a database resource name is not a proxy host`.
 
 ---
 
