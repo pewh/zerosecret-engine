@@ -139,9 +139,12 @@ impl FileStore {
         let unresolvable = || {
             MaterializationError::File(format!("credential reference {reference} not resolvable"))
         };
-        if !std::path::Path::new(&relative)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        if relative
+            .split('/')
+            .any(|part| part.is_empty() || part == ".")
+            || !std::path::Path::new(&relative)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
             return Err(unresolvable());
         }
