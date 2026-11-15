@@ -1,4 +1,5 @@
 pub mod packet;
+mod read_only;
 pub mod scramble;
 
 use std::net::SocketAddr;
@@ -13,13 +14,16 @@ use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event, ServerText};
 
 use packet::{
-    AuthSwitch, CACHING_SHA2_PASSWORD, CLEAR_PASSWORD, CLIENT_COMPRESS, CLIENT_SSL,
-    CLIENT_ZSTD_COMPRESSION_ALGORITHM, COM_CHANGE_USER, COM_QUIT, ERR_HEADER, Greeting,
-    HANDSHAKE_LIMIT, HandshakeResponse, MORE_DATA_HEADER, NATIVE_PASSWORD, OK_HEADER,
+    AuthSwitch, CACHING_SHA2_PASSWORD, CLEAR_PASSWORD, CLIENT_COMPRESS, CLIENT_QUERY_ATTRIBUTES,
+    CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM, COM_CHANGE_USER, COM_QUIT, ERR_HEADER, Greeting,
+    HANDSHAKE_LIMIT, HandshakeResponse, MAX_PAYLOAD, MORE_DATA_HEADER, NATIVE_PASSWORD, OK_HEADER,
     REQUIRED_SERVER_CAPABILITIES, SCRAMBLE_LEN, SHA256_PASSWORD, STRIPPED_CAPABILITIES,
     SWITCH_HEADER, ServerError, client_capabilities, err_packet, read_packet, ssl_request,
     write_packet,
 };
+use read_only::{Kind, Refused};
+pub use read_only::{MAX_SCREENED_COMMAND, READ_ONLY_REASON, REFUSAL, SESSION_START, scan};
+use zs_protocol::SessionAccess;
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
 pub use zs_protocol::{AuditRefusal, Materialize};
@@ -86,6 +90,11 @@ pub const USER_REFUSED: Reply = Reply {
     code: 1045,
     sqlstate: "28000",
     message: "ZeroSecret refused the database user",
+};
+pub const READ_ONLY_REFUSED: Reply = Reply {
+    code: 1045,
+    sqlstate: "28000",
+    message: "ZeroSecret could not open a read-only session",
 };
 pub const UPSTREAM_REFUSED: &str = "ZeroSecret upstream refused the connection";
 
@@ -223,7 +232,41 @@ struct Conn {
 
 struct Stopped(&'static str);
 
+#[derive(Clone, Copy)]
+struct Screen {
+    attributes: bool,
+}
+
 impl Conn {
+    async fn refuse_read_only(&self, client: &mut TcpStream, stage: &'static str) -> Stopped {
+        let mut event = self
+            .event("client_refused")
+            .warn()
+            .code("reason", "read_only")
+            .code("stage", stage);
+        if let Some(seq) = (self.shared.audit_refusal)("connect", READ_ONLY_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.emit(event);
+        self.refuse(client, &READ_ONLY_REFUSED).await;
+        Stopped("refused")
+    }
+
+    fn refused(&self, refused: Refused) {
+        let event = match refused {
+            Refused::Word(word) => self.event("statement_refused").code("word", word),
+            Refused::Command(command, reason) => self
+                .event("command_refused")
+                .code("command", command)
+                .code("reason", reason),
+        };
+        let mut event = event.warn();
+        if let Some(seq) = (self.shared.audit_refusal)("query", READ_ONLY_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.emit(event);
+    }
+
     fn event(&self, name: &'static str) -> Event {
         Event::new(Component::Mysql, name)
             .conn(self.id)
@@ -282,7 +325,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
     conn.emit(conn.event("conn_accepted"));
     let outcome = tokio::time::timeout(HANDSHAKE_BUDGET, handshake(&mut client, &conn)).await;
     match outcome {
-        Ok(Ok((upstream, watch))) => relay(client, upstream, watch, &conn).await,
+        Ok(Ok((upstream, watch, screen))) => relay(client, upstream, watch, screen, &conn).await,
         Ok(Err(Stopped(by))) => conn.closed(0, 0, by),
         Err(_) => {
             conn.upstream_failed("handshake", "timed_out");
@@ -295,7 +338,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
 async fn handshake(
     client: &mut TcpStream,
     conn: &Conn,
-) -> Result<(Box<dyn Io>, zs_protocol::SessionWatch), Stopped> {
+) -> Result<(Box<dyn Io>, zs_protocol::SessionWatch, Option<Screen>), Stopped> {
     let (tcp, greeting) = open_upstream(client, conn).await?;
     if greeting.scramble.len() != SCRAMBLE_LEN {
         return Err(conn
@@ -323,13 +366,20 @@ async fn handshake(
         conn.refuse(client, &USER_REFUSED).await;
         return Err(Stopped("refused"));
     }
-    let (password, watch) = materialize(client, conn).await?;
+    let (password, watch, access) = materialize(client, conn).await?;
+    let screened = access == SessionAccess::ReadOnly;
+    if screened && read_only::names_mariadb(&greeting.server_version) {
+        return Err(conn.refuse_read_only(client, "mariadb").await);
+    }
     let (plugin, auth_data) = first_answer(&greeting, &password);
     let tls = greeting.capabilities & CLIENT_SSL != 0;
     let mut flags = (response.capabilities & offered) | REQUIRED_SERVER_CAPABILITIES;
     if tls {
         flags |= CLIENT_SSL;
     }
+    let screen = screened.then_some(Screen {
+        attributes: flags & CLIENT_QUERY_ATTRIBUTES != 0,
+    });
     let request = ssl_request(flags, response.max_packet, response.charset);
     let (mut upstream, seq) = secure_upstream(client, conn, tcp, tls, &request).await?;
     let outgoing = HandshakeResponse {
@@ -355,9 +405,14 @@ async fn handshake(
     let state = AuthState { plugin, rounds: 0 };
     let reply = match authenticate(&mut upstream, conn, &password, tls, state).await {
         Ok(ok) => {
+            if let Some(screen) = screen
+                && !start_read_only(&mut upstream, screen).await
+            {
+                return Err(conn.refuse_read_only(client, "session_start").await);
+            }
             let seq = conn.client_seq.load(Ordering::SeqCst);
             return match write_packet(client, seq, &ok).await {
-                Ok(()) => Ok((upstream, watch)),
+                Ok(()) => Ok((upstream, watch, screen)),
                 Err(_) => Err(Stopped("client")),
             };
         }
@@ -369,15 +424,26 @@ async fn handshake(
     Err(Stopped("refused"))
 }
 
+async fn start_read_only(upstream: &mut Box<dyn Io>, screen: Screen) -> bool {
+    let start = read_only::session_start(screen.attributes);
+    if write_packet(upstream, 0, &start).await.is_err() {
+        return false;
+    }
+    read_packet(upstream, HANDSHAKE_LIMIT)
+        .await
+        .is_ok_and(|reply| reply.seq == 1 && reply.payload.first() == Some(&OK_HEADER))
+}
+
 async fn materialize(
     client: &mut TcpStream,
     conn: &Conn,
-) -> Result<(Zeroizing<Vec<u8>>, zs_protocol::SessionWatch), Stopped> {
+) -> Result<(Zeroizing<Vec<u8>>, zs_protocol::SessionWatch, SessionAccess), Stopped> {
     match (conn.shared.materialize)() {
         Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
+            let access = materialized.access();
             let (credential, watch) = materialized.into_parts();
-            Ok((Zeroizing::new(credential.expose().to_vec()), watch))
+            Ok((Zeroizing::new(credential.expose().to_vec()), watch, access))
         }
         Err(denied) => {
             conn.emit(
@@ -744,6 +810,7 @@ enum Ending {
     Client,
     Server,
     ChangeUser,
+    ReadOnly,
     Broken(&'static str),
     Revoked(&'static str),
 }
@@ -754,8 +821,75 @@ impl Ending {
             Ending::Client => "client",
             Ending::Server | Ending::Broken(_) => "upstream",
             Ending::ChangeUser => "change_user",
+            Ending::ReadOnly => "read_only",
             Ending::Revoked(_) => "revoked",
         }
+    }
+}
+
+fn packet_len(header: &[u8; 4]) -> usize {
+    usize::from(header[0]) | usize::from(header[1]) << 8 | usize::from(header[2]) << 16
+}
+
+async fn reassemble<R>(client: &mut R, payload: &mut Vec<u8>, conn: &Conn) -> Result<(), Ending>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let mut header = [0u8; 4];
+        if client.read_exact(&mut header).await.is_err() {
+            return Err(Ending::Client);
+        }
+        let len = packet_len(&header);
+        if payload.len() + len > MAX_SCREENED_COMMAND {
+            let command = read_only::command_name(payload.first().copied());
+            conn.refused(Refused::Command(command, "too_large"));
+            return Err(Ending::ReadOnly);
+        }
+        let start = payload.len();
+        payload.resize(start + len, 0);
+        if client.read_exact(&mut payload[start..]).await.is_err() {
+            return Err(Ending::Client);
+        }
+        if len < MAX_PAYLOAD {
+            return Ok(());
+        }
+    }
+}
+
+async fn screen_command<R>(
+    client: &mut R,
+    header: &[u8; 4],
+    payload: &mut Vec<u8>,
+    screen: Screen,
+    conn: &Conn,
+) -> Result<Option<Vec<u8>>, Ending>
+where
+    R: AsyncRead + Unpin,
+{
+    let command = payload.first().copied();
+    let kind = read_only::kind(command);
+    if matches!(kind, Kind::Streamed) {
+        return Ok(None);
+    }
+    let split = packet_len(header) == MAX_PAYLOAD;
+    if split {
+        if matches!(kind, Kind::Refused) {
+            conn.refused(Refused::Command(read_only::command_name(command), "split"));
+            return Err(Ending::ReadOnly);
+        }
+        reassemble(client, payload, conn).await?;
+    }
+    match read_only::refusal(payload, screen.attributes) {
+        Some((refused, mut replacement)) => {
+            conn.refused(refused);
+            if split {
+                replacement.resize(payload.len().max(replacement.len()), b' ');
+            }
+            Ok(Some(packet::frame(header[3], &replacement)))
+        }
+        None if split => Ok(Some(packet::frame(header[3], payload))),
+        None => Ok(None),
     }
 }
 
@@ -764,6 +898,8 @@ async fn forward_commands<R, W>(
     upstream: &mut W,
     bytes: &AtomicU64,
     quit: &AtomicBool,
+    screen: Option<Screen>,
+    conn: &Conn,
 ) -> Ending
 where
     R: AsyncRead + Unpin,
@@ -775,8 +911,7 @@ where
         if client.read_exact(&mut header).await.is_err() {
             return Ending::Client;
         }
-        let len =
-            usize::from(header[0]) | usize::from(header[1]) << 8 | usize::from(header[2]) << 16;
+        let len = packet_len(&header);
         let mut payload = vec![0u8; len];
         if client.read_exact(&mut payload).await.is_err() {
             return Ending::Client;
@@ -785,20 +920,35 @@ where
             return Ending::ChangeUser;
         }
         let quitting = command_start && payload.first() == Some(&COM_QUIT);
-        command_start = len < packet::MAX_PAYLOAD;
+        let replaced = match screen {
+            Some(screen) if command_start => {
+                match screen_command(client, &header, &mut payload, screen, conn).await {
+                    Ok(replaced) => replaced,
+                    Err(ending) => return ending,
+                }
+            }
+            _ => None,
+        };
+        command_start = replaced.is_some() || len < MAX_PAYLOAD;
         if quitting {
             quit.store(true, Ordering::SeqCst);
         }
         let sent = async {
-            upstream.write_all(&header).await?;
-            upstream.write_all(&payload).await?;
+            match &replaced {
+                Some(wire) => upstream.write_all(wire).await?,
+                None => {
+                    upstream.write_all(&header).await?;
+                    upstream.write_all(&payload).await?;
+                }
+            }
             upstream.flush().await
         }
         .await;
         if let Err(error) = sent {
             return Ending::Broken(zs_diag::io_kind(&error));
         }
-        bytes.fetch_add((len + 4) as u64, Ordering::Relaxed);
+        let sent = replaced.map_or(len + 4, |wire| wire.len());
+        bytes.fetch_add(sent as u64, Ordering::Relaxed);
         if quitting {
             return Ending::Client;
         }
@@ -831,6 +981,7 @@ async fn relay(
     client: TcpStream,
     upstream: Box<dyn Io>,
     watch: zs_protocol::SessionWatch,
+    screen: Option<Screen>,
     conn: &Conn,
 ) {
     let up = AtomicU64::new(0);
@@ -843,7 +994,15 @@ async fn relay(
         // the attribution to the client whatever order the halves finish in.
         let quit = AtomicBool::new(false);
         let forward = async {
-            let ending = forward_commands(&mut client_read, &mut upstream_write, &up, &quit).await;
+            let ending = forward_commands(
+                &mut client_read,
+                &mut upstream_write,
+                &up,
+                &quit,
+                screen,
+                conn,
+            )
+            .await;
             let _ = upstream_write.shutdown().await;
             ending
         };
@@ -853,7 +1012,7 @@ async fn relay(
         let relayed = async {
             tokio::select! {
                 ending = &mut forward => match ending {
-                    Ending::ChangeUser | Ending::Broken(_) => ending,
+                    Ending::ChangeUser | Ending::ReadOnly | Ending::Broken(_) => ending,
                     other => match backward.as_mut().await {
                         broken @ Ending::Broken(_) if !quit.load(Ordering::SeqCst) => broken,
                         _ => other,

@@ -71,6 +71,9 @@ pub struct Script {
     pub flow: Flow,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub deny_text: &'static str,
+    pub server_version: &'static [u8],
+    pub extra_capabilities: u32,
+    pub first_reply: Option<Vec<u8>>,
 }
 
 impl Script {
@@ -80,11 +83,29 @@ impl Script {
             flow,
             tls: None,
             deny_text: DENY_TEXT,
+            server_version: SERVER_VERSION,
+            extra_capabilities: 0,
+            first_reply: None,
         }
     }
 
     pub fn with_deny_text(mut self, text: &'static str) -> Self {
         self.deny_text = text;
+        self
+    }
+
+    pub fn with_server_version(mut self, version: &'static [u8]) -> Self {
+        self.server_version = version;
+        self
+    }
+
+    pub fn with_capabilities(mut self, extra: u32) -> Self {
+        self.extra_capabilities = extra;
+        self
+    }
+
+    pub fn with_first_reply(mut self, reply: Vec<u8>) -> Self {
+        self.first_reply = Some(reply);
         self
     }
 
@@ -254,12 +275,12 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
         let refusal = packet::err_packet(1040, "08004", "Too many connections");
         return packet::write_packet(&mut tcp, 0, &refusal).await;
     }
-    let mut capabilities = SERVER_CAPS;
+    let mut capabilities = SERVER_CAPS | script.extra_capabilities;
     if script.tls.is_some() {
         capabilities |= packet::CLIENT_SSL;
     }
     let greeting = Greeting {
-        server_version: SERVER_VERSION.to_vec(),
+        server_version: script.server_version.to_vec(),
         connection_id: CONNECTION_ID,
         scramble: salt(1),
         capabilities,
@@ -302,6 +323,7 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
     }
     seen.lock().unwrap().authenticated = true;
     packet::write_packet(&mut stream, seq, &packet::ok_packet(OK_INFO)).await?;
+    let mut first_reply = script.first_reply.clone();
     loop {
         let Ok(command) = packet::read_packet(&mut stream, 2 * packet::MAX_PAYLOAD).await else {
             return Ok(());
@@ -313,12 +335,10 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
         if script.flow == Flow::ResetAfterCommand {
             return Ok(());
         }
-        packet::write_packet(
-            &mut stream,
-            command.seq.wrapping_add(1),
-            &packet::ok_packet(OK_INFO),
-        )
-        .await?;
+        let reply = first_reply
+            .take()
+            .unwrap_or_else(|| packet::ok_packet(OK_INFO));
+        packet::write_packet(&mut stream, command.seq.wrapping_add(1), &reply).await?;
     }
 }
 
@@ -409,15 +429,26 @@ pub async fn listen_gated(
 }
 
 pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
+    granted_with(password, zs_protocol::SessionAccess::ReadWrite)
+}
+
+pub fn granted_with(
+    password: &[u8],
+    access: zs_protocol::SessionAccess,
+) -> zs_protocol::Materialized {
     zs_protocol::Materialized::new(
         zs_credential::Credential::from_bytes(password.to_vec()).unwrap(),
-        zs_protocol::SessionAccess::ReadWrite,
+        access,
         Arc::new(|| Ok(())),
     )
 }
 
 pub fn materialize(password: &'static str) -> Materialize {
     Arc::new(move || Ok(granted(password.as_bytes())))
+}
+
+pub fn materialize_with(password: &'static str, access: zs_protocol::SessionAccess) -> Materialize {
+    Arc::new(move || Ok(granted_with(password.as_bytes(), access)))
 }
 
 pub fn counted(password: &'static str) -> (Materialize, Arc<AtomicUsize>) {
@@ -473,7 +504,11 @@ impl Session {
     pub async fn query(&mut self, sql: &str) -> std::io::Result<Vec<u8>> {
         let mut command = vec![packet::COM_QUERY];
         command.extend_from_slice(sql.as_bytes());
-        packet::write_packet(&mut self.stream, 0, &command).await?;
+        self.run(&command).await
+    }
+
+    pub async fn run(&mut self, command: &[u8]) -> std::io::Result<Vec<u8>> {
+        packet::write_packet(&mut self.stream, 0, command).await?;
         let mut all = Vec::new();
         let mut eofs = 0;
         loop {

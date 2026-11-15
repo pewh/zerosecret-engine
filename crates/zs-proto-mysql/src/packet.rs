@@ -19,6 +19,7 @@ pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 pub const CLIENT_SESSION_TRACK: u32 = 0x0080_0000;
 pub const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
 pub const CLIENT_ZSTD_COMPRESSION_ALGORITHM: u32 = 0x0400_0000;
+pub const CLIENT_QUERY_ATTRIBUTES: u32 = 0x0800_0000;
 pub const CLIENT_MULTI_FACTOR_AUTHENTICATION: u32 = 0x1000_0000;
 
 pub const REQUIRED_SERVER_CAPABILITIES: u32 =
@@ -37,6 +38,8 @@ pub const CLEAR_PASSWORD: &[u8] = b"mysql_clear_password";
 pub const COM_QUIT: u8 = 0x01;
 pub const COM_QUERY: u8 = 0x03;
 pub const COM_CHANGE_USER: u8 = 0x11;
+pub const COM_STMT_PREPARE: u8 = 0x16;
+pub const COM_RESET_CONNECTION: u8 = 0x1f;
 
 pub const OK_HEADER: u8 = 0x00;
 pub const MORE_DATA_HEADER: u8 = 0x01;
