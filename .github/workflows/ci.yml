@@ -313,6 +313,7 @@ jobs:
       - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
         env:
           ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
+      - run: cargo test --locked -p zs-proto-postgres --test read_only_real -- --nocapture
       - name: Redis real tests
         env:
           ZS_TEST_REDIS_ADDR: 127.0.0.1:6380

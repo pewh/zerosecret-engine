@@ -85,6 +85,8 @@ pub struct Seen {
     pub queries: Vec<String>,
     pub cancels: Vec<Vec<u8>>,
     pub terminated: bool,
+    pub startup: Vec<u8>,
+    pub messages: Vec<Vec<u8>>,
 }
 
 pub struct Fake {
@@ -176,7 +178,11 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
         seen.lock().unwrap().cancels.push(packet);
         return Ok(());
     }
-    seen.lock().unwrap().startups += 1;
+    {
+        let mut seen = seen.lock().unwrap();
+        seen.startups += 1;
+        seen.startup = packet.clone();
+    }
     if let Auth::Method(code) = script.auth {
         let mut body = code.to_be_bytes().to_vec();
         if code == 5 {
@@ -206,18 +212,23 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
         return Ok(());
     }
     while let Ok((tag, body)) = read_tagged(&mut stream).await {
-        if tag == b'X' {
-            seen.lock().unwrap().terminated = true;
+        seen.lock().unwrap().messages.push(frame(tag, &body));
+        match tag {
+            b'Q' => {
+                let sql = String::from_utf8_lossy(&body)
+                    .trim_end_matches('\0')
+                    .to_string();
+                seen.lock().unwrap().queries.push(sql);
+                write_tagged(&mut stream, b'C', b"SELECT 1\0").await?;
+                write_tagged(&mut stream, b'Z', b"I").await?;
+            }
+            b'S' => write_tagged(&mut stream, b'Z', b"I").await?,
+            b'X' => {
+                seen.lock().unwrap().terminated = true;
+                break;
+            }
+            _ => {}
         }
-        if tag != b'Q' {
-            break;
-        }
-        let sql = String::from_utf8_lossy(&body)
-            .trim_end_matches('\0')
-            .to_string();
-        seen.lock().unwrap().queries.push(sql);
-        write_tagged(&mut stream, b'C', b"SELECT 1\0").await?;
-        write_tagged(&mut stream, b'Z', b"I").await?;
     }
     let _ = stream.shutdown().await;
     Ok(())
@@ -268,7 +279,7 @@ async fn scram<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io::Re
     Ok(true)
 }
 
-fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+pub fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut msg = vec![tag];
     msg.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     msg.extend_from_slice(body);
@@ -391,9 +402,16 @@ pub async fn listen_gated(
 }
 
 pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
+    granted_as(password, zs_protocol::SessionAccess::ReadWrite)
+}
+
+pub fn granted_as(
+    password: &[u8],
+    access: zs_protocol::SessionAccess,
+) -> zs_protocol::Materialized {
     zs_protocol::Materialized::new(
         Credential::from_bytes(password.to_vec()).unwrap(),
-        zs_protocol::SessionAccess::ReadWrite,
+        access,
         Arc::new(|| Ok(())),
     )
 }

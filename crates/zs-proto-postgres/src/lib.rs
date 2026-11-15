@@ -6,6 +6,9 @@ use thiserror::Error;
 use zeroize::Zeroize;
 use zs_diag::{Component, DiagLog, Event, ServerText};
 
+mod read_only;
+pub use read_only::{PARSE_REFUSAL, QUERY_REFUSAL, READ_ONLY_REASON, read_only_startup, scan};
+
 #[derive(Debug, Error)]
 pub enum PostgresError {
     #[error("bad startup message")]
@@ -1373,6 +1376,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_large_frontend_message_is_relayed_intact() {
+        relay_large_message(SessionAccess::ReadWrite).await;
+        relay_large_message(SessionAccess::ReadOnly).await;
+    }
+
+    async fn relay_large_message(access: SessionAccess) {
         let trace = Trace::disabled();
         let (mut from_client, client) = tokio::io::duplex(64 * 1024);
         let (upstream, mut relayed_to_upstream) = tokio::io::duplex(64 * 1024);
@@ -1391,7 +1399,7 @@ mod tests {
             from_client.write_all(&large).await.unwrap();
             from_client.shutdown().await.unwrap();
         };
-        let copy = copy_frontend(client, upstream, &counter, &trace);
+        let copy = copy_frontend(client, upstream, access, &counter, &trace);
         let collect = async {
             let mut received = Vec::new();
             relayed_to_upstream
@@ -1413,6 +1421,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_only_session_forwards_no_part_of_an_unfinished_message() {
+        for (access, forwarded) in [(SessionAccess::ReadWrite, 5), (SessionAccess::ReadOnly, 0)] {
+            let trace = Trace::disabled();
+            let (mut from_client, client) = tokio::io::duplex(1024);
+            let (upstream, mut relayed_to_upstream) = tokio::io::duplex(1024);
+            let counter = AtomicU64::new(0);
+            let mut partial = vec![b'Q', 0, 0, 0, 100];
+            partial.extend_from_slice(b"SELECT 1; ");
+            from_client.write_all(&partial).await.unwrap();
+            from_client.shutdown().await.unwrap();
+
+            let error = copy_frontend(client, upstream, access, &counter, &trace)
+                .await
+                .expect_err("an unfinished message must end the relay");
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            let mut received = Vec::new();
+            relayed_to_upstream
+                .read_to_end(&mut received)
+                .await
+                .unwrap();
+            assert_eq!(received.len(), forwarded, "{access:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_bad_frontend_length_ends_the_relay() {
         let trace = Trace::disabled();
         let (mut from_client, client) = tokio::io::duplex(1024);
@@ -1420,7 +1453,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         from_client.write_all(&[b'Q', 0, 0, 0, 3]).await.unwrap();
 
-        let error = copy_frontend(client, upstream, &counter, &trace)
+        let error = copy_frontend(client, upstream, SessionAccess::ReadWrite, &counter, &trace)
             .await
             .expect_err("a length below the framing minimum must end the relay");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -1445,6 +1478,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zs_credential::Credential;
+use zs_protocol::SessionAccess;
 
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
@@ -1484,6 +1518,7 @@ impl Trace {
     fn refuse_startup(&self, reason: &'static str) -> Vec<u8> {
         let (code, reply) = match reason {
             REPLICATION_REFUSED_REASON => ("replication", REPLICATION_REFUSED),
+            READ_ONLY_REASON => ("read_only", READ_ONLY_REFUSED),
             _ => ("user_mismatch", USER_REFUSED),
         };
         let mut event = self.event("client_refused").warn().code("reason", code);
@@ -1506,6 +1541,14 @@ impl Trace {
             .warn()
             .code("reason", "revoked");
         if let Some(seq) = (self.audit_refusal)("connect", reason) {
+            event = event.audit_seq(seq);
+        }
+        self.diag.emit(event);
+    }
+
+    fn refuse_statement(&self, word: &'static str) {
+        let mut event = self.event("statement_refused").warn().code("word", word);
+        if let Some(seq) = (self.audit_refusal)("query", READ_ONLY_REASON) {
             event = event.audit_seq(seq);
         }
         self.diag.emit(event);
@@ -1928,12 +1971,12 @@ where
         return Ok(());
     }
 
-    let (credential, watch) = match materialize() {
+    let (access, (credential, watch)) = match materialize() {
         Ok(materialized) => {
             trace
                 .diag
                 .emit(trace.event("materialized").code("decision", "allow"));
-            materialized.into_parts()
+            (materialized.access(), materialized.into_parts())
         }
         Err(denied) => {
             trace.diag.emit(
@@ -1946,6 +1989,18 @@ where
             let _ = client.write_all(&error_response(&denied.reason)).await;
             return Ok(());
         }
+    };
+    let startup = match access {
+        SessionAccess::ReadWrite => startup,
+        SessionAccess::ReadOnly => match read_only_startup(&startup) {
+            Ok(rewritten) => rewritten,
+            Err(_) => {
+                let _ = client
+                    .write_all(&trace.refuse_startup(READ_ONLY_REASON))
+                    .await;
+                return Ok(());
+            }
+        },
     };
 
     let tcp = match connect(target.endpoint.clone()).await {
@@ -2094,7 +2149,7 @@ where
         .map_err(at("ready"))?;
 
     let started = std::time::Instant::now();
-    let relayed = relay(client, upstream, watch, trace).await;
+    let relayed = relay(client, upstream, access, watch, trace).await;
     trace.diag.emit(
         trace
             .event("conn_closed")
@@ -2116,6 +2171,10 @@ const UPSTREAM_AUTHENTICATION_FAILED: (&str, &str) = ("28000", "upstream authent
 const UPSTREAM_TLS_FAILED: (&str, &str) = ("08006", "upstream TLS failed");
 const USER_REFUSED: (&str, &str) = ("28000", "database user not allowed by the binding");
 const REPLICATION_REFUSED: (&str, &str) = ("28000", "replication connections are refused");
+const READ_ONLY_REFUSED: (&str, &str) = (
+    "28000",
+    "connection options not accepted on a read-only resource",
+);
 
 async fn refuse(
     client: &mut TcpStream,
@@ -2377,6 +2436,7 @@ fn counted(joined: Copied, counter: &AtomicU64) -> std::io::Result<u64> {
 async fn relay(
     client: TcpStream,
     upstream: Box<dyn Io>,
+    access: SessionAccess,
     watch: zs_protocol::SessionWatch,
     trace: &Trace,
 ) -> Relayed {
@@ -2387,7 +2447,14 @@ async fn relay(
     let (up_count, down_count) = (up_bytes.clone(), down_bytes.clone());
     let frontend_trace = trace.clone();
     let mut to_upstream = tokio::spawn(async move {
-        copy_frontend(client_read, upstream_write, &up_count, &frontend_trace).await
+        copy_frontend(
+            client_read,
+            upstream_write,
+            access,
+            &up_count,
+            &frontend_trace,
+        )
+        .await
     });
     let mut to_client =
         tokio::spawn(async move { copy_backend(upstream_read, client_write, &down_count).await });
@@ -2430,9 +2497,40 @@ enum First {
 
 const MAX_FRONTEND_MESSAGE: u32 = i32::MAX as u32;
 
+fn invalid(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+async fn screened<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    tag: u8,
+    length: u32,
+    trace: &Trace,
+) -> std::io::Result<Vec<u8>> {
+    if length > read_only::MAX_SCREENED_MESSAGE {
+        return Err(invalid("postgres message too large to screen"));
+    }
+    let mut message = vec![tag];
+    message.extend_from_slice(&length.to_be_bytes());
+    let body = u64::from(length) - 4;
+    (&mut *reader).take(body).read_to_end(&mut message).await?;
+    if message.len() as u64 != 5 + body {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    match read_only::refusal(tag, &message[5..], false) {
+        Ok(None) => Ok(message),
+        Ok(Some((word, replacement))) => {
+            trace.refuse_statement(word);
+            Ok(replacement)
+        }
+        Err(_) => Err(invalid("bad postgres message")),
+    }
+}
+
 async fn copy_frontend<R, W>(
     mut reader: R,
     mut writer: W,
+    access: SessionAccess,
     counter: &AtomicU64,
     trace: &Trace,
 ) -> std::io::Result<u64>
@@ -2440,6 +2538,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let read_only = access == SessionAccess::ReadOnly;
     let mut body = vec![0u8; 16 * 1024];
     let mut total = 0u64;
     loop {
@@ -2451,10 +2550,18 @@ where
         reader.read_exact(&mut length).await?;
         let length = u32::from_be_bytes(length);
         if !(4..=MAX_FRONTEND_MESSAGE).contains(&length) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bad postgres message length",
-            ));
+            return Err(invalid("bad postgres message length"));
+        }
+        if read_only && read_only::SCREENED.contains(&tag[0]) {
+            let forwarded = screened(&mut reader, tag[0], length, trace).await?;
+            writer.write_all(&forwarded).await?;
+            writer.flush().await?;
+            total += forwarded.len() as u64;
+            counter.store(total, Ordering::Relaxed);
+            continue;
+        }
+        if read_only && !read_only::STREAMED.contains(&tag[0]) {
+            return Err(invalid("unknown postgres message"));
         }
         if tag[0] == b'X' {
             trace.diag.emit(trace.event("client_terminate"));
