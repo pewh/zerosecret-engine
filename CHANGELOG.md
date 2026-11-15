@@ -10,6 +10,9 @@
   echoed credential cannot come back in parts (ADR-0059).
 - A database resource name is no longer a proxy host: `CONNECT <database resource>:<port>`
   passes through without a credential.
+- A policy file is refused at load when two bindings share a key: a database resource name
+  that equals an http or https host, or two http or https bindings on one host. Before, one
+  binding silently replaced the other.
 - `zs init` lists every leftover copy of a brokered secret in `.env`, lists `_PASS` and `_PWD`
   keys, and sets an existing credential file to 0600.
 - The MongoDB relay refuses an `OP_MSG` that does not have exactly one body section; the MySQL

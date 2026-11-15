@@ -253,3 +253,32 @@ APP_NAME=my-app-service\n",
         );
     }
 }
+
+#[test]
+fn an_exact_copy_of_a_short_password_under_a_plain_key_is_listed() {
+    let sandbox = Sandbox::with_env(
+        "MYSQL_HOST=db.example.internal\n\
+MYSQL_USER=app\n\
+MYSQL_PASSWORD=app\n\
+LEGACY_DB=app\n\
+APP_LABEL=app-service\n",
+    );
+
+    let output = sandbox.init();
+    let printed = printed(&output);
+    assert!(output.status.success(), "{printed}");
+    assert_eq!(
+        fs::read_to_string(sandbox.credential("mysql")).unwrap(),
+        "app",
+        "positive control: zs init brokered the password: {printed}"
+    );
+    assert!(
+        !listed_as_not_brokered(&printed, "APP_LABEL"),
+        "negative control: a value that only contains the short password is not listed: {printed}"
+    );
+    assert!(
+        listed_as_not_brokered(&printed, "LEGACY_DB"),
+        "LEGACY_DB keeps the brokered password and its name does not mark a secret, and zs init \
+         did not list it: {printed}"
+    );
+}

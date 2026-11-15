@@ -443,3 +443,52 @@ async fn the_proxy_does_not_send_an_https_credential_to_a_database_port() {
          port received the https binding's credential, on a path outside `paths`"
     );
 }
+
+#[test]
+fn a_binding_key_used_twice_is_refused_at_load() {
+    let https = serde_json::json!({ "resource": API, "host": HOST, "protocol": "https" });
+    let postgres = |resource: &str| {
+        serde_json::json!({
+            "resource": resource,
+            "host": PG_HOST,
+            "protocol": "postgres",
+            "upstream_port": PG_PORT
+        })
+    };
+    let validate = |bindings: serde_json::Value| {
+        serde_json::from_value::<zs::AgentFile>(serde_json::json!({ "bindings": bindings }))
+            .unwrap()
+            .validate()
+    };
+
+    validate(serde_json::json!([https.clone(), postgres(PG)]))
+        .expect("positive control: distinct keys load");
+
+    for (case, bindings) in [
+        (
+            "database resource named as the https host",
+            serde_json::json!([https.clone(), postgres(HOST)]),
+        ),
+        (
+            "https host named as the database resource, other case",
+            serde_json::json!([postgres(&HOST.to_ascii_uppercase()), https.clone()]),
+        ),
+        (
+            "two https bindings on one host",
+            serde_json::json!([
+                https.clone(),
+                { "resource": "second-api", "host": HOST.to_ascii_uppercase(), "protocol": "https" }
+            ]),
+        ),
+    ] {
+        let Err(error) = validate(bindings) else {
+            panic!("{case}: a binding silently replaces another, so the load must refuse it");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("is already used by another binding"),
+            "{case}: {error}"
+        );
+    }
+}

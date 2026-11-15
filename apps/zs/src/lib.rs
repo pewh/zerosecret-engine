@@ -747,6 +747,7 @@ impl AgentFile {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut prefixes = std::collections::HashSet::new();
         let mut listen_ports = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
         for signed in &self.grants {
             if !matches!(
                 signed.grant.source,
@@ -762,6 +763,14 @@ impl AgentFile {
             if binding.source.is_some() {
                 return Err(ConfigError::Policy(format!(
                     "{}: source is set only by the control plane",
+                    binding.resource
+                )));
+            }
+            if let Some(key) = binding_key(binding)
+                && !keys.insert(key.to_ascii_lowercase())
+            {
+                return Err(ConfigError::Policy(format!(
+                    "{}: {key} is already used by another binding",
                     binding.resource
                 )));
             }
@@ -946,6 +955,20 @@ fn resource_key(host: &str) -> String {
     host.to_ascii_lowercase()
 }
 
+// The key of a binding in `AgentHandler::bindings`: its resource name for a database, its host
+// for http and https.
+fn binding_key(binding: &ResourceBinding) -> Option<String> {
+    match zs_protocol::classify_intercepted_protocol(&binding.protocol)? {
+        zs_protocol::InterceptedProtocol::Postgres
+        | zs_protocol::InterceptedProtocol::Mysql
+        | zs_protocol::InterceptedProtocol::Mongo
+        | zs_protocol::InterceptedProtocol::Redis => Some(binding.resource.clone()),
+        zs_protocol::InterceptedProtocol::Https | zs_protocol::InterceptedProtocol::Http => {
+            Some(resource_key(&binding.host))
+        }
+    }
+}
+
 fn protocol_for_auth(
     auth: &HttpAuth,
     host: &str,
@@ -1026,28 +1049,16 @@ impl AgentHandler {
         let mut protocols: HashMap<String, Arc<dyn Protocol>> = HashMap::new();
         for binding in bindings {
             // Enumerate, never negate (ADR-0022): an unknown protocol gets no handler and denies.
-            match zs_protocol::classify_intercepted_protocol(&binding.protocol) {
-                Some(
-                    zs_protocol::InterceptedProtocol::Postgres
-                    | zs_protocol::InterceptedProtocol::Mysql
-                    | zs_protocol::InterceptedProtocol::Mongo
-                    | zs_protocol::InterceptedProtocol::Redis,
-                ) => {
-                    by_host.insert(binding.resource.clone(), binding);
-                }
-                Some(
-                    zs_protocol::InterceptedProtocol::Https
-                    | zs_protocol::InterceptedProtocol::Http,
-                ) => {
-                    let key = resource_key(&binding.host);
-                    protocols.insert(
-                        key.clone(),
-                        protocol_for_auth(&binding.auth, &binding.host, vec![workload.clone()]),
-                    );
-                    by_host.insert(key, binding);
-                }
-                None => {}
+            let Some(key) = binding_key(&binding) else {
+                continue;
+            };
+            if !binding.is_l3() {
+                protocols.insert(
+                    key.clone(),
+                    protocol_for_auth(&binding.auth, &binding.host, vec![workload.clone()]),
+                );
             }
+            by_host.insert(key, binding);
         }
         Self {
             subject,
