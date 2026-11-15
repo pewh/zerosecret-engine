@@ -303,7 +303,7 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
     seen.lock().unwrap().authenticated = true;
     packet::write_packet(&mut stream, seq, &packet::ok_packet(OK_INFO)).await?;
     loop {
-        let Ok(command) = packet::read_packet(&mut stream, 1 << 24).await else {
+        let Ok(command) = packet::read_packet(&mut stream, 2 * packet::MAX_PAYLOAD).await else {
             return Ok(());
         };
         if command.payload.first() == Some(&packet::COM_QUIT) {

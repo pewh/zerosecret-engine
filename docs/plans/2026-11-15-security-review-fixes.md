@@ -164,13 +164,13 @@ Rewritten 2026-11-15 after the owner accepted the [session-end spec](../specs/20
 **Interfaces:**
 - Produces: `pub fn body_sections(payload: &[u8]) -> Result<usize, Malformed>` in `zs-proto-mongo/src/wire.rs`: the number of kind 0 sections, walking the sections as `exceeds_depth` does.
 
-- [ ] **Step 1: Copy both tests into place** and run them. Run: `cargo test -p zs-proto-mongo --test second_body_section`, `cargo test -p zs-proto-mysql --test change_user_sequence`. Expected: both FAIL at the last assertion.
-- [ ] **Step 2: Write the MySQL continuation test** in `change_user_sequence.rs`: `a_continuation_packet_that_starts_with_0x11_is_forwarded`. Send one command as two packets: sequence 0 with exactly `0xff_ffff` payload bytes (`0x03` then filler), then sequence 1 whose payload starts with `0x11` and holds a marker. Assert that the fake upstream received the marker and that the session is still open. Run it. Expected: PASS today; it must still pass after step 4.
-- [ ] **Step 3: MongoDB.** Add `body_sections`; in the relay, after the `exceeds_depth` match (`:851-855`), a result other than `Ok(1)` returns `Ending::Refused("malformed")`. Add a unit test in `wire.rs` for 0, 1 and 2 body sections and for a kind 1 section before the body.
-- [ ] **Step 4: MySQL.** In `forward_commands`, keep `let mut command_start = true;`. Replace both `header[3] == 0 &&` conditions (`:784`, `:787`) with `command_start &&`. After each packet set `command_start = len < 0xff_ffff`.
-- [ ] **Step 5: Run.** Both test files PASS; then `cargo test -p zs-proto-mongo` and `cargo test -p zs-proto-mysql`: all pass.
-- [ ] **Step 6: Documents.** `docs/SECURITY.md:944`: add "an `OP_MSG` that does not have exactly one body section" to the list. `:936`: add "whatever its sequence id".
-- [ ] **Step 7: Gate and commit.** `fix(l3): refuse a second OP_MSG body section and COM_CHANGE_USER at any sequence id`.
+- [x] **Step 1: Copy both tests into place** and run them. Run: `cargo test -p zs-proto-mongo --test second_body_section`, `cargo test -p zs-proto-mysql --test change_user_sequence`. Expected: both FAIL at the last assertion.
+- [x] **Step 2: Write the MySQL continuation test** in `change_user_sequence.rs`: `a_continuation_packet_that_starts_with_0x11_is_forwarded`. Send one command as two packets: sequence 0 with exactly `0xff_ffff` payload bytes (`0x03` then filler), then sequence 1 whose payload starts with `0x11` and holds a marker. Assert that the fake upstream received the marker and that the session is still open. Run it. Expected: PASS today; it must still pass after step 4.
+- [x] **Step 3: MongoDB.** Add `body_sections`; in the relay, after the `exceeds_depth` match (`:851-855`), a result other than `Ok(1)` returns `Ending::Refused("malformed")`. Add a unit test in `wire.rs` for 0, 1 and 2 body sections and for a kind 1 section before the body.
+- [x] **Step 4: MySQL.** In `forward_commands`, keep `let mut command_start = true;`. Replace both `header[3] == 0 &&` conditions (`:784`, `:787`) with `command_start &&`. After each packet set `command_start = len < 0xff_ffff`.
+- [x] **Step 5: Run.** Both test files PASS; then `cargo test -p zs-proto-mongo` and `cargo test -p zs-proto-mysql`: all pass.
+- [x] **Step 6: Documents.** `docs/SECURITY.md:944`: add "an `OP_MSG` that does not have exactly one body section" to the list. `:936`: add "whatever its sequence id".
+- [x] **Step 7: Gate and commit.** `fix(l3): refuse a second OP_MSG body section and COM_CHANGE_USER at any sequence id`.
 
 ---
 

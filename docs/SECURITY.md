@@ -944,7 +944,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | `Host` missing, repeated or for another origin, or a target that is not origin-form, inside a tunnel to a bound host | Refuse before the upstream. Audit `deny` with the method. Absolute-form: the URI authority replaces `Host` (ADR-0027) |
 | `paths` empty, not canonical or on a non-HTTPS binding, or an unknown binding field | Refuse the config at load. Never fall back to host-wide injection (ADR-0027) |
 | Diagnostic log unavailable or full | Traffic continues. One stderr warning. The log never holds a credential, a request path or workload data (ADR-0028) |
-| MySQL client sends `COM_CHANGE_USER` | Refuse with an ERR packet and close. Never forward it. Audit `deny` `change_user` (ADR-0029) |
+| MySQL client sends `COM_CHANGE_USER`, whatever its sequence id | Refuse with an ERR packet and close. Never forward it. Audit `deny` `change_user` (ADR-0029) |
 | MySQL upstream asks for a method that sends the password without verified TLS, or switches to an unknown plugin | Refuse. Never send the password or the RSA key request (`0x02`) (ADR-0029) |
 | MySQL upstream TLS fails verification or the pin, or `upstream_ca` or `upstream_cert_sha256` is set and the server does not offer TLS | Refuse. Never fall back to plaintext (ADR-0029) |
 | MySQL client asks for TLS or compression on the loopback leg | Refuse before any auth data goes upstream (ADR-0029) |
@@ -952,7 +952,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | PostgreSQL binding sets `upstream_ca` or `upstream_cert_sha256`, and the server answers `N` to the SSLRequest | Refuse before the startup packet (ADR-0030) |
 | PostgreSQL server sends a byte after `S` before the TLS handshake, or an answer that is not `S` or `N` | Refuse before the startup packet (ADR-0030) |
 | MongoDB client sends `saslStart`, `saslContinue` or `authenticate` | Send an error reply (code 18, fixed text) and close. Never forward it. Audit `deny` `authenticate` (ADR-0031) |
-| MongoDB client sends a first message that is not `hello`, `OP_COMPRESSED`, a checksummed message, a later `OP_QUERY`, another opcode, a frame outside the limits, or a frame that does not parse | Close. Never forward it (ADR-0031) |
+| MongoDB client sends a first message that is not `hello`, `OP_COMPRESSED`, a checksummed message, a later `OP_QUERY`, another opcode, an `OP_MSG` that does not have exactly one body section, a frame outside the limits, or a frame that does not parse | Close. Never forward it (ADR-0031) |
 | MongoDB upstream offers no SCRAM mechanism, or gives a bad nonce, an iteration count out of range, too many rounds or a wrong server signature | Refuse. Never relay (ADR-0031) |
 | MongoDB upstream TLS fails verification or the pin | Refuse. Never fall back to plaintext (ADR-0031) |
 | MongoDB discovery finds a primary that is not in `hosts`, needs a second redirect, finds another set name, or finds no writable primary | Refuse. Never authenticate there (ADR-0031) |

@@ -187,6 +187,28 @@ pub fn command_name(payload: &[u8]) -> Option<&str> {
     None
 }
 
+pub fn body_sections(payload: &[u8]) -> Result<usize, Malformed> {
+    let flags = msg_flags(payload).ok_or(Malformed)?;
+    let end = sections_end(payload, flags).ok_or(Malformed)?;
+    let mut at = 4;
+    let mut bodies = 0;
+    while at < end {
+        let kind = *payload.get(at).ok_or(Malformed)?;
+        at += 1;
+        let size = int32_at(payload, at)?;
+        match kind {
+            0 if size >= 5 => bodies += 1,
+            1 if size >= 5 => {}
+            _ => return Err(Malformed),
+        }
+        at = at.checked_add(size).ok_or(Malformed)?;
+        if at > end {
+            return Err(Malformed);
+        }
+    }
+    Ok(bodies)
+}
+
 pub fn exceeds_depth(payload: &[u8], limit: usize) -> Result<bool, Malformed> {
     let flags = msg_flags(payload).ok_or(Malformed)?;
     let end = sections_end(payload, flags).ok_or(Malformed)?;
@@ -399,6 +421,49 @@ mod tests {
             exceeds_depth(payload(&frame), bson::MAX_DOCUMENT_DEPTH),
             Err(Malformed)
         );
+    }
+
+    #[test]
+    fn body_sections_are_counted() {
+        let body = || Section::Body(Doc::new().with_i32("ping", 1).with_str("$db", "zsdb"));
+        let documents = || Section::Sequence(sequence(&Doc::new().with_i32("x", 1)));
+        let count = |sections: Vec<Section>| {
+            let frame = OpMsg { flags: 0, sections }.encode(1, 0);
+            body_sections(payload(&frame))
+        };
+        assert_eq!(count(vec![]), Ok(0));
+        assert_eq!(count(vec![documents()]), Ok(0));
+        assert_eq!(count(vec![body()]), Ok(1));
+        assert_eq!(count(vec![documents(), body()]), Ok(1));
+        assert_eq!(count(vec![body(), documents()]), Ok(1));
+        assert_eq!(count(vec![body(), body()]), Ok(2));
+        assert_eq!(count(vec![documents(), body(), body()]), Ok(2));
+    }
+
+    #[test]
+    fn body_sections_refuses_a_section_it_cannot_walk() {
+        let body = Doc::new().with_i32("ping", 1).encode();
+        let with = |sections: &[(u8, &[u8])]| {
+            let mut out = 0u32.to_le_bytes().to_vec();
+            for (kind, bytes) in sections {
+                out.push(*kind);
+                out.extend_from_slice(bytes);
+            }
+            out
+        };
+        for (case, bytes) in [
+            ("unknown section kind", with(&[(0, &body), (2, &body)])),
+            (
+                "sequence past the end",
+                with(&[(0, &body), (1, &[50, 0, 0, 0, b'd', 0])]),
+            ),
+            ("body past the end", with(&[(0, &[50, 0, 0, 0, 0])])),
+            ("body shorter than a document", with(&[(0, &[4, 0, 0, 0])])),
+            ("truncated size", with(&[(0, &body), (0, &[5, 0])])),
+            ("truncated flags", vec![0, 0]),
+        ] {
+            assert_eq!(body_sections(&bytes), Err(Malformed), "{case}");
+        }
     }
 
     #[test]

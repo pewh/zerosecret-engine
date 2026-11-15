@@ -848,6 +848,9 @@ where
             Ok(true) => return Ending::Refused("document_depth"),
             Err(_) => return Ending::Refused("malformed"),
         }
+        if wire::body_sections(&payload) != Ok(1) {
+            return Ending::Refused("malformed");
+        }
         let frame = if topology::is_hello(command) {
             let Ok(mut msg) = OpMsg::parse(&payload) else {
                 return Ending::Refused("malformed");

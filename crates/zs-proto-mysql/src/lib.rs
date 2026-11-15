@@ -769,6 +769,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut command_start = true;
     loop {
         let mut header = [0u8; 4];
         if client.read_exact(&mut header).await.is_err() {
@@ -780,10 +781,11 @@ where
         if client.read_exact(&mut payload).await.is_err() {
             return Ending::Client;
         }
-        if header[3] == 0 && payload.first() == Some(&COM_CHANGE_USER) {
+        if command_start && payload.first() == Some(&COM_CHANGE_USER) {
             return Ending::ChangeUser;
         }
-        let quitting = header[3] == 0 && payload.first() == Some(&COM_QUIT);
+        let quitting = command_start && payload.first() == Some(&COM_QUIT);
+        command_start = len < packet::MAX_PAYLOAD;
         if quitting {
             quit.store(true, Ordering::SeqCst);
         }
