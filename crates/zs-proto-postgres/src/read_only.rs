@@ -1,12 +1,37 @@
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use tokio::sync::Notify;
+
 use crate::{PostgresError, Result};
 
 pub const QUERY_REFUSAL: &str = "DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '25006', MESSAGE = 'zs: refused, read-only resource'; END $$";
 pub const PARSE_REFUSAL: &str = "SELECT zs_refused_read_only_resource()";
 pub const READ_ONLY_REASON: &str = "read-only";
+pub const READ_ONLY_ESCAPED_REASON: &str = "read-only escaped";
 
 pub(crate) const SCREENED: &[u8] = b"QPF";
 pub(crate) const STREAMED: &[u8] = b"BCcdDEfHpSX";
 pub(crate) const MAX_SCREENED_MESSAGE: u32 = 0x3fff_ffff;
+pub(crate) const MAX_PARAMETER_STATUS: u32 = 16 * 1024;
+
+const MODE_SETTING: &[u8] = b"default_transaction_read_only";
+const SUPERUSER_SETTING: &[u8] = b"is_superuser";
+const SUPERUSER_WORDS: [&str; 9] = [
+    "program",
+    "pg_reload_conf",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "lo_import",
+    "lo_export",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+];
+const SUPERUSER_PHRASES: [(&str, &str, &str); 3] = [
+    ("alter", "system", "alter system"),
+    ("session", "authorization", "session authorization"),
+    ("set", "role", "set role"),
+];
 
 const FUNCTION_CALL: &str = "function_call";
 const AGENT_OPTION: &[u8] = b"-c default_transaction_read_only=on";
@@ -242,9 +267,24 @@ fn followed_by(text: &[u8], at: usize, word: &str, budget: &mut usize) -> bool {
     skip_blank(text, at, budget).is_none_or(|next| word_at(text, next, word))
 }
 
-pub fn scan(text: &[u8], _superuser: bool) -> Option<&'static str> {
+fn superuser_match(text: &[u8], at: usize, budget: &mut usize) -> Option<&'static str> {
+    if let Some(word) = SUPERUSER_WORDS.iter().find(|word| word_at(text, at, word)) {
+        return Some(word);
+    }
+    SUPERUSER_PHRASES
+        .iter()
+        .find(|(first, second, _)| {
+            word_at(text, at, first) && followed_by(text, at + first.len(), second, budget)
+        })
+        .map(|(_, _, phrase)| *phrase)
+}
+
+pub fn scan(text: &[u8], superuser: bool) -> Option<&'static str> {
     let mut budget = 4 * text.len() + 1024;
     for at in 0..text.len() {
+        if superuser && let Some(found) = superuser_match(text, at, &mut budget) {
+            return Some(found);
+        }
         if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
             return Some(word);
         }
@@ -297,6 +337,187 @@ pub(crate) fn refusal(
         }
         b'F' => Ok(Some((FUNCTION_CALL, query_refusal()))),
         _ => Ok(None),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    Escaped,
+    Superuser,
+    Other,
+}
+
+pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
+    let (name, rest) = until_nul(body).ok()?;
+    let (value, rest) = until_nul(rest).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(match name {
+        MODE_SETTING if value != b"on" => Status::Escaped,
+        SUPERUSER_SETTING if value == b"on" => Status::Superuser,
+        _ => Status::Other,
+    })
+}
+
+pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
+    let mut superuser = false;
+    let mut rest = tail;
+    while let [tag, a, b, c, d, after @ ..] = rest {
+        let size = (u32::from_be_bytes([*a, *b, *c, *d]) as usize).checked_sub(4)?;
+        let body = after.get(..size)?;
+        if *tag == b'S' {
+            match parameter_status(body)? {
+                Status::Escaped => return None,
+                Status::Superuser => superuser = true,
+                Status::Other => {}
+            }
+        }
+        rest = &after[size..];
+    }
+    rest.is_empty().then_some(superuser)
+}
+
+#[derive(Default)]
+struct GateState {
+    units: u64,
+    ready: u64,
+    copy_in: bool,
+    superuser: bool,
+    escaped: bool,
+}
+
+impl GateState {
+    fn idle(&self) -> bool {
+        self.ready == self.units
+    }
+}
+
+pub(crate) struct Gate {
+    state: Mutex<GateState>,
+    changed: Notify,
+}
+
+impl Gate {
+    pub(crate) fn new(superuser: bool) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                superuser,
+                ..GateState::default()
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn superuser(&self) -> bool {
+        self.state().superuser
+    }
+
+    pub(crate) fn become_superuser(&self) -> bool {
+        !std::mem::replace(&mut self.state().superuser, true)
+    }
+
+    pub(crate) fn escape(&self) {
+        self.state().escaped = true;
+    }
+
+    pub(crate) fn escaped(&self) -> bool {
+        self.state().escaped
+    }
+
+    pub(crate) fn copy_in(&self) {
+        self.state().copy_in = true;
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        let expected = {
+            let mut state = self.state();
+            state.ready += 1;
+            state.copy_in = false;
+            state.ready <= state.units
+        };
+        self.changed.notify_one();
+        expected
+    }
+
+    fn unit(&self) {
+        self.state().units += 1;
+    }
+
+    async fn until<T>(&self, check: impl Fn(&GateState) -> Option<T>) -> T {
+        loop {
+            let notified = self.changed.notified();
+            let found = check(&self.state());
+            if let Some(found) = found {
+                return found;
+            }
+            notified.await;
+        }
+    }
+
+    async fn idle(&self) {
+        self.until(|state| state.idle().then_some(())).await
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Units {
+    open: bool,
+    executes: u32,
+    after_execute: bool,
+    copy_sync: bool,
+}
+
+impl Units {
+    pub(crate) async fn admit(&mut self, gate: &Gate, tag: u8) -> Result<()> {
+        match tag {
+            b'c' | b'd' | b'f' | b'H' | b'X' => {}
+            b'Q' | b'F' if self.open => return Err(PostgresError::BadFraming),
+            b'Q' | b'F' => {
+                gate.idle().await;
+                gate.unit();
+                self.copy_sync = false;
+            }
+            b'S' if self.open => {
+                gate.unit();
+                self.open = false;
+                self.copy_sync = self.executes == 1 && self.after_execute;
+            }
+            b'S' => {
+                let copy_sync = self.copy_sync;
+                let closes_copy = gate
+                    .until(|state| {
+                        if state.idle() {
+                            Some(false)
+                        } else {
+                            (copy_sync && state.copy_in).then_some(true)
+                        }
+                    })
+                    .await;
+                if !closes_copy {
+                    gate.unit();
+                }
+                self.copy_sync = false;
+            }
+            _ => {
+                if !self.open {
+                    gate.idle().await;
+                    self.open = true;
+                    self.executes = 0;
+                    self.copy_sync = false;
+                }
+                if tag == b'E' {
+                    self.executes += 1;
+                }
+                self.after_execute = tag == b'E';
+            }
+        }
+        Ok(())
     }
 }
 
@@ -467,6 +688,329 @@ mod tests {
         ] {
             assert_eq!(scan(text.as_bytes(), false), None, "{text}");
         }
+    }
+
+    const SUPERUSER_WORDS: [&str; 9] = [
+        "program",
+        "pg_reload_conf",
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "lo_import",
+        "lo_export",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+    ];
+
+    #[test]
+    fn every_superuser_word_matches_only_in_a_superuser_session() {
+        for word in SUPERUSER_WORDS {
+            let upper = word.to_ascii_uppercase();
+            for text in [
+                word.to_string(),
+                format!("select {word}(1)"),
+                format!("select pg_catalog.{word}(1)"),
+                format!("select \"{upper}\"(1)"),
+                format!("select '{word}'"),
+                format!("select 1 /* {word} */"),
+                format!("select 1;{upper}"),
+            ] {
+                assert_eq!(scan(text.as_bytes(), true), Some(word), "{text}");
+                assert_eq!(scan(text.as_bytes(), false), None, "{text}");
+            }
+            for text in [
+                format!("select x{word}(1)"),
+                format!("select {word}x(1)"),
+                format!("select _{word}"),
+                format!("select {word}_"),
+                format!("select ${word}"),
+                format!("select {word}$1"),
+                format!("select 0{word}"),
+                format!("select {word}9"),
+                format!("select \u{e9}{word}"),
+            ] {
+                assert_eq!(scan(text.as_bytes(), true), None, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_to_program_is_matched_only_in_a_superuser_session() {
+        for text in [
+            "COPY t TO PROGRAM 'true'",
+            "copy (select 1) to program 'true'",
+            "COPY t FROM PROGRAM 'cat /etc/hostname'",
+            "copy t to\tprogram\n'true'",
+        ] {
+            assert_eq!(scan(text.as_bytes(), true), Some("program"), "{text}");
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
+        }
+        for text in [
+            "select program_id from t",
+            "select programs from t",
+            "select my_program from t",
+        ] {
+            assert_eq!(scan(text.as_bytes(), true), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn every_superuser_phrase_matches_with_blanks_and_comments_between() {
+        for (first, second) in [
+            ("alter", "system"),
+            ("session", "authorization"),
+            ("set", "role"),
+        ] {
+            let phrase = format!("{first} {second}");
+            let upper = phrase.to_ascii_uppercase();
+            for text in [
+                phrase.clone(),
+                format!("{first}  {second} x"),
+                format!("{first}\n\t{second}"),
+                format!("{first}/**/{second}"),
+                format!("{first} /* a /* nested */ b */ {second}"),
+                format!("{first} -- c\n{second}"),
+                format!("select 1; {upper}"),
+                format!("select '{phrase}'"),
+                format!("{first}\x0b\x0c{second}"),
+            ] {
+                assert_eq!(
+                    scan(text.as_bytes(), true),
+                    Some(phrase.as_str()),
+                    "{text:?}"
+                );
+                assert_eq!(scan(text.as_bytes(), false), None, "{text:?}");
+            }
+            for text in [
+                format!("{first}{second}"),
+                format!("{first}_{second}"),
+                format!("{first}, {second}"),
+                format!("x{first} {second}"),
+                format!("{first} {second}x"),
+                format!("{first} /* unterminated {second}"),
+                format!("{first} -- {second}"),
+                format!("{first}\u{a0}{second}"),
+            ] {
+                assert_eq!(scan(text.as_bytes(), true), None, "{text:?}");
+            }
+        }
+        for text in [
+            "ALTER SYSTEM SET work_mem = '64MB'",
+            "SET SESSION AUTHORIZATION other",
+            "set session authorization default",
+            "SET ROLE other",
+        ] {
+            assert!(scan(text.as_bytes(), true).is_some(), "{text}");
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
+        }
+        for text in [
+            "reset role",
+            "select role from t where system = 1",
+            "alter table t set (fillfactor = 70)",
+        ] {
+            assert_eq!(scan(text.as_bytes(), true), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_superuser_session_still_matches_every_ordinary_word() {
+        assert_eq!(
+            scan(b"SET default_transaction_read_only = off", true),
+            Some("default_transaction_read_only")
+        );
+        assert_eq!(scan(b"select dblink_exec('x', 'y')", true), Some("dblink"));
+        assert_eq!(scan(b"begin read write", true), Some("read write"));
+        assert_eq!(scan(b"select 1; do $$ $$", true), Some("do"));
+        assert_eq!(scan(b"select u&'x'", true), Some("u&"));
+    }
+
+    fn status(name: &str, value: &str) -> Vec<u8> {
+        let mut body = name.as_bytes().to_vec();
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+        body
+    }
+
+    #[test]
+    fn parameter_status_reads_the_mode_and_the_superuser_flag() {
+        let read_only = "default_transaction_read_only";
+        assert_eq!(
+            parameter_status(&status(read_only, "on")),
+            Some(Status::Other)
+        );
+        for value in ["off", "On", "ON", "", "true", "on "] {
+            assert_eq!(
+                parameter_status(&status(read_only, value)),
+                Some(Status::Escaped),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            parameter_status(&status("is_superuser", "on")),
+            Some(Status::Superuser)
+        );
+        assert_eq!(
+            parameter_status(&status("is_superuser", "off")),
+            Some(Status::Other)
+        );
+        assert_eq!(
+            parameter_status(&status("Default_Transaction_Read_Only", "off")),
+            Some(Status::Other)
+        );
+        for bad in [&b""[..], b"x", b"x\0", b"x\0y", b"x\0y\0z", b"x\0y\0\0"] {
+            assert_eq!(parameter_status(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn startup_tail_fails_closed_on_a_mode_other_than_on() {
+        let frame_status = |name, value| frame(b'S', &status(name, value));
+        let key = frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]);
+        let tail = [
+            frame_status("server_version", "16.4"),
+            frame_status("default_transaction_read_only", "on"),
+            frame_status("is_superuser", "off"),
+            key.clone(),
+        ]
+        .concat();
+        assert_eq!(startup_superuser(&tail), Some(false));
+        let superuser = [tail.clone(), frame_status("is_superuser", "on")].concat();
+        assert_eq!(startup_superuser(&superuser), Some(true));
+        assert_eq!(startup_superuser(&[]), Some(false));
+        let escaped = [
+            frame_status("default_transaction_read_only", "off"),
+            key.clone(),
+        ]
+        .concat();
+        assert_eq!(startup_superuser(&escaped), None);
+        let mut truncated = tail.clone();
+        truncated.pop();
+        assert_eq!(startup_superuser(&truncated), None);
+        assert_eq!(startup_superuser(&[b'S', 0, 0, 0, 3]), None);
+    }
+
+    const HELD: std::time::Duration = std::time::Duration::from_millis(200);
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    async fn admitted(units: &mut Units, gate: &Gate, tag: u8) -> bool {
+        tokio::time::timeout(HELD, units.admit(gate, tag))
+            .await
+            .is_ok_and(|admitted| admitted.is_ok())
+    }
+
+    #[tokio::test]
+    async fn a_ready_signal_that_arrives_before_the_wait_is_not_lost() {
+        let gate = Gate::new(false);
+        let mut units = Units::default();
+        assert!(admitted(&mut units, &gate, b'Q').await);
+        assert!(
+            !admitted(&mut units, &gate, b'Q').await,
+            "held before ReadyForQuery"
+        );
+        gate.copy_in();
+        assert!(
+            !admitted(&mut units, &gate, b'Q').await,
+            "a stored permit for another change does not release the unit"
+        );
+
+        assert!(gate.ready());
+        assert!(
+            tokio::time::timeout(PROMPT, units.admit(&gate, b'Q'))
+                .await
+                .is_ok(),
+            "a ready signal sent before the wait releases it"
+        );
+
+        let (admitted, signalled) = tokio::join!(
+            tokio::time::timeout(PROMPT, units.admit(&gate, b'Q')),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                gate.ready()
+            }
+        );
+        assert!(
+            admitted.is_ok() && signalled,
+            "a signal during the wait releases it"
+        );
+        assert!(gate.ready());
+        assert!(!gate.ready(), "a ReadyForQuery with no unit is a violation");
+    }
+
+    #[tokio::test]
+    async fn copy_data_terminate_and_flush_are_never_held() {
+        let gate = Gate::new(false);
+        let mut units = Units::default();
+        assert!(admitted(&mut units, &gate, b'Q').await);
+        for tag in *b"dcfHX" {
+            assert!(admitted(&mut units, &gate, tag).await, "{}", tag as char);
+        }
+        assert!(!admitted(&mut units, &gate, b'P').await);
+    }
+
+    #[tokio::test]
+    async fn a_unit_ends_at_its_sync_and_a_query_inside_it_is_refused() {
+        let gate = Gate::new(false);
+        let mut units = Units::default();
+        for tag in *b"PBDEHBECS" {
+            assert!(admitted(&mut units, &gate, tag).await, "{}", tag as char);
+        }
+        for tag in *b"PSQF" {
+            assert!(!admitted(&mut units, &gate, tag).await, "{}", tag as char);
+        }
+        assert!(gate.ready());
+        assert!(admitted(&mut units, &gate, b'P').await);
+        assert!(matches!(
+            units.admit(&gate, b'Q').await,
+            Err(PostgresError::BadFraming)
+        ));
+        assert!(matches!(
+            units.admit(&gate, b'F').await,
+            Err(PostgresError::BadFraming)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_sync_that_ends_an_extended_copy_flows_once() {
+        let gate = Gate::new(false);
+        let mut units = Units::default();
+        for tag in *b"PBDES" {
+            assert!(admitted(&mut units, &gate, tag).await);
+        }
+        assert!(
+            !admitted(&mut units, &gate, b'S').await,
+            "no CopyInResponse yet"
+        );
+        gate.copy_in();
+        for tag in *b"dcS" {
+            assert!(admitted(&mut units, &gate, tag).await, "{}", tag as char);
+        }
+        assert!(!admitted(&mut units, &gate, b'S').await, "only one");
+        assert!(gate.ready());
+        assert!(gate.state().idle());
+        assert!(admitted(&mut units, &gate, b'S').await);
+        assert!(gate.ready());
+        assert!(gate.state().idle());
+
+        for tag in *b"PBEPBES" {
+            assert!(admitted(&mut units, &gate, tag).await);
+        }
+        gate.copy_in();
+        assert!(
+            !admitted(&mut units, &gate, b'S').await,
+            "with two Execute messages the server reads the Sync after an error, so it counts"
+        );
+        assert!(gate.ready());
+        assert!(admitted(&mut units, &gate, b'S').await);
+        assert!(!gate.state().idle());
+
+        assert!(gate.ready());
+        assert!(admitted(&mut units, &gate, b'Q').await);
+        gate.copy_in();
+        assert!(
+            !admitted(&mut units, &gate, b'S').await,
+            "a simple Query copy ends with its ReadyForQuery"
+        );
     }
 
     #[test]

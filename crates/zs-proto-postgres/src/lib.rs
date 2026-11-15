@@ -7,7 +7,11 @@ use zeroize::Zeroize;
 use zs_diag::{Component, DiagLog, Event, ServerText};
 
 mod read_only;
-pub use read_only::{PARSE_REFUSAL, QUERY_REFUSAL, READ_ONLY_REASON, read_only_startup, scan};
+use read_only::{Gate, Status, Units};
+pub use read_only::{
+    PARSE_REFUSAL, QUERY_REFUSAL, READ_ONLY_ESCAPED_REASON, READ_ONLY_REASON, read_only_startup,
+    scan,
+};
 
 #[derive(Debug, Error)]
 pub enum PostgresError {
@@ -1394,18 +1398,29 @@ mod tests {
         large.extend(std::iter::repeat_n(b'q', LARGE_BODY));
         let expected: Vec<u8> = query.iter().chain(large.iter()).copied().collect();
 
+        let gate = (access == SessionAccess::ReadOnly).then(|| Gate::new(false));
         let write = async {
             from_client.write_all(&query).await.unwrap();
             from_client.write_all(&large).await.unwrap();
             from_client.shutdown().await.unwrap();
         };
-        let copy = copy_frontend(client, upstream, access, &counter, &trace);
+        let copy = copy_frontend(client, upstream, gate.as_ref(), &counter, &trace);
         let collect = async {
             let mut received = Vec::new();
-            relayed_to_upstream
-                .read_to_end(&mut received)
-                .await
-                .unwrap();
+            let mut answered = false;
+            loop {
+                let mut chunk = vec![0u8; 64 * 1024];
+                let read = relayed_to_upstream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..read]);
+                if let Some(gate) = gate.as_ref().filter(|_| !answered)
+                    && received.len() >= query.len()
+                {
+                    answered = gate.ready();
+                }
+            }
             received
         };
         let ((), copied, received) = tokio::join!(write, copy, collect);
@@ -1432,7 +1447,8 @@ mod tests {
             from_client.write_all(&partial).await.unwrap();
             from_client.shutdown().await.unwrap();
 
-            let error = copy_frontend(client, upstream, access, &counter, &trace)
+            let gate = (access == SessionAccess::ReadOnly).then(|| Gate::new(false));
+            let error = copy_frontend(client, upstream, gate.as_ref(), &counter, &trace)
                 .await
                 .expect_err("an unfinished message must end the relay");
             assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -1453,7 +1469,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         from_client.write_all(&[b'Q', 0, 0, 0, 3]).await.unwrap();
 
-        let error = copy_frontend(client, upstream, SessionAccess::ReadWrite, &counter, &trace)
+        let error = copy_frontend(client, upstream, None, &counter, &trace)
             .await
             .expect_err("a length below the framing minimum must end the relay");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -1544,6 +1560,21 @@ impl Trace {
             event = event.audit_seq(seq);
         }
         self.diag.emit(event);
+    }
+
+    fn escaped(&self) {
+        let mut event = self
+            .event("client_refused")
+            .warn()
+            .code("reason", "read_only_escaped");
+        if let Some(seq) = (self.audit_refusal)("connect", READ_ONLY_ESCAPED_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.diag.emit(event);
+    }
+
+    fn superuser(&self) {
+        self.diag.emit(self.event("superuser_session").warn());
     }
 
     fn refuse_statement(&self, word: &'static str) {
@@ -2136,6 +2167,25 @@ where
         }
     };
 
+    let gate = match access {
+        SessionAccess::ReadWrite => None,
+        SessionAccess::ReadOnly => match read_only::startup_superuser(&startup_tail) {
+            Some(superuser) => {
+                if superuser {
+                    trace.superuser();
+                }
+                Some(Arc::new(Gate::new(superuser)))
+            }
+            None => {
+                trace.escaped();
+                let _ = client
+                    .write_all(&error_frame(READ_ONLY_ESCAPED.0, READ_ONLY_ESCAPED.1))
+                    .await;
+                return Ok(());
+            }
+        },
+    };
+
     client
         .write_all(&authentication_ok())
         .await
@@ -2149,7 +2199,7 @@ where
         .map_err(at("ready"))?;
 
     let started = std::time::Instant::now();
-    let relayed = relay(client, upstream, access, watch, trace).await;
+    let relayed = relay(client, upstream, gate, watch, trace).await;
     trace.diag.emit(
         trace
             .event("conn_closed")
@@ -2175,6 +2225,7 @@ const READ_ONLY_REFUSED: (&str, &str) = (
     "28000",
     "connection options not accepted on a read-only resource",
 );
+const READ_ONLY_ESCAPED: (&str, &str) = ("08006", "upstream did not keep the session read-only");
 
 async fn refuse(
     client: &mut TcpStream,
@@ -2436,7 +2487,7 @@ fn counted(joined: Copied, counter: &AtomicU64) -> std::io::Result<u64> {
 async fn relay(
     client: TcpStream,
     upstream: Box<dyn Io>,
-    access: SessionAccess,
+    gate: Option<Arc<Gate>>,
     watch: zs_protocol::SessionWatch,
     trace: &Trace,
 ) -> Relayed {
@@ -2445,25 +2496,39 @@ async fn relay(
     let up_bytes = Arc::new(AtomicU64::new(0));
     let down_bytes = Arc::new(AtomicU64::new(0));
     let (up_count, down_count) = (up_bytes.clone(), down_bytes.clone());
-    let frontend_trace = trace.clone();
+    let (frontend_trace, backend_trace) = (trace.clone(), trace.clone());
+    let (frontend_gate, backend_gate) = (gate.clone(), gate.clone());
     let mut to_upstream = tokio::spawn(async move {
         copy_frontend(
             client_read,
             upstream_write,
-            access,
+            frontend_gate.as_deref(),
             &up_count,
             &frontend_trace,
         )
         .await
     });
-    let mut to_client =
-        tokio::spawn(async move { copy_backend(upstream_read, client_write, &down_count).await });
+    let mut to_client = tokio::spawn(async move {
+        match backend_gate {
+            Some(gate) => {
+                copy_backend_framed(
+                    upstream_read,
+                    client_write,
+                    &gate,
+                    &down_count,
+                    &backend_trace,
+                )
+                .await
+            }
+            None => copy_backend(upstream_read, client_write, &down_count).await,
+        }
+    });
     let first = tokio::select! {
         up = &mut to_upstream => First::Up(up),
         down = &mut to_client => First::Down(down),
         reason = watch.ended() => First::Revoked(reason),
     };
-    let (closed_by, up, down) = match first {
+    let (mut closed_by, up, down) = match first {
         First::Up(up) => {
             to_client.abort();
             ("client", up, to_client.await)
@@ -2479,6 +2544,10 @@ async fn relay(
             ("revoked", to_upstream.await, to_client.await)
         }
     };
+    if gate.as_ref().is_some_and(|gate| gate.escaped()) {
+        trace.escaped();
+        closed_by = "escaped";
+    }
     let (up, down) = (counted(up, &up_bytes), counted(down, &down_bytes));
     let bytes = |copied: &std::io::Result<u64>| copied.as_ref().map_or(0, |n| *n);
     Relayed {
@@ -2505,6 +2574,7 @@ async fn screened<R: AsyncRead + Unpin>(
     reader: &mut R,
     tag: u8,
     length: u32,
+    superuser: bool,
     trace: &Trace,
 ) -> std::io::Result<Vec<u8>> {
     if length > read_only::MAX_SCREENED_MESSAGE {
@@ -2517,7 +2587,7 @@ async fn screened<R: AsyncRead + Unpin>(
     if message.len() as u64 != 5 + body {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
-    match read_only::refusal(tag, &message[5..], false) {
+    match read_only::refusal(tag, &message[5..], superuser) {
         Ok(None) => Ok(message),
         Ok(Some((word, replacement))) => {
             trace.refuse_statement(word);
@@ -2530,7 +2600,7 @@ async fn screened<R: AsyncRead + Unpin>(
 async fn copy_frontend<R, W>(
     mut reader: R,
     mut writer: W,
-    access: SessionAccess,
+    gate: Option<&Gate>,
     counter: &AtomicU64,
     trace: &Trace,
 ) -> std::io::Result<u64>
@@ -2538,7 +2608,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let read_only = access == SessionAccess::ReadOnly;
+    let mut units = Units::default();
     let mut body = vec![0u8; 16 * 1024];
     let mut total = 0u64;
     loop {
@@ -2552,16 +2622,24 @@ where
         if !(4..=MAX_FRONTEND_MESSAGE).contains(&length) {
             return Err(invalid("bad postgres message length"));
         }
-        if read_only && read_only::SCREENED.contains(&tag[0]) {
-            let forwarded = screened(&mut reader, tag[0], length, trace).await?;
-            writer.write_all(&forwarded).await?;
-            writer.flush().await?;
-            total += forwarded.len() as u64;
-            counter.store(total, Ordering::Relaxed);
-            continue;
-        }
-        if read_only && !read_only::STREAMED.contains(&tag[0]) {
-            return Err(invalid("unknown postgres message"));
+        if let Some(gate) = gate {
+            let screen = read_only::SCREENED.contains(&tag[0]);
+            if !screen && !read_only::STREAMED.contains(&tag[0]) {
+                return Err(invalid("unknown postgres message"));
+            }
+            units
+                .admit(gate, tag[0])
+                .await
+                .map_err(|_| invalid("query inside an unfinished extended batch"))?;
+            if screen {
+                let forwarded =
+                    screened(&mut reader, tag[0], length, gate.superuser(), trace).await?;
+                writer.write_all(&forwarded).await?;
+                writer.flush().await?;
+                total += forwarded.len() as u64;
+                counter.store(total, Ordering::Relaxed);
+                continue;
+            }
         }
         if tag[0] == b'X' {
             trace.diag.emit(trace.event("client_terminate"));
@@ -2608,6 +2686,94 @@ where
         counter.store(total, Ordering::Relaxed);
     }
     writer.shutdown().await?;
+    Ok(total)
+}
+
+async fn copy_backend_framed<R, W>(
+    reader: R,
+    writer: W,
+    gate: &Gate,
+    counter: &AtomicU64,
+    trace: &Trace,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = tokio::io::BufReader::with_capacity(16 * 1024, reader);
+    let mut writer = tokio::io::BufWriter::with_capacity(16 * 1024, writer);
+    let mut body = vec![0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        if reader.buffer().is_empty() {
+            writer.flush().await?;
+            counter.store(total, Ordering::Relaxed);
+        }
+        let mut header = [0u8; 5];
+        if reader.read(&mut header[..1]).await? == 0 {
+            break;
+        }
+        reader.read_exact(&mut header[1..]).await?;
+        let tag = header[0];
+        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        if !(4..=MAX_FRONTEND_MESSAGE).contains(&length) {
+            return Err(invalid("bad postgres message length"));
+        }
+        if matches!(tag, b'S' | b'Z') {
+            if (tag == b'Z' && length != 5)
+                || (tag == b'S' && length > read_only::MAX_PARAMETER_STATUS)
+            {
+                return Err(invalid("bad postgres status message"));
+            }
+            let mut message = header.to_vec();
+            message.resize(length as usize + 1, 0);
+            reader.read_exact(&mut message[5..]).await?;
+            if tag == b'Z' && !gate.ready() {
+                return Err(invalid("unexpected ready for query"));
+            }
+            if tag == b'S' {
+                match read_only::parameter_status(&message[5..]) {
+                    None => return Err(invalid("bad postgres parameter status")),
+                    Some(Status::Escaped) => {
+                        gate.escape();
+                        counter.store(total, Ordering::Relaxed);
+                        return Ok(total);
+                    }
+                    Some(Status::Superuser) => {
+                        if gate.become_superuser() {
+                            trace.superuser();
+                        }
+                    }
+                    Some(Status::Other) => {}
+                }
+            }
+            writer.write_all(&message).await?;
+            total += message.len() as u64;
+            continue;
+        }
+        if tag == b'G' {
+            gate.copy_in();
+        }
+        writer.write_all(&header).await?;
+        total += 5;
+        let mut remaining = length as usize - 4;
+        while remaining > 0 {
+            if reader.buffer().is_empty() {
+                writer.flush().await?;
+                counter.store(total, Ordering::Relaxed);
+            }
+            let chunk = remaining.min(body.len());
+            let read = reader.read(&mut body[..chunk]).await?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            writer.write_all(&body[..read]).await?;
+            remaining -= read;
+            total += read as u64;
+        }
+    }
+    writer.shutdown().await?;
+    counter.store(total, Ordering::Relaxed);
     Ok(total)
 }
 

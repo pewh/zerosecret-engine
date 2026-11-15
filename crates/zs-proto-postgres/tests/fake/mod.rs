@@ -128,6 +128,73 @@ pub async fn start(script: Script) -> Fake {
     Fake { addr, seen }
 }
 
+pub async fn start_with<F, Fut>(serve: F) -> SocketAddr
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve = Arc::new(serve);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let serve = serve.clone();
+            tokio::spawn(async move {
+                let _ = serve(tcp).await;
+            });
+        }
+    });
+    addr
+}
+
+pub fn parameter_status(name: &str, value: &str) -> Vec<u8> {
+    let mut body = name.as_bytes().to_vec();
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    frame(b'S', &body)
+}
+
+pub const READ_ONLY_LOGIN: [(&str, &str); 2] = [
+    ("default_transaction_read_only", "on"),
+    ("is_superuser", "off"),
+];
+
+pub async fn read_startup(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let first = read_packet(stream).await?;
+    if first != SSL_REQUEST {
+        return Ok(first);
+    }
+    stream.write_all(b"N").await?;
+    read_packet(stream).await
+}
+
+pub async fn accept_login(
+    stream: &mut TcpStream,
+    status: &[(&str, &str)],
+) -> std::io::Result<Vec<u8>> {
+    let startup = read_startup(stream).await?;
+    complete_login(stream, status).await?;
+    Ok(startup)
+}
+
+pub async fn complete_login(
+    stream: &mut TcpStream,
+    status: &[(&str, &str)],
+) -> std::io::Result<()> {
+    if !scram(stream).await? {
+        return Err(std::io::Error::other("the proof did not match"));
+    }
+    let mut reply = frame(b'R', &0u32.to_be_bytes());
+    for (name, value) in status {
+        reply.extend_from_slice(&parameter_status(name, value));
+    }
+    reply.extend_from_slice(&frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+    reply.extend_from_slice(&frame(b'Z', b"I"));
+    stream.write_all(&reply).await?;
+    stream.flush().await
+}
+
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 

@@ -308,6 +308,666 @@ async fn an_unknown_message_ends_a_read_only_session() {
     );
 }
 
+type Frames = Arc<Mutex<Vec<Vec<u8>>>>;
+type Status = &'static [(&'static str, &'static str)];
+
+const ESCAPED: (&str, &str) = ("08006", "upstream did not keep the session read-only");
+const SUPERUSER_LOGIN: [(&str, &str); 2] = [
+    ("default_transaction_read_only", "on"),
+    ("is_superuser", "on"),
+];
+const HIDDEN: &str = "SELECT zs_hidden()";
+const INSERT: &str = "INSERT INTO t VALUES (2)";
+
+fn complete(tag: &str) -> Vec<u8> {
+    let mut body = tag.as_bytes().to_vec();
+    body.push(0);
+    fake::frame(b'C', &body)
+}
+
+fn ready() -> Vec<u8> {
+    fake::frame(b'Z', b"I")
+}
+
+fn copy_in() -> Vec<u8> {
+    fake::frame(b'G', &[0, 0, 1, 0, 0])
+}
+
+fn wide() -> Vec<u8> {
+    let mut row = 1u16.to_be_bytes().to_vec();
+    row.extend_from_slice(&3000u32.to_be_bytes());
+    row.extend((0..3000).map(|at| b'a' + (at % 26) as u8));
+    [
+        fake::frame(
+            b'T',
+            b"\0\x01wide\0\0\0\0\0\0\0\0\0\0\x19\xff\xff\xff\xff\xff\xff\0\0",
+        ),
+        fake::frame(b'D', &row),
+        fake::frame(b'N', b"SNOTICE\0C00000\0Mzs notice\0\0"),
+        fake::parameter_status("application_name", "orders"),
+        complete("SELECT 1"),
+    ]
+    .concat()
+}
+
+fn results(text: &str) -> Vec<u8> {
+    if text.contains("zs_hidden") {
+        [
+            complete("SELECT 1"),
+            fake::parameter_status("default_transaction_read_only", "off"),
+        ]
+        .concat()
+    } else if text.contains("RESET ROLE") {
+        [
+            complete("RESET"),
+            fake::parameter_status("is_superuser", "off"),
+        ]
+        .concat()
+    } else if text.contains("SET ROLE admin") {
+        [
+            complete("SET"),
+            fake::parameter_status("is_superuser", "on"),
+        ]
+        .concat()
+    } else if text.contains("wide") {
+        wide()
+    } else {
+        complete("SELECT 1")
+    }
+}
+
+#[derive(Default)]
+struct Emulator {
+    statement: String,
+    copy: Option<bool>,
+}
+
+impl Emulator {
+    fn answer(&mut self, tag: u8, body: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(body).into_owned();
+        match tag {
+            b'Q' if text.contains("STDIN") => {
+                self.copy = Some(false);
+                copy_in()
+            }
+            b'Q' => [results(&text), ready()].concat(),
+            b'P' => {
+                self.statement = text;
+                fake::frame(b'1', &[])
+            }
+            b'B' => fake::frame(b'2', &[]),
+            b'E' if self.statement.contains("STDIN") => {
+                self.copy = Some(true);
+                copy_in()
+            }
+            b'E' => results(&self.statement),
+            b'S' if self.copy.is_some() => Vec::new(),
+            b'S' => ready(),
+            b'c' => match self.copy.take() {
+                Some(false) => [complete("COPY 2"), ready()].concat(),
+                Some(true) => complete("COPY 2"),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
+
+struct Emulated {
+    addr: SocketAddr,
+    frames: Frames,
+}
+
+impl Emulated {
+    fn frames(&self) -> Vec<Vec<u8>> {
+        self.frames.lock().unwrap().clone()
+    }
+}
+
+async fn write_bytewise(tcp: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    for byte in bytes {
+        tcp.write_all(&[*byte]).await?;
+        tcp.flush().await?;
+    }
+    Ok(())
+}
+
+async fn emulated(status: Status, bytewise: bool) -> Emulated {
+    let frames: Frames = Arc::new(Mutex::new(Vec::new()));
+    let record = frames.clone();
+    let addr = fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            tcp.set_nodelay(true)?;
+            fake::accept_login(&mut tcp, status).await?;
+            let mut emulator = Emulator::default();
+            loop {
+                let (tag, body) = fake::read_tagged(&mut tcp).await?;
+                record.lock().unwrap().push(fake::frame(tag, &body));
+                let reply = emulator.answer(tag, &body);
+                if bytewise {
+                    write_bytewise(&mut tcp, &reply).await?;
+                } else {
+                    tcp.write_all(&reply).await?;
+                }
+                if tag == b'X' {
+                    return Ok(());
+                }
+            }
+        }
+    })
+    .await;
+    Emulated { addr, frames }
+}
+
+async fn reply(client: &mut TcpStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let (tag, body) = tokio::time::timeout(Duration::from_secs(10), fake::read_tagged(client))
+            .await
+            .expect("the reply must arrive within 10 s")
+            .unwrap();
+        bytes.extend_from_slice(&fake::frame(tag, &body));
+        if tag == b'Z' {
+            return bytes;
+        }
+    }
+}
+
+async fn until_tag(client: &mut TcpStream, wanted: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let (tag, body) = tokio::time::timeout(Duration::from_secs(10), fake::read_tagged(client))
+            .await
+            .expect("the message must arrive within 10 s")
+            .unwrap();
+        bytes.extend_from_slice(&fake::frame(tag, &body));
+        if tag == wanted {
+            return bytes;
+        }
+    }
+}
+
+async fn closed(client: &mut TcpStream) -> Vec<u8> {
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+        .await
+        .expect("the session must close within 5 s")
+        .ok();
+    rest
+}
+
+fn extended(sql: &str) -> Vec<Vec<u8>> {
+    vec![parse("", sql, &[]), bind(""), execute(), sync()]
+}
+
+type Arrivals = Arc<Mutex<Vec<(Vec<u8>, bool)>>>;
+
+async fn timing_upstream() -> (SocketAddr, Arrivals) {
+    let arrivals: Arrivals = Arc::new(Mutex::new(Vec::new()));
+    let record = arrivals.clone();
+    let addr = fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            fake::accept_login(&mut tcp, &fake::READ_ONLY_LOGIN).await?;
+            loop {
+                let (tag, body) = fake::read_tagged(&mut tcp).await?;
+                let mut next = [0u8; 1];
+                let early = matches!(
+                    tokio::time::timeout(Duration::from_millis(300), tcp.peek(&mut next)).await,
+                    Ok(Ok(read)) if read > 0
+                );
+                record
+                    .lock()
+                    .unwrap()
+                    .push((fake::frame(tag, &body), early));
+                match tag {
+                    b'Q' => {
+                        tcp.write_all(&[complete("SELECT 1"), ready()].concat())
+                            .await?
+                    }
+                    b'S' => tcp.write_all(&ready()).await?,
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await;
+    (addr, arrivals)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn units_are_forwarded_one_at_a_time() {
+    let (upstream, arrivals) = timing_upstream().await;
+    let session = listen_as(upstream.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+
+    send_all(&mut client, &[query("SELECT 1"), query("SELECT 2")]).await;
+    reply(&mut client).await;
+    reply(&mut client).await;
+    let mut batch = extended("SELECT 3");
+    batch.push(query("SELECT 4"));
+    send_all(&mut client, &batch).await;
+    reply(&mut client).await;
+    reply(&mut client).await;
+
+    let early: Vec<(Vec<u8>, bool)> = vec![
+        (query("SELECT 1"), false),
+        (query("SELECT 2"), false),
+        (parse("", "SELECT 3", &[]), true),
+        (bind(""), true),
+        (execute(), true),
+        (sync(), false),
+        (query("SELECT 4"), false),
+    ];
+    assert_eq!(
+        *arrivals.lock().unwrap(),
+        early,
+        "the messages of one unit arrive together, the next unit only after ReadyForQuery"
+    );
+    assert!(session.refusals().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_write_session_does_not_hold_pipelined_units() {
+    let (upstream, arrivals) = timing_upstream().await;
+    let session = listen_as(upstream.port(), SessionAccess::ReadWrite).await;
+    let mut client = fake::login(session.local).await.unwrap();
+
+    send_all(&mut client, &[query("SELECT 1"), query("SELECT 2")]).await;
+    let first = reply(&mut client).await;
+    let second = reply(&mut client).await;
+
+    assert_eq!(first, [complete("SELECT 1"), ready()].concat());
+    assert_eq!(second, first);
+    assert_eq!(
+        *arrivals.lock().unwrap(),
+        vec![(query("SELECT 1"), true), (query("SELECT 2"), false)],
+        "a read-write session forwards the pipelined Query without waiting"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn split_server_messages_are_framed_correctly() {
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, true).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+
+    send_all(&mut client, &[query("SELECT wide")]).await;
+    let expected = [wide(), ready()].concat();
+    let mut received = vec![0u8; expected.len()];
+    tokio::time::timeout(Duration::from_secs(20), client.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        received, expected,
+        "every byte reaches the client unchanged"
+    );
+
+    send_all(&mut client, &[query(HIDDEN), query(INSERT)]).await;
+    let rest = closed(&mut client).await;
+    assert!(
+        complete("SELECT 1").starts_with(&rest),
+        "at most what came before the ParameterStatus reaches the client: {rest:?}"
+    );
+    assert!(
+        fake::eventually(|| upstream.frames().len() == 2).await,
+        "{:?}",
+        upstream.frames()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        upstream.frames(),
+        vec![query("SELECT wide"), query(HIDDEN)],
+        "the pipelined INSERT never reached the upstream"
+    );
+    assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parameter_status_off_closes_the_session_before_the_next_unit() {
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadWrite).await;
+    let mut control = fake::login(session.local).await.unwrap();
+    let mut pipelined = vec![query(HIDDEN)];
+    pipelined.extend(extended(INSERT));
+    pipelined.push(query(INSERT));
+    send_all(&mut control, &pipelined).await;
+    for _ in 0..3 {
+        reply(&mut control).await;
+    }
+    assert_eq!(
+        upstream.frames(),
+        pipelined,
+        "negative control: a read-write session forwards every unit"
+    );
+    assert!(session.refusals().is_empty());
+
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    assert_eq!(
+        fake::query(&mut client, "SELECT 'before'").await,
+        "SELECT 1"
+    );
+    send_all(&mut client, &pipelined).await;
+
+    let rest = closed(&mut client).await;
+    assert!(
+        complete("SELECT 1").starts_with(&rest),
+        "at most what came before the ParameterStatus reaches the client: {rest:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        upstream.frames(),
+        vec![query("SELECT 'before'"), query(HIDDEN)],
+        "no message of the next unit reached the upstream"
+    );
+    assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
+    let events = session.events().await;
+    let escaped = fake::named(&events, "client_refused");
+    assert_eq!(escaped.len(), 1, "{events:?}");
+    assert_eq!(escaped[0]["fields"]["reason"], "read_only_escaped");
+    assert_eq!(escaped[0]["audit_seq"], 7);
+    assert_eq!(
+        fake::named(&events, "conn_closed")[0]["fields"]["closed_by"],
+        "escaped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superuser_login_scans_with_the_superuser_words() {
+    let statements = [
+        "COPY t TO PROGRAM 'true'",
+        "ALTER SYSTEM SET work_mem = '64MB'",
+        "SELECT pg_terminate_backend(7)",
+        "SET ROLE other",
+        "SET SESSION AUTHORIZATION other",
+    ];
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut control = fake::login(session.local).await.unwrap();
+    for statement in statements {
+        fake::query(&mut control, statement).await;
+    }
+    assert_eq!(
+        upstream.frames(),
+        statements.map(query).to_vec(),
+        "negative control: a non-superuser read-only session forwards them"
+    );
+    assert!(session.refusals().is_empty());
+    assert!(fake::named(&session.events().await, "superuser_session").is_empty());
+
+    let upstream = emulated(&SUPERUSER_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    assert_eq!(
+        fake::query(&mut client, "SELECT program_id FROM t").await,
+        "SELECT 1"
+    );
+    for statement in statements {
+        fake::query(&mut client, statement).await;
+    }
+
+    let mut expected = vec![query("SELECT program_id FROM t")];
+    expected.extend(statements.map(|_| query(QUERY_REFUSAL)));
+    assert_eq!(upstream.frames(), expected);
+    assert_eq!(session.refusals(), vec![("query", "read-only"); 5]);
+    let events = session.events().await;
+    assert_eq!(
+        fake::named(&events, "superuser_session").len(),
+        1,
+        "{events:?}"
+    );
+    let words: Vec<String> = fake::named(&events, "statement_refused")
+        .iter()
+        .map(|event| event["fields"]["word"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        words,
+        [
+            "program",
+            "alter system",
+            "pg_terminate_backend",
+            "set role",
+            "session authorization"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_becomes_superuser_scans_with_the_superuser_words_from_then_on() {
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    let alter = "ALTER SYSTEM SET work_mem = '64MB'";
+
+    fake::query(&mut client, alter).await;
+    fake::query(&mut client, "SET ROLE admin").await;
+    fake::query(&mut client, alter).await;
+    fake::query(&mut client, "RESET ROLE").await;
+    fake::query(&mut client, alter).await;
+
+    assert_eq!(
+        upstream.frames(),
+        vec![
+            query(alter),
+            query("SET ROLE admin"),
+            query(QUERY_REFUSAL),
+            query("RESET ROLE"),
+            query(QUERY_REFUSAL),
+        ],
+        "forwarded before the server reports is_superuser on, refused after, and still after off"
+    );
+    assert_eq!(session.refusals(), vec![("query", "read-only"); 2]);
+    let events = session.events().await;
+    assert_eq!(
+        fake::named(&events, "superuser_session").len(),
+        1,
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_that_reports_read_write_at_login_fails_closed() {
+    const READ_WRITE_LOGIN: [(&str, &str); 2] = [
+        ("default_transaction_read_only", "off"),
+        ("is_superuser", "off"),
+    ];
+    let upstream = emulated(&READ_WRITE_LOGIN, false).await;
+    let control = listen_as(upstream.addr.port(), SessionAccess::ReadWrite).await;
+    let mut allowed = fake::login(control.local)
+        .await
+        .expect("negative control: a read-write login works");
+    assert_eq!(fake::query(&mut allowed, "SELECT 1").await, "SELECT 1");
+
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    assert_eq!(
+        fake::login(session.local).await.err(),
+        Some(fake::error_frame(ESCAPED))
+    );
+    assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(upstream.frames(), vec![query("SELECT 1")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pgbouncer_upstream_fails_closed() {
+    let startups: Frames = Arc::new(Mutex::new(Vec::new()));
+    let record = startups.clone();
+    let upstream = fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            let startup = fake::read_startup(&mut tcp).await?;
+            record.lock().unwrap().push(startup.clone());
+            if startup.windows(8).any(|window| window == b"options\0") {
+                tcp.write_all(&fake::frame(
+                    b'E',
+                    b"SERROR\0C08P01\0Munsupported startup parameter: options\0\0",
+                ))
+                .await?;
+                return Ok(());
+            }
+            fake::complete_login(&mut tcp, &[]).await?;
+            loop {
+                let (tag, _) = fake::read_tagged(&mut tcp).await?;
+                if tag == b'Q' {
+                    tcp.write_all(&[complete("SELECT 1"), ready()].concat())
+                        .await?;
+                }
+            }
+        }
+    })
+    .await;
+
+    let control = listen_as(upstream.port(), SessionAccess::ReadWrite).await;
+    let mut allowed = fake::login(control.local)
+        .await
+        .expect("negative control: a login without options works");
+    assert_eq!(fake::query(&mut allowed, "SELECT 1").await, "SELECT 1");
+
+    let session = listen_as(upstream.port(), SessionAccess::ReadOnly).await;
+    let mut client = TcpStream::connect(session.local).await.unwrap();
+    client
+        .write_all(&zs_proto_postgres::startup_packet("alice", "appdb"))
+        .await
+        .unwrap();
+    assert_eq!(
+        closed(&mut client).await,
+        fake::error_frame(fake::UNAVAILABLE),
+        "the client gets a connection error and nothing else"
+    );
+    let startups = startups.lock().unwrap().clone();
+    assert_eq!(startups.len(), 2);
+    assert!(
+        startups[1]
+            .windows(35)
+            .any(|window| window == b"-c default_transaction_read_only=on")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_data_flows_while_its_unit_runs() {
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    let data = [
+        fake::frame(b'd', b"1\n"),
+        fake::frame(b'd', b"2\n"),
+        fake::frame(b'c', &[]),
+    ];
+
+    send_all(&mut client, &[query("COPY t FROM STDIN")]).await;
+    assert_eq!(until_tag(&mut client, b'G').await, copy_in());
+    send_all(&mut client, &data).await;
+    assert_eq!(
+        reply(&mut client).await,
+        [complete("COPY 2"), ready()].concat()
+    );
+
+    send_all(&mut client, &extended("COPY t FROM STDIN")).await;
+    until_tag(&mut client, b'G').await;
+    let mut closing = data.to_vec();
+    closing.push(sync());
+    send_all(&mut client, &closing).await;
+    assert_eq!(
+        reply(&mut client).await,
+        [complete("COPY 2"), ready()].concat()
+    );
+
+    send_all(&mut client, &extended("COPY t FROM STDIN")).await;
+    send_all(&mut client, &closing).await;
+    assert_eq!(
+        reply(&mut client).await,
+        [
+            fake::frame(b'1', &[]),
+            fake::frame(b'2', &[]),
+            copy_in(),
+            complete("COPY 2"),
+            ready()
+        ]
+        .concat(),
+        "copy data sent before the CopyInResponse arrives also flows"
+    );
+
+    assert_eq!(fake::query(&mut client, "SELECT 'after'").await, "SELECT 1");
+    let mut expected = vec![query("COPY t FROM STDIN")];
+    expected.extend(data.clone());
+    for _ in 0..2 {
+        expected.extend(extended("COPY t FROM STDIN"));
+        expected.extend(closing.clone());
+    }
+    expected.push(query("SELECT 'after'"));
+    assert_eq!(upstream.frames(), expected);
+    assert!(session.refusals().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_without_sync_lets_the_unit_continue() {
+    let upstream = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    let flush = fake::frame(b'H', &[]);
+
+    send_all(
+        &mut client,
+        &[
+            parse("", "SELECT 1", &[]),
+            bind(""),
+            execute(),
+            flush.clone(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        until_tag(&mut client, b'C').await,
+        [
+            fake::frame(b'1', &[]),
+            fake::frame(b'2', &[]),
+            complete("SELECT 1")
+        ]
+        .concat(),
+        "the results of a flushed unit arrive before its Sync"
+    );
+    send_all(&mut client, &[bind(""), execute(), sync()]).await;
+    assert_eq!(
+        reply(&mut client).await,
+        [fake::frame(b'2', &[]), complete("SELECT 1"), ready()].concat()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fake::query(&mut client, "SELECT 'after'").await, "SELECT 1");
+    assert_eq!(upstream.frames().len(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_flows_while_a_unit_runs() {
+    let terminated = Arc::new(Mutex::new(false));
+    let record = terminated.clone();
+    let upstream = fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            fake::accept_login(&mut tcp, &fake::READ_ONLY_LOGIN).await?;
+            let (tag, _) = fake::read_tagged(&mut tcp).await?;
+            assert_eq!(tag, b'Q');
+            let (tag, _) = fake::read_tagged(&mut tcp).await?;
+            *record.lock().unwrap() = tag == b'X';
+            Ok(())
+        }
+    })
+    .await;
+    let session = listen_as(upstream.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+
+    send_all(
+        &mut client,
+        &[query("SELECT pg_sleep(60)"), fake::frame(b'X', &[])],
+    )
+    .await;
+    assert!(fake::eventually(|| *terminated.lock().unwrap()).await);
+    closed(&mut client).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_options_string_that_cannot_be_parsed_denies_a_read_only_connection() {
     let upstream = fake::start(Script::new(Answer::N)).await;

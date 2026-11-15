@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use zs_credential::Credential;
 use zs_proto_postgres::{
@@ -655,8 +655,13 @@ async fn dblink_functions_are_refused() {
     let address = setup.simple("SELECT host(inet_server_addr())").await;
     setup.close().await;
     if !created.ok() {
-        eprintln!("dblink_functions_are_refused: the dblink extension is not available, skipped");
         fixture.remove().await;
+        assert!(
+            std::env::var_os("ZS_REQUIRE_PG").is_none(),
+            "ZS_REQUIRE_PG is set and the dblink extension could not be created: {:?}",
+            created.errors
+        );
+        eprintln!("dblink_functions_are_refused: the dblink extension is not available, skipped");
         return;
     }
     let address = address.value().unwrap().to_string();
@@ -708,5 +713,211 @@ async fn dblink_functions_are_refused() {
         teardown.simple("DROP EXTENSION IF EXISTS dblink").await;
         teardown.close().await;
     }
+    fixture.remove().await;
+}
+
+fn tags(mut bytes: &[u8]) -> Vec<u8> {
+    let mut tags = Vec::new();
+    while bytes.len() >= 5 {
+        let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        tags.push(bytes[0]);
+        bytes = &bytes[(1 + length).min(bytes.len())..];
+    }
+    tags
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hidden_switch_off_closes_session_before_next_unit() {
+    let Some(fixture) = Fixture::new("zs_ro_hidden").await else {
+        return;
+    };
+    let mut setup = admin(&fixture.db).await;
+    let created = setup
+        .simple(&format!(
+            "CREATE OR REPLACE FUNCTION zs_ro_flip() RETURNS text LANGUAGE sql SECURITY DEFINER \
+             AS $$ SELECT set_config('default_transaction_read_only', 'off', false) $$; \
+             REVOKE ALL ON FUNCTION zs_ro_flip() FROM PUBLIC; \
+             GRANT EXECUTE ON FUNCTION zs_ro_flip() TO {ROLE}"
+        ))
+        .await;
+    assert!(
+        created.ok(),
+        "could not create the test function: {created:?}"
+    );
+    setup.close().await;
+    let pipelined = [query("SELECT zs_ro_flip()"), query(&fixture.insert())];
+
+    let mut control = fixture.session(SessionAccess::ReadWrite).await;
+    assert!(
+        control
+            .simple("SET default_transaction_read_only = on")
+            .await
+            .ok()
+    );
+    assert_eq!(
+        control.simple("SELECT zs_ro_flip()").await.value(),
+        Some("off")
+    );
+    assert_eq!(
+        control
+            .simple("SHOW default_transaction_read_only")
+            .await
+            .value(),
+        Some("off"),
+        "negative control: the function switches the mode off on the server"
+    );
+    control.send(&pipelined).await;
+    assert!(control.reply().await.ok());
+    assert!(control.reply().await.ok());
+    control.close().await;
+    assert_eq!(
+        fixture.rows().await,
+        "2",
+        "negative control: the same sequence in a read-write session writes the row"
+    );
+
+    let (local, refusals) = listen(&fixture.db, ROLE_PASSWORD, SessionAccess::ReadOnly).await;
+    let mut session = Client::open(local, ROLE, &fixture.db, &[]).await;
+    let read = session
+        .simple(&format!("SELECT count(*) FROM {}", fixture.table))
+        .await;
+    assert_eq!(read.value(), Some("2"), "positive control: a read works");
+    session.send(&pipelined).await;
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.stream.read_to_end(&mut rest),
+    )
+    .await
+    .is_ok();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = fixture.rows().await;
+    let mut teardown = admin(&fixture.db).await;
+    let dropped = teardown.simple("DROP FUNCTION zs_ro_flip()").await;
+    teardown.close().await;
+    fixture.remove().await;
+
+    assert!(closed, "the session must close within 5 s");
+    assert!(
+        b"TDC".starts_with(&tags(&rest)),
+        "at most the reply up to the ParameterStatus, then the close: {:?}",
+        tags(&rest)
+    );
+    assert_eq!(rows, "2", "the pipelined INSERT never ran");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", "read-only escaped")]
+    );
+    assert!(dropped.ok(), "{dropped:?}");
+}
+
+const COPY_TO_PROGRAM: &str = "COPY (SELECT 1) TO PROGRAM 'cat > /dev/null'";
+const WORK_MEM_IN_FILES: &str = "SELECT count(*) FROM pg_file_settings WHERE name = 'work_mem'";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn superuser_session_refuses_copy_to_program_and_alter_system() {
+    let Some(fixture) = Fixture::new("zs_ro_superuser").await else {
+        return;
+    };
+    let db = &fixture.db;
+    let mut victim = admin(db).await;
+    let pid = victim
+        .simple("SELECT pg_backend_pid()")
+        .await
+        .value()
+        .unwrap()
+        .to_string();
+    let mut setup = admin(db).await;
+    let settings = setup
+        .simple(WORK_MEM_IN_FILES)
+        .await
+        .value()
+        .unwrap()
+        .to_string();
+
+    let mut control = admin(db).await;
+    let copied = control.simple(COPY_TO_PROGRAM).await;
+    assert!(
+        copied.ok(),
+        "negative control: a read-write superuser session runs a program: {copied:?}"
+    );
+    assert!(control.simple(&format!("SET ROLE {ROLE}")).await.ok());
+    assert_eq!(
+        control.simple("SELECT current_user").await.value(),
+        Some(ROLE),
+        "negative control: a read-write superuser session changes its role"
+    );
+    control.close().await;
+
+    let (local, refusals) = listen(db, &db.password, SessionAccess::ReadOnly).await;
+    let mut session = Client::open(local, &db.user, db, &[]).await;
+    assert_eq!(session.simple(MODE).await.value(), Some("on"));
+    let read = session
+        .simple(&format!("SELECT count(*) FROM {}", fixture.table))
+        .await;
+    assert_eq!(read.value(), Some("1"), "positive control: a read works");
+    let statements = [
+        COPY_TO_PROGRAM.to_string(),
+        "ALTER SYSTEM SET work_mem = '64MB'".to_string(),
+        "SELECT pg_reload_conf()".to_string(),
+        format!("SELECT pg_terminate_backend({pid})"),
+        format!("SET ROLE {ROLE}"),
+        format!("SET SESSION AUTHORIZATION {ROLE}"),
+        "SELECT 1 AS program".to_string(),
+    ];
+    let mut replies = Vec::new();
+    for statement in &statements {
+        replies.push((statement, session.simple(statement).await));
+    }
+    let who = session
+        .simple("SELECT current_user || ' ' || session_user")
+        .await;
+    let alive = setup
+        .simple(&format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = {pid}"
+        ))
+        .await;
+    let after = setup
+        .simple(WORK_MEM_IN_FILES)
+        .await
+        .value()
+        .unwrap()
+        .to_string();
+    if after != settings {
+        setup.simple("ALTER SYSTEM RESET work_mem").await;
+        setup.simple("SELECT pg_reload_conf()").await;
+    }
+    victim.close().await;
+    setup.close().await;
+
+    for (statement, refused) in &replies {
+        assert!(refused.refused_with(READ_ONLY), "{statement}: {refused:?}");
+        assert_eq!(refused.message(), REFUSED, "{statement}");
+        assert_eq!(refused.status, b'I', "{statement}");
+    }
+    assert_eq!(
+        who.value(),
+        Some(format!("{} {}", db.user, db.user).as_str())
+    );
+    assert_eq!(
+        alive.value(),
+        Some("1"),
+        "the other backend was terminated: {alive:?}"
+    );
+    assert_eq!(after, settings, "ALTER SYSTEM reached the server");
+    assert_still_read_only(&mut session, &fixture, "the superuser statements").await;
+    session.close().await;
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); statements.len()]
+    );
+
+    let mut plain = fixture.session(SessionAccess::ReadOnly).await;
+    let column = plain.simple("SELECT 1 AS program").await;
+    assert!(
+        column.ok() && column.value() == Some("1"),
+        "a non-superuser session is not refused for a column named program: {column:?}"
+    );
+    plain.close().await;
     fixture.remove().await;
 }
