@@ -811,6 +811,65 @@ async fn hidden_switch_off_closes_session_before_next_unit() {
     assert!(dropped.ok(), "{dropped:?}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_to_stdout_works_and_copy_from_stdin_is_refused_before_copy_in() {
+    let Some(fixture) = Fixture::new("zs_ro_copy").await else {
+        return;
+    };
+    let copy_from = format!("COPY {} FROM STDIN", fixture.table);
+    let mut control = fixture.session(SessionAccess::ReadWrite).await;
+    control.send(&[query(&copy_from)]).await;
+    let (tag, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        fake::read_tagged(&mut control.stream),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    control
+        .send(&[fake::frame(b'f', b"zs negative control\0")])
+        .await;
+    let failed = control.reply().await;
+    control.close().await;
+
+    let mut session = fixture.session(SessionAccess::ReadOnly).await;
+    let out = session
+        .simple(&format!(
+            "COPY (SELECT id FROM {}) TO STDOUT",
+            fixture.table
+        ))
+        .await;
+    let simple = session.simple(&copy_from).await;
+    session
+        .send(&[parse("", &copy_from), bind(""), execute(), sync()])
+        .await;
+    let extended = session.reply().await;
+    let read = session
+        .simple(&format!("SELECT count(*) FROM {}", fixture.table))
+        .await;
+    session.close().await;
+    let rows = fixture.rows().await;
+    fixture.remove().await;
+
+    assert_eq!(
+        tag, b'G',
+        "negative control: a read-write session gets a CopyInResponse"
+    );
+    assert_eq!(failed.tags, b"EZ", "{failed:?}");
+    assert_eq!(out.tags, b"HdcCZ", "COPY TO STDOUT is a read: {out:?}");
+    assert!(out.ok());
+    assert_eq!(simple.tags, b"EZ", "no CopyInResponse: {simple:?}");
+    assert!(simple.refused_with(READ_ONLY), "{simple:?}");
+    assert!(
+        simple.message().contains("read-only transaction"),
+        "the database refuses it: {simple:?}"
+    );
+    assert_eq!(extended.tags, b"12EZ", "no CopyInResponse: {extended:?}");
+    assert!(extended.refused_with(READ_ONLY), "{extended:?}");
+    assert_eq!(read.value(), Some("1"), "the session stays usable");
+    assert_eq!(rows, "1");
+}
+
 const COPY_TO_PROGRAM: &str = "COPY (SELECT 1) TO PROGRAM 'cat > /dev/null'";
 const WORK_MEM_IN_FILES: &str = "SELECT count(*) FROM pg_file_settings WHERE name = 'work_mem'";
 

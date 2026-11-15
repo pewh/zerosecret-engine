@@ -2495,14 +2495,31 @@ async fn relay(
     let (frontend_trace, backend_trace) = (trace.clone(), trace.clone());
     let (frontend_gate, backend_gate) = (gate.clone(), gate.clone());
     let mut to_upstream = tokio::spawn(async move {
-        copy_frontend(
-            client_read,
-            upstream_write,
-            frontend_gate.as_deref(),
-            &up_count,
-            &frontend_trace,
-        )
-        .await
+        match frontend_gate {
+            Some(gate) => {
+                let mut upstream_write = upstream_write;
+                let copied = copy_frontend(
+                    client_read,
+                    &mut upstream_write,
+                    Some(&gate),
+                    &up_count,
+                    &frontend_trace,
+                )
+                .await;
+                let _ = upstream_write.shutdown().await;
+                copied
+            }
+            None => {
+                copy_frontend(
+                    client_read,
+                    upstream_write,
+                    None,
+                    &up_count,
+                    &frontend_trace,
+                )
+                .await
+            }
+        }
     });
     let mut to_client = tokio::spawn(async move {
         match backend_gate {
@@ -2525,6 +2542,16 @@ async fn relay(
         reason = watch.ended() => First::Revoked(reason),
     };
     let (mut closed_by, up, down) = match first {
+        First::Up(up) if gate.is_some() => {
+            let down = match tokio::time::timeout(ESCAPE_AUDIT_WAIT, &mut to_client).await {
+                Ok(down) => down,
+                Err(_) => {
+                    to_client.abort();
+                    to_client.await
+                }
+            };
+            ("client", up, down)
+        }
         First::Up(up) => {
             to_client.abort();
             ("client", up, to_client.await)
@@ -2553,6 +2580,8 @@ async fn relay(
         failure: up.err().or(down.err()),
     }
 }
+
+const ESCAPE_AUDIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 enum First {
     Up(Copied),
@@ -2697,12 +2726,15 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut reader = tokio::io::BufReader::with_capacity(16 * 1024, reader);
-    let mut writer = tokio::io::BufWriter::with_capacity(16 * 1024, writer);
+    let mut writer = ToClient {
+        writer: tokio::io::BufWriter::with_capacity(16 * 1024, writer),
+        gone: false,
+    };
     let mut body = vec![0u8; 16 * 1024];
     let mut total = 0u64;
     loop {
         if reader.buffer().is_empty() {
-            writer.flush().await?;
+            writer.flush().await;
             counter.store(total, Ordering::Relaxed);
         }
         let mut header = [0u8; 5];
@@ -2743,19 +2775,21 @@ where
                     Some(Status::ReadOnly | Status::Other) => {}
                 }
             }
-            writer.write_all(&message).await?;
+            writer.send(&message).await;
             total += message.len() as u64;
             continue;
         }
-        if tag == b'G' {
-            gate.copy_in();
+        if matches!(tag, b'G' | b'W') {
+            gate.escape();
+            counter.store(total, Ordering::Relaxed);
+            return Ok(total);
         }
-        writer.write_all(&header).await?;
+        writer.send(&header).await;
         total += 5;
         let mut remaining = length as usize - 4;
         while remaining > 0 {
             if reader.buffer().is_empty() {
-                writer.flush().await?;
+                writer.flush().await;
                 counter.store(total, Ordering::Relaxed);
             }
             let chunk = remaining.min(body.len());
@@ -2763,14 +2797,39 @@ where
             if read == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
-            writer.write_all(&body[..read]).await?;
+            writer.send(&body[..read]).await;
             remaining -= read;
             total += read as u64;
         }
     }
-    writer.shutdown().await?;
+    writer.shutdown().await;
     counter.store(total, Ordering::Relaxed);
     Ok(total)
+}
+
+struct ToClient<W> {
+    writer: tokio::io::BufWriter<W>,
+    gone: bool,
+}
+
+impl<W: AsyncWrite + Unpin> ToClient<W> {
+    async fn send(&mut self, bytes: &[u8]) {
+        if !self.gone && self.writer.write_all(bytes).await.is_err() {
+            self.gone = true;
+        }
+    }
+
+    async fn flush(&mut self) {
+        if !self.gone && self.writer.flush().await.is_err() {
+            self.gone = true;
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        if !self.gone {
+            let _ = self.writer.shutdown().await;
+        }
+    }
 }
 
 pub fn authentication_ok() -> Vec<u8> {

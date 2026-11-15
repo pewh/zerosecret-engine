@@ -403,7 +403,6 @@ pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
 struct GateState {
     units: u64,
     ready: u64,
-    copy_in: bool,
     superuser: bool,
     escaped: bool,
 }
@@ -450,16 +449,10 @@ impl Gate {
         self.state().escaped
     }
 
-    pub(crate) fn copy_in(&self) {
-        self.state().copy_in = true;
-        self.changed.notify_one();
-    }
-
     pub(crate) fn ready(&self) -> bool {
         let expected = {
             let mut state = self.state();
             state.ready += 1;
-            state.copy_in = false;
             state.ready <= state.units
         };
         self.changed.notify_one();
@@ -470,28 +463,21 @@ impl Gate {
         self.state().units += 1;
     }
 
-    async fn until<T>(&self, check: impl Fn(&GateState) -> Option<T>) -> T {
+    async fn idle(&self) {
         loop {
             let notified = self.changed.notified();
-            let found = check(&self.state());
-            if let Some(found) = found {
-                return found;
+            let idle = self.state().idle();
+            if idle {
+                return;
             }
             notified.await;
         }
-    }
-
-    async fn idle(&self) {
-        self.until(|state| state.idle().then_some(())).await
     }
 }
 
 #[derive(Default)]
 pub(crate) struct Units {
     open: bool,
-    executes: u32,
-    after_execute: bool,
-    copy_sync: bool,
 }
 
 impl Units {
@@ -502,40 +488,20 @@ impl Units {
             b'Q' | b'F' => {
                 gate.idle().await;
                 gate.unit();
-                self.copy_sync = false;
             }
             b'S' if self.open => {
                 gate.unit();
                 self.open = false;
-                self.copy_sync = self.executes == 1 && self.after_execute;
             }
             b'S' => {
-                let copy_sync = self.copy_sync;
-                let closes_copy = gate
-                    .until(|state| {
-                        if state.idle() {
-                            Some(false)
-                        } else {
-                            (copy_sync && state.copy_in).then_some(true)
-                        }
-                    })
-                    .await;
-                if !closes_copy {
-                    gate.unit();
-                }
-                self.copy_sync = false;
+                gate.idle().await;
+                gate.unit();
             }
             _ => {
                 if !self.open {
                     gate.idle().await;
                     self.open = true;
-                    self.executes = 0;
-                    self.copy_sync = false;
                 }
-                if tag == b'E' {
-                    self.executes += 1;
-                }
-                self.after_execute = tag == b'E';
             }
         }
         Ok(())
@@ -979,10 +945,11 @@ mod tests {
             !admitted(&mut units, &gate, b'Q').await,
             "held before ReadyForQuery"
         );
-        gate.copy_in();
+        assert!(gate.ready());
+        assert!(admitted(&mut units, &gate, b'Q').await);
         assert!(
             !admitted(&mut units, &gate, b'Q').await,
-            "a stored permit for another change does not release the unit"
+            "the permit stored by the earlier signal does not release the next unit"
         );
 
         assert!(gate.ready());
@@ -1042,46 +1009,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sync_that_ends_an_extended_copy_flows_once() {
+    async fn a_sync_after_copy_messages_counts_and_waits_like_any_unit() {
         let gate = Gate::new(false);
         let mut units = Units::default();
-        for tag in *b"PBDES" {
-            assert!(admitted(&mut units, &gate, tag).await);
-        }
-        assert!(
-            !admitted(&mut units, &gate, b'S').await,
-            "no CopyInResponse yet"
-        );
-        gate.copy_in();
-        for tag in *b"dcS" {
+        for tag in *b"PBEcS" {
             assert!(admitted(&mut units, &gate, tag).await, "{}", tag as char);
         }
-        assert!(!admitted(&mut units, &gate, b'S').await, "only one");
-        assert!(gate.ready());
-        assert!(gate.state().idle());
-        assert!(admitted(&mut units, &gate, b'S').await);
-        assert!(gate.ready());
-        assert!(gate.state().idle());
-
-        for tag in *b"PBEPBES" {
-            assert!(admitted(&mut units, &gate, tag).await);
-        }
-        gate.copy_in();
         assert!(
             !admitted(&mut units, &gate, b'S').await,
-            "with two Execute messages the server reads the Sync after an error, so it counts"
+            "a second Sync is a new unit"
         );
         assert!(gate.ready());
         assert!(admitted(&mut units, &gate, b'S').await);
-        assert!(!gate.state().idle());
-
+        assert!(!admitted(&mut units, &gate, b'Q').await);
         assert!(gate.ready());
         assert!(admitted(&mut units, &gate, b'Q').await);
-        gate.copy_in();
         assert!(
-            !admitted(&mut units, &gate, b'S').await,
-            "a simple Query copy ends with its ReadyForQuery"
+            !admitted(&mut units, &gate, b'Q').await,
+            "each unit waits for its own ReadyForQuery"
         );
+        assert!(gate.ready());
+        assert!(gate.state().idle());
+        assert!(!gate.ready(), "no ReadyForQuery is banked");
     }
 
     #[test]
