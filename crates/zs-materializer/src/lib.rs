@@ -249,6 +249,7 @@ mod tests {
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })
             .unwrap()

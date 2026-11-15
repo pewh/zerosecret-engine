@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use crate::{Connection, GrantRule, Materialization, Policy, ResourcePolicy};
+use crate::{Access, Connection, GrantRule, Materialization, Policy, ResourcePolicy};
 
 pub(crate) fn policy() -> Policy {
     serde_json::from_str(
@@ -110,6 +110,7 @@ pub(crate) fn resource(name: &str, operations: &[&str], project: Option<&str>) -
         source: None,
         project: project.map(str::to_string),
         connection: Connection::default(),
+        access: Access::default(),
     }
 }
 

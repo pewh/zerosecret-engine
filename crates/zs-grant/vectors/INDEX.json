@@ -1,5 +1,6 @@
 {
   "files": {
+    "grant-access.json": 1,
     "grant-aws-ssm.json": 1,
     "grant-file.json": 2,
     "grant-json.json": 8,

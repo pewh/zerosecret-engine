@@ -28,6 +28,7 @@ fn signed(mode: Materialization, credential_ref: &str) -> SignedGrant {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })
         .unwrap()

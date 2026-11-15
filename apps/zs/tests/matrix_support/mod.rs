@@ -45,6 +45,7 @@ pub fn grant(expires_at_ms: u64, grant_id: &str) -> Grant {
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        access: zs_policy::Access::ReadWrite,
         version: zs_grant::GRANT_VERSION,
     }
 }
@@ -365,6 +366,7 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
+                            access: zs_policy::Access::ReadWrite,
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })
                         .unwrap()
@@ -388,6 +390,7 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
+                            access: zs_policy::Access::ReadWrite,
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })
                         .unwrap()

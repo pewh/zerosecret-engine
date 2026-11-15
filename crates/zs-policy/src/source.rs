@@ -274,6 +274,7 @@ mod tests {
             source,
             project: None,
             connection: Default::default(),
+            access: Default::default(),
         }
     }
 

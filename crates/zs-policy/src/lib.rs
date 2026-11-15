@@ -36,6 +36,22 @@ pub struct ResourcePolicy {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Connection::is_default")]
     pub connection: Connection,
+    #[serde(default, skip_serializing_if = "Access::is_read_write")]
+    pub access: Access,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    #[default]
+    ReadWrite,
+    ReadOnly,
+}
+
+impl Access {
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 impl ResourcePolicy {
@@ -781,5 +797,41 @@ mod tests {
             median < std::time::Duration::from_millis(5),
             "median {median:?}"
         );
+    }
+
+    #[test]
+    fn policy_without_access_reads_as_read_write() {
+        let without: ResourcePolicy = serde_json::from_str(
+            r#"{"name": "orders-pg", "host": "db.example.com", "protocol": "postgres",
+                "operations": ["connect"]}"#,
+        )
+        .unwrap();
+        assert_eq!(without.access, Access::ReadWrite);
+        assert!(without.access.is_read_write());
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("access"));
+
+        let read_only: ResourcePolicy = serde_json::from_str(
+            r#"{"name": "orders-pg", "host": "db.example.com", "protocol": "postgres",
+                "operations": ["connect"], "access": "read_only"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_only.access, Access::ReadOnly);
+        assert!(!read_only.access.is_read_write());
+        let value = serde_json::to_value(&read_only).unwrap();
+        assert_eq!(value["access"], "read_only");
+
+        let explicit: ResourcePolicy = serde_json::from_str(
+            r#"{"name": "orders-pg", "host": "db.example.com", "protocol": "postgres",
+                "operations": ["connect"], "access": "read_write"}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.access, Access::ReadWrite);
+
+        let unknown = serde_json::from_str::<ResourcePolicy>(
+            r#"{"name": "orders-pg", "host": "db.example.com", "protocol": "postgres",
+                "operations": ["connect"], "access": "write_only"}"#,
+        );
+        assert!(unknown.is_err());
     }
 }

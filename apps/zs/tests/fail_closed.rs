@@ -158,6 +158,7 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })
         .unwrap();
@@ -179,6 +180,7 @@ async fn a_protocol_no_layer_carries_is_denied_rather_than_proxied() {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })
         .unwrap();

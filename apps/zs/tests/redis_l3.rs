@@ -72,6 +72,7 @@ fn write_setup_with(
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })
             .unwrap(),
@@ -452,6 +453,7 @@ fn zs_resources_reports_a_redis_binding_as_l3() {
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })
             .unwrap(),

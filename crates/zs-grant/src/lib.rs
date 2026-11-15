@@ -6,6 +6,7 @@ use thiserror::Error;
 use zs_policy::CredentialSource;
 
 pub const GRANT_VERSION: u32 = 1;
+pub const GRANT_VERSION_ACCESS: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum GrantError {
@@ -48,6 +49,9 @@ pub fn canonical_payload(grant: &Grant) -> Vec<u8> {
         out.push_str(value);
         out.push('\u{1e}');
     };
+    if grant.access == zs_policy::Access::ReadOnly {
+        field("access", "read_only");
+    }
     if let CredentialSource::File { reference } = &grant.source {
         field("credential_ref", reference);
     }
@@ -146,6 +150,7 @@ pub struct Grant {
     pub upstream_port: u16,
     pub upstream_tls: zs_policy::UpstreamTlsMode,
     pub local_endpoint: bool,
+    pub access: zs_policy::Access,
     pub version: u32,
 }
 
@@ -175,6 +180,8 @@ struct GrantWire {
     )]
     version: u32,
     local_endpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access: Option<zs_policy::Access>,
 }
 
 fn default_grant_version() -> u32 {
@@ -209,6 +216,10 @@ impl From<Grant> for GrantWire {
             upstream_tls: grant.upstream_tls,
             version: grant.version,
             local_endpoint: grant.local_endpoint,
+            access: match grant.access {
+                zs_policy::Access::ReadWrite => None,
+                access => Some(access),
+            },
         }
     }
 }
@@ -247,6 +258,7 @@ impl TryFrom<GrantWire> for Grant {
                 wire.version
             },
             local_endpoint: wire.local_endpoint,
+            access: wire.access.unwrap_or_default(),
         })
     }
 }
@@ -362,8 +374,10 @@ impl AgentVerifier {
         let signature = Signature::from_bytes(&bytes);
         key.verify(&payload, &signature)
             .map_err(|_| GrantError::SignatureInvalid)?;
-        if signed.grant.version != GRANT_VERSION {
-            return Err(GrantError::UnsupportedVersion);
+        match (signed.grant.version, signed.grant.access) {
+            (GRANT_VERSION, zs_policy::Access::ReadWrite)
+            | (GRANT_VERSION_ACCESS, zs_policy::Access::ReadOnly) => {}
+            _ => return Err(GrantError::UnsupportedVersion),
         }
         if let Some(environment) = context.environment
             && signed.grant.environment != environment
@@ -449,6 +463,7 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            access: zs_policy::Access::ReadWrite,
             version: GRANT_VERSION,
         }
     }
@@ -794,6 +809,7 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            access: zs_policy::Access::ReadWrite,
             version: GRANT_VERSION,
         }
     }
@@ -1111,5 +1127,168 @@ mod tests {
         assert_eq!(verified.signed().signature, signed.signature);
         assert_eq!(verified.grant().source, signed.grant.source);
         assert_eq!(verified.grant().grant_id, "g-1");
+    }
+
+    fn read_only_grant() -> Grant {
+        let mut grant = golden_grant();
+        grant.access = zs_policy::Access::ReadOnly;
+        grant.version = GRANT_VERSION_ACCESS;
+        grant
+    }
+
+    fn access_vector_case() -> serde_json::Value {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../vectors/grant-access.json")).unwrap();
+        vector["cases"][0].clone()
+    }
+
+    #[test]
+    fn a_read_only_grant_is_version_two_and_signs_access_first() {
+        let grant = read_only_grant();
+        let payload = String::from_utf8(canonical_payload(&grant)).unwrap();
+        assert!(payload.starts_with("access\u{1f}read_only\u{1e}credential_ref\u{1f}"));
+        assert!(payload.contains("version\u{1f}2\u{1e}"));
+
+        let keys: Vec<&str> = payload
+            .split('\u{1e}')
+            .filter(|record| !record.is_empty())
+            .map(|record| record.split('\u{1f}').next().unwrap())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
+
+        let read_write = String::from_utf8(canonical_payload(&golden_grant())).unwrap();
+        assert!(!read_write.contains("access"));
+        assert!(!read_write.contains("version"));
+
+        let control = ControlSigningKey::generate("k1");
+        let signed = control.sign(grant).unwrap();
+        let verified = verifier_for(&control)
+            .verify(&signed, 0, &ctx("stripe-production", "GET"))
+            .unwrap();
+        assert_eq!(verified.grant().access, zs_policy::Access::ReadOnly);
+        assert_eq!(verified.grant().version, GRANT_VERSION_ACCESS);
+    }
+
+    #[test]
+    fn a_read_write_grant_is_byte_identical_to_v1() {
+        let signed = ControlSigningKey::from_bytes("k1", &[7; 32])
+            .sign(golden_grant())
+            .unwrap();
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../vectors/grant-file.json")).unwrap();
+        let case = &vector["cases"][0];
+        assert_eq!(
+            case["expect"]["payload_hex"].as_str().unwrap(),
+            hex_lower(&canonical_payload(&signed.grant))
+        );
+        assert_eq!(
+            case["expect"]["signature_b64"].as_str().unwrap(),
+            signed.signature
+        );
+        let value = serde_json::to_value(&signed.grant).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("access"));
+        assert!(!value.as_object().unwrap().contains_key("version"));
+    }
+
+    #[test]
+    fn version_two_without_access_is_refused() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+
+        let signed = control.sign(read_only_grant()).unwrap();
+        assert!(verifier.verify(&signed, 0, &context).is_ok());
+
+        let mut grant = golden_grant();
+        grant.version = GRANT_VERSION_ACCESS;
+        let signed = control.sign(grant).unwrap();
+        assert!(matches!(
+            verifier.verify(&signed, 0, &context),
+            Err(GrantError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn version_one_with_access_is_refused() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+
+        let mut grant = golden_grant();
+        grant.access = zs_policy::Access::ReadOnly;
+        let signed = control.sign(grant).unwrap();
+        assert!(matches!(
+            verifier.verify(&signed, 0, &context),
+            Err(GrantError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn access_is_signed_and_on_the_wire_only_for_read_only() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+
+        let mut signed = control.sign(read_only_grant()).unwrap();
+        signed.grant.access = zs_policy::Access::ReadWrite;
+        assert!(matches!(
+            verifier.verify(&signed, 0, &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+
+        let value = serde_json::to_value(read_only_grant()).unwrap();
+        assert_eq!(value["access"], "read_only");
+        assert_eq!(value["version"], 2);
+        let parsed: Grant = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.access, zs_policy::Access::ReadOnly);
+
+        let mut without = value;
+        without.as_object_mut().unwrap().remove("access");
+        let parsed: Grant = serde_json::from_value(without).unwrap();
+        assert_eq!(parsed.access, zs_policy::Access::ReadWrite);
+        assert_eq!(parsed.version, GRANT_VERSION_ACCESS);
+    }
+
+    #[test]
+    fn the_v0_6_0_payload_of_a_read_only_grant_fails_the_signature() {
+        let case = access_vector_case();
+        let grant: Grant = serde_json::from_value(case["input"].clone()).unwrap();
+        assert_eq!(grant.access, zs_policy::Access::ReadOnly);
+        assert_eq!(grant.version, GRANT_VERSION_ACCESS);
+
+        let current = canonical_payload(&grant);
+        let previous = String::from_utf8(current.clone())
+            .unwrap()
+            .strip_prefix("access\u{1f}read_only\u{1e}")
+            .unwrap()
+            .to_string()
+            .into_bytes();
+        assert_ne!(current, previous);
+
+        let signature_b64 = case["expect"]["signature_b64"].as_str().unwrap();
+        let signature: [u8; 64] = base64::engine::general_purpose::STANDARD
+            .decode(signature_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature = Signature::from_bytes(&signature);
+        let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        assert!(key.verify(&current, &signature).is_ok());
+        assert!(key.verify(&previous, &signature).is_err());
+
+        let previous_release = AgentVerifier::new(vec![("k1".into(), key)]);
+        let mut as_seen_by_v0_6_0 = grant;
+        as_seen_by_v0_6_0.access = zs_policy::Access::ReadWrite;
+        let signed = SignedGrant {
+            grant: as_seen_by_v0_6_0,
+            signature: signature_b64.to_string(),
+            signing_key_id: "k1".into(),
+        };
+        assert!(matches!(
+            previous_release.verify(&signed, 0, &ctx("stripe-production", "GET")),
+            Err(GrantError::SignatureInvalid)
+        ));
     }
 }

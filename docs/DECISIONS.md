@@ -7,6 +7,43 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0063 — A resource can be read-only; the grant carries `access` and the agent checks commands
+
+**2026-11-15 · Accepted** · owner decision 2026-11-15 · extends ADR-0053 (grant version)
+
+A person who gives an agent access to a database can want the agent to read and never to
+change. The grant did not say this. The only limit was the operations list, and a database
+session has one operation: `connect`.
+
+**Decision.**
+- **Policy.** A resource has `access`: `read_write` (the default) or `read_only`. A policy
+  without the field reads as `read_write`.
+- **Grant.** The control plane signs `access` into the grant. A `read_only` grant is version 2.
+  Its canonical payload starts with `access`, then `read_only`, before `credential_ref`. A
+  `read_write` grant has no `access` record and stays version 1, byte for byte as before. The
+  vector `crates/zs-grant/vectors/grant-access.json` fixes these bytes for every
+  implementation.
+- **Fail closed.** The agent accepts only version 1 with `read_write` and version 2 with
+  `read_only`. An agent that does not know the field (v0.6.0 and older) builds the payload
+  without it, the signature does not verify, and the agent refuses the grant.
+- **Enforcement.** The agent opens PostgreSQL and MySQL sessions in the database's own
+  read-only mode and refuses the known ways to switch that mode off. On MongoDB and Redis it
+  admits only an allowlist of read commands and refuses all others.
+- **Commands, not data.** The agent checks commands. It never checks the data that a command
+  returns or stores.
+
+**Consequence.** A read-only grant cannot be used by an agent that cannot enforce it. A new
+release of the agent is needed before the control plane issues the first read-only grant.
+
+**This is a guardrail, not a security boundary.** A person who holds the database password
+can connect without the agent and is not limited by it. A database account that has only read
+privileges is the control that stops writes. The agent makes the safe path the easy path.
+
+**Reverse it if** the agent must stop checking commands. Then `access` leaves the grant, and
+a later version of the grant says so.
+
+---
+
 ## ADR-0062 — `materialize_failed` names the credential reference, the step and the provider code
 
 **2026-11-15 · Accepted** · amends ADR-0028

@@ -624,6 +624,7 @@ fn write_local_setup(
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })
             .unwrap();
@@ -1346,6 +1347,7 @@ pub fn write_postgres_setup_signing(
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    access: zs_policy::Access::ReadWrite,
                     version: zs_grant::GRANT_VERSION,
                 })
                 .unwrap(),

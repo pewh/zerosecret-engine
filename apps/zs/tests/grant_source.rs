@@ -102,6 +102,7 @@ fn grant(source: CredentialSource, expires_at_ms: u64) -> Grant {
         upstream_port: 5432,
         upstream_tls: zs_policy::UpstreamTlsMode::Default,
         local_endpoint: false,
+        access: zs_policy::Access::ReadWrite,
         version: zs_grant::GRANT_VERSION,
     }
 }
