@@ -35,7 +35,10 @@ const TOKEN_SUFFIXES: &[&str] = &[
     "_PASSWORD",
 ];
 const HTTP_OPERATIONS: &[&str] = &["GET", "POST"];
-const REDIS_REASON: &str = "zs does not broker Redis yet";
+const REDIS_REASON: &str = "zs init does not write Redis bindings; write the binding by hand";
+const LEFTOVER_REASON: &str =
+    "holds a value that zs init brokered under another key; remove it by hand";
+const LEFTOVER_MIN_CONTAINED: usize = 8;
 const ONE_PER_HOST_REASON: &str = "several credentials in this file target the same host; zs injects one credential per host, so none of them is brokered";
 pub const SANITIZED_MARKER: &str =
     "# zs init: brokered secrets in this file were replaced; the original is at";
@@ -497,7 +500,10 @@ fn classify(
             name,
             "URL with an embedded password for a protocol zs init does not broker",
         );
-    } else if SECRET_KEY_WORDS.iter().any(|w| upper.contains(w)) || upper.ends_with("_KEY") {
+    } else if SECRET_KEY_WORDS.iter().any(|w| upper.contains(w))
+        || upper.ends_with("_KEY")
+        || PASSWORD_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    {
         report.skip(
             name,
             "zs init cannot broker this value; move it out of the file by hand, or pass --auth KEY=bearer or KEY=header:<Name> when a matching _URL key names its host",
@@ -506,7 +512,35 @@ fn classify(
     Ok(None)
 }
 
+fn brokered_value<'a>(old: &'a str, new: &str) -> Option<&'a str> {
+    let raw = if new == PLACEHOLDER {
+        Some(old)
+    } else {
+        DB_SCHEMES
+            .iter()
+            .find_map(|scheme| old.strip_prefix(scheme.prefix))
+            .and_then(parse_db_url)
+            .filter(|url| url.has_password)
+            .map(|url| url.password)
+    };
+    raw.filter(|raw| !raw.is_empty() && !is_placeholder(raw))
+}
+
+fn holds_brokered(value: &str, brokered: &[Zeroizing<String>]) -> bool {
+    brokered.iter().any(|raw| {
+        value == raw.as_str()
+            || (raw.len() >= LEFTOVER_MIN_CONTAINED && value.contains(raw.as_str()))
+    })
+}
+
 impl ScanReport {
+    fn leftover(&mut self, key: &str) {
+        match self.unbrokered.iter_mut().find(|entry| entry.key == key) {
+            Some(entry) => entry.reason = LEFTOVER_REASON.into(),
+            None => self.skip(key, LEFTOVER_REASON),
+        }
+    }
+
     fn skip(&mut self, key: &str, reason: impl Into<Cow<'static, str>>) {
         self.unbrokered.push(Unbrokered {
             key: key.to_string(),
@@ -558,6 +592,7 @@ fn entries(content: &str) -> Vec<Entry> {
 struct Plan {
     rewrites: HashMap<String, String>,
     claimed: HashSet<String>,
+    users: HashSet<String>,
 }
 
 impl Plan {
@@ -705,7 +740,10 @@ fn plan_databases(
             (None, Some(port)) => port,
             (None, None) => default_port(protocol),
         };
-        let user = first_key(entries, prefix, DB_USER_SUFFIXES).map(|(_, v)| v);
+        let user = first_key(entries, prefix, DB_USER_SUFFIXES).map(|(key, v)| {
+            plan.users.insert(key);
+            v
+        });
         if protocol == "mongo" && user.is_none() {
             report.skip(
                 &password_key,
@@ -875,24 +913,27 @@ fn basic_candidates(entries: &[Entry], plan: &mut Plan) -> Vec<HttpCandidate> {
         }
         let pair = url_prefixes(&entry.name).into_iter().find_map(|prefix| {
             BASIC_PAIRS.iter().find_map(|(user_suffix, secret_suffix)| {
-                let user = lookup(entries, &format!("{prefix}{user_suffix}"))?;
+                let user_key = format!("{prefix}{user_suffix}");
+                let user = lookup(entries, &user_key)?;
                 let secret_key = format!("{prefix}{secret_suffix}");
                 let secret = lookup(entries, &secret_key)?;
                 Some((
                     prefix.clone(),
+                    user_key,
                     user.to_string(),
                     secret_key,
                     secret.to_string(),
                 ))
             })
         });
-        let Some((prefix, user, secret_key, secret)) = pair else {
+        let Some((prefix, user_key, user, secret_key, secret)) = pair else {
             continue;
         };
         if plan.handled(&secret_key) {
             continue;
         }
         plan.claimed.insert(secret_key.clone());
+        plan.users.insert(user_key);
         if is_placeholder(&secret) {
             continue;
         }
@@ -982,6 +1023,8 @@ pub fn scan_with(
     plan_http(candidates, &mut report, &mut plan);
     let mut lines = Vec::new();
     let mut masked = Vec::new();
+    let mut brokered: Vec<Zeroizing<String>> = Vec::new();
+    let mut kept: Vec<(String, Zeroizing<String>)> = Vec::new();
     for (index, line) in content.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim();
@@ -1014,15 +1057,26 @@ pub fn scan_with(
         };
         match outcome {
             Some(new_value) => {
+                if let Some(raw) = brokered_value(value, &new_value) {
+                    brokered.push(Zeroizing::new(raw.to_string()));
+                }
                 let rewritten = format!("{key}={new_value}");
                 masked.push(rewritten.clone());
                 lines.push(rewritten);
                 report.replaced.push(name.to_string());
             }
             None => {
+                if !plan.users.contains(name) {
+                    kept.push((name.to_string(), Zeroizing::new(value.to_string())));
+                }
                 lines.push(line.to_string());
                 masked.push(format!("{key}={WITHHELD}"));
             }
+        }
+    }
+    for (name, value) in &kept {
+        if holds_brokered(value, &brokered) {
+            report.leftover(name);
         }
     }
     if !report.replaced.is_empty() {
@@ -1151,6 +1205,12 @@ fn write_credentials(dir: &Path, credentials: &[ScannedCredential]) -> Result<()
                         "credential file {} already holds another value; move it away first",
                         path.display()
                     ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                        .map_err(|e| format!("cannot set mode 0600 on {}: {e}", path.display()))?;
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => pending.push((path, credential)),

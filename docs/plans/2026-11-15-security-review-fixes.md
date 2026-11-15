@@ -142,15 +142,15 @@ Rewritten 2026-11-15 after the owner accepted the [session-end spec](../specs/20
 **Interfaces:**
 - Fixed text for a leftover copy: `holds a value that zs init brokered under another key; remove it by hand`. It is printed by the existing `zs: not brokered, left in .env: <KEY> (<reason>)` line.
 
-- [ ] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test init_leftover_secrets`. Expected: 4 FAIL.
-- [ ] **Step 2: Add the short-value test** to the same file: `a_short_brokered_password_reports_only_its_exact_copy`. `.env`: `MYSQL_HOST=db.example.internal`, `MYSQL_USER=app`, `MYSQL_PASSWORD=app`, `MYSQL_PWD=app`, `APP_NAME=my-app-service`. Assert: `MYSQL_PWD` is listed as not brokered; `APP_NAME` and `MYSQL_USER` are not listed.
-- [ ] **Step 3: Implement the leftover report.** After planning, for each `.env` line that is not rewritten: report it with the fixed text when its value equals a brokered raw value, or contains a brokered raw value of 8 bytes or more. "Brokered raw value" is the value as it stood in `.env` (for a Basic pair, the secret, not the base64 token). `MYSQL_USER` is exempt because the user key of a brokered group is never reported.
-- [ ] **Step 4: Extend the name rule.** In `classify` (`:500`), a key that ends with one of `PASSWORD_SUFFIXES` (`:16`) is reported as the `SECRET_KEY_WORDS` keys are.
-- [ ] **Step 5: File mode (G1).** In the existing-file branch (`:1145-1155`), after the value compare, set the file mode to `0o600` on Unix; an error stops `zs init` before `.env` changes, as the other errors of that function do.
-- [ ] **Step 6: Redis text.** Change `REDIS_REASON` (`:38`) to `zs init does not write Redis bindings; write the binding by hand`. Update the tests in `apps/zs/tests/init_cli.rs` that assert the old text.
-- [ ] **Step 7: Run.** `cargo test -p zs --test init_leftover_secrets` (5 PASS) and `cargo test -p zs --test init_cli` (all pass).
-- [ ] **Step 8: Documents.** `README.md:206`: say that a second copy of a brokered value is listed, and that an existing credential file is set to 0600.
-- [ ] **Step 9: Gate and commit.** `fix(init): list every leftover copy of a brokered secret, set 0600 on an existing file`.
+- [x] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test init_leftover_secrets`. Expected: 4 FAIL.
+- [x] **Step 2: Add the short-value test** to the same file: `a_short_brokered_password_reports_only_its_exact_copy`. `.env`: `MYSQL_HOST=db.example.internal`, `MYSQL_USER=app`, `MYSQL_PASSWORD=app`, `MYSQL_PWD=app`, `APP_NAME=my-app-service`. Assert: `MYSQL_PWD` is listed as not brokered; `APP_NAME` and `MYSQL_USER` are not listed.
+- [x] **Step 3: Implement the leftover report.** After planning, for each `.env` line that is not rewritten: report it with the fixed text when its value equals a brokered raw value, or contains a brokered raw value of 8 bytes or more. "Brokered raw value" is the value as it stood in `.env` (for a Basic pair, the secret, not the base64 token). `MYSQL_USER` is exempt because the user key of a brokered group is never reported.
+- [x] **Step 4: Extend the name rule.** In `classify` (`:500`), a key that ends with one of `PASSWORD_SUFFIXES` (`:16`) is reported as the `SECRET_KEY_WORDS` keys are.
+- [x] **Step 5: File mode (G1).** In the existing-file branch (`:1145-1155`), after the value compare, set the file mode to `0o600` on Unix; an error stops `zs init` before `.env` changes, as the other errors of that function do.
+- [x] **Step 6: Redis text.** Change `REDIS_REASON` (`:38`) to `zs init does not write Redis bindings; write the binding by hand`. Update the tests in `apps/zs/tests/init_cli.rs` that assert the old text. (2026-11-15: none does; the unit test in `init.rs` uses the constant.)
+- [x] **Step 7: Run.** `cargo test -p zs --test init_leftover_secrets` (5 PASS) and `cargo test -p zs --test init_cli` (all pass).
+- [x] **Step 8: Documents.** `README.md:206`: say that a second copy of a brokered value is listed, and that an existing credential file is set to 0600.
+- [x] **Step 9: Gate and commit.** `fix(init): list every leftover copy of a brokered secret, set 0600 on an existing file`.
 
 ---
 
