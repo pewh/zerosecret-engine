@@ -7,6 +7,29 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0062 — `materialize_failed` names the credential reference, the step and the provider code
+
+**2026-11-15 · Accepted** · amends ADR-0028
+
+ADR-0028 says that the `materialize_failed` diagnostic event has `resource` and `error.kind`
+and no reason text. The agent writes more than that, and the record did not say so.
+
+**Decision.**
+- `materialize_failed` also has `credential_ref`: the grant's credential reference
+  (`file:<reference>` or `aws_ssm:<role ARN>:<parameter>`). It is a reference, never a value.
+- A `refused` error also has `step` (the provider call that failed) and `provider_code` (the
+  error code that the provider returned). A `transport` error also has `step`.
+- It still has no reason text.
+
+**Consequence.** A diagnostic log names the file path or the AWS role and parameter of a failed
+materialization. These names leave the machine when the owner gives the file to an LLM, as
+hostnames and resource names already do (ADR-0028).
+
+**Reverse it if** a credential reference must stay off the machine's diagnostic log. Then the
+event drops `credential_ref`, and a reader joins it to the grant by `resource`.
+
+---
+
 ## ADR-0061 — v2 work does not wait for the v1 exit
 
 **2026-11-15 · Accepted** · owner decision 2026-11-15 ("no gate") · changes ROADMAP "v2 — reach

@@ -128,7 +128,8 @@ the credential's raw bytes in the message stream. An upstream that returns the c
 JSON-escaped (`\/` for `/`, a `\u` escape), base64-encoded, percent-encoded inside a
 WebSocket frame, or otherwise transformed is not matched. A credential made only of letters,
 digits, `-`, `_`, `.`, `+` and `=` has one JSON form, so this matters for a credential with
-`/` or a non-ASCII byte.
+`/` or a non-ASCII byte. For a `basic` binding the matched value is the stored base64 token; the
+decoded `user:secret` is not matched.
 
 **No cap on concurrent connections, and one body clone per attempt.** Any local process can
 open many connections to the agent's listener. The agent bounds a request head in 30 s and a
@@ -221,8 +222,8 @@ With a control plane, these rules together mean that a committed binding cannot 
 credential through a host, a port, a TLS mode, a CA, a pinned leaf or a local endpoint that the
 control plane did not sign. A binding with no startup grant keeps its file values, so it may
 open its file-chosen local endpoint. Every request through that endpoint that needs the
-credential is denied for lack of a grant (`materialize` calls `authorized`,
-`apps/zs/src/lib.rs:1055-1066`), and so is `POST /.zs/presign`. A request outside the binding's
+credential is denied for lack of a grant (`materialize` calls `authorized` in
+`apps/zs/src/lib.rs`), and so is `POST /.zs/presign`. A request outside the binding's
 `paths` is forwarded without a credential, as through the proxy (ADR-0027).
 
 Local mode, with no control URL, trusts the signing keys and grants in the file by design, so a
@@ -389,7 +390,9 @@ credential or read it back; R5 still closes the stream before a reply that carri
 client. `-@dangerous` also removes `INFO`, which the ioredis ready check and Bull call; add
 `+info` back, which does not show the credential. Redis Cluster and Sentinel are not brokered, the listener refuses client TLS, and the
 agent does not broker a password that a command carries as data (`MIGRATE ... AUTH`,
-`ACL SETUSER`, `CONFIG SET requirepass`).
+`ACL SETUSER`, `CONFIG SET requirepass`). The reply guard matches the raw credential only:
+`ACL LIST` and `ACL GETUSER` return its SHA-256, which is not matched. Redis 5 and earlier has
+no ACL, so this advice cannot be applied there.
 
 **The workload chooses the PostgreSQL or MySQL database and role unless `user` is bound.** The
 agent sends the server the client's own startup packet or handshake response with the brokered
@@ -406,6 +409,19 @@ mismatch) still opens one upstream connection, and the agent closes it before it
 handshake response. The
 agent always refuses a PostgreSQL startup that carries the `replication` parameter, whatever its
 value and whatever the binding says, and audits `deny` `connect`, reason `replication refused`.
+
+**A PostgreSQL or MySQL client can change the password of its own account.** The agent does not
+authorize single statements (PRODUCT §3). A client under `zs run` can send `ALTER ROLE`,
+`ALTER USER` or `SET PASSWORD` for the brokered user. The new password then works without the
+agent, and the stored credential stops working. Give the brokered user the least rights that the
+app needs. On MySQL 8.0.13 and later, create the brokered user with `PASSWORD REQUIRE CURRENT`,
+so a change needs the current password, which the client never holds. PostgreSQL has no such
+setting.
+
+**A PostgreSQL client sees the agent's denial reason.** When the agent refuses a PostgreSQL
+connection before materialization, the error response carries the denial text: it can name the
+subject, the resource or its host, a grant ID, and on an audit failure the journal path. It never
+holds a credential value.
 
 **An http binding sends the credential in cleartext.** A binding with `protocol: "http"` opts
 in to plaintext (ADR-0033). The agent adds the credential to a request that crosses the network
@@ -427,7 +443,7 @@ that has an `Origin` header, so a web page cannot reach it by DNS rebinding.
 signs the method, path, query and signed headers (and, for `hmac-body-signature`, the body) that the client
 chose, within the grant and the path scope. This is the same session-abuse limit as the first
 paragraph of this section. A request with no `Authorization` header goes to an `aws-sigv4`
-host unchanged and unsigned.
+host unchanged and unsigned, and only when the workload holds a grant for the method.
 
 **Hash state is not zeroized.** The SHA-1 and SHA-256 crates in `Cargo.lock` (`sha1` 0.10.7,
 `sha2` 0.10.9, `digest` 0.10.7) do not zeroize their block buffers. Hasher state and finalize
@@ -497,6 +513,7 @@ These are enforced in code review and in CI, not by convention.
 7. The diagnostic log follows rules 3 and 5 (ADR-0028). `zs-diag` takes typed values only. A
    request path, a query string, a header value, SQL text, a body, argv after argv[0], an
    environment value and the subject are never logged. Server error text is kept only when it does not contain the credential.
+   That text can hold a user or database name.
 8. No credential value reaches the workload. The agent holds each WebSocket data message from
    the upstream until its last fragment, and checks every data message and control frame before
    it writes it. One that carries the credential ends the session unseen (audit `deny`
@@ -536,13 +553,16 @@ These are enforced in code review and in CI, not by convention.
    chunks is seen whole, and releases the other bytes at once. A body that carries a matched value, or that ends with
    8 or more bytes of the start of one, is cut and audited `deny` `response echo` (§3). A WebSocket
    binding's refused upgrade answer gets the same checks. A copy of the credential that is
-   transformed, or that has other bytes between its parts, is not matched.
+   transformed, or that has other bytes between its parts, is not matched. For a `basic`
+   binding the matched value is the stored base64 token; the decoded `user:secret` is not
+   matched.
 10. Four inputs from outside the agent fail closed. A PostgreSQL SCRAM challenge with fewer
     than 4096 or more than 1,000,000 iterations is refused. The MySQL listener never offers
     `CLIENT_LOCAL_FILES` upstream: it is removed from the greeting and from the response the
     agent forwards, so a server cannot start a `LOCAL INFILE` transfer through the agent. A
-    `file` credential reference resolves only when every part of its path is a plain name, so
-    a drive prefix, a root, or a `.` part is refused as not resolvable. `zs run` with
+    `file` credential reference resolves only when every part of its path is a plain name: a
+    leading `/` is dropped, `..` becomes `__`, and a drive prefix, an empty part or a `.` part
+    is refused as not resolvable. `zs run` with
     `--enrollment-token` applies the control URL rule (`https`, or `http` for a loopback host)
     to `--control` and to `--enroll-url` before it opens any connection.
 
@@ -943,7 +963,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Ambiguous request target on a binding with `paths` | Refuse before the upstream. Audit `deny` with the method (ADR-0027) |
 | `Host` missing, repeated or for another origin, or a target that is not origin-form, inside a tunnel to a bound host | Refuse before the upstream. Audit `deny` with the method. Absolute-form: the URI authority replaces `Host` (ADR-0027) |
 | `paths` empty, not canonical or on a non-HTTPS binding, or an unknown binding field | Refuse the config at load. Never fall back to host-wide injection (ADR-0027) |
-| Diagnostic log unavailable or full | Traffic continues. One stderr warning. The log never holds a credential, a request path or workload data (ADR-0028) |
+| Diagnostic log unavailable or full | Traffic continues. One stderr warning. The log never holds a credential or a request path. Server error text in it can hold a user or database name (ADR-0028) |
 | MySQL client sends `COM_CHANGE_USER`, whatever its sequence id | Refuse with an ERR packet and close. Never forward it. Audit `deny` `change_user` (ADR-0029) |
 | MySQL upstream asks for a method that sends the password without verified TLS, or switches to an unknown plugin | Refuse. Never send the password or the RSA key request (`0x02`) (ADR-0029) |
 | MySQL upstream TLS fails verification or the pin, or `upstream_ca` or `upstream_cert_sha256` is set and the server does not offer TLS | Refuse. Never fall back to plaintext (ADR-0029) |
@@ -963,7 +983,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | WebSocket message over 32 MiB, masked server frame, or reserved bits set | End the session (ADR-0034) |
 | `websocket-json-field` request without `Upgrade: websocket` | Deny (ADR-0034) |
 | `aws-sigv4` request with `Authorization` but no valid `x-amz-date`, no `x-amz-content-sha256`, a malformed `STREAMING-` body or one carrying an unexpected trailer header, a missing signed header, or `host` not signed | Deny before the upstream (ADR-0035) |
-| `aws-sigv4` request with no `Authorization` header | Forward unchanged. No credential is used (ADR-0035) |
+| `aws-sigv4` request with no `Authorization` header | Forward unchanged only when the workload holds a grant for the method; else deny. No credential is used (ADR-0035) |
 | `hmac-body-signature` request without its `id_header` | Deny before the upstream (ADR-0046) |
 | `/.zs/presign` for a method not in the grant, a path outside the scope, a non-https binding, signed headers other than `host`, an expiry outside 1 s to 15 minutes, or an `X-Amz-Date` more than 15 minutes from now | Deny. Audit `deny` `presign <METHOD>`. Never call upstream (ADR-0035) |
 | Local endpoint request whose `Host` is not its loopback address, or that has an `Origin` header | Refuse before the upstream (ADR-0035) |

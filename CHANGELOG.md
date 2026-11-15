@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Security
+
+- An open PostgreSQL, MySQL, MongoDB or Redis session ends within 5 s when its grant is revoked
+  or expires (ADR-0059).
+- An injected request on a scheme that sends the credential loses `Range` and `If-Range`, so an
+  echoed credential cannot come back in parts (ADR-0059).
+- A database resource name is no longer a proxy host: `CONNECT <database resource>:<port>`
+  passes through without a credential.
+- `zs init` lists every leftover copy of a brokered secret in `.env`, lists `_PASS` and `_PWD`
+  keys, and sets an existing credential file to 0600.
+- The MongoDB relay refuses an `OP_MSG` that does not have exactly one body section; the MySQL
+  relay refuses `COM_CHANGE_USER` whatever its sequence id.
+- A `file` credential reference with an empty part or a `.` part is refused as not resolvable.
+
 ## [0.6.0] - 2026-11-11
 
 - A `redis` binding brokers Redis logins through `RedisListener` (ADR-0057). The agent
