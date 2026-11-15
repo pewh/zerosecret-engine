@@ -179,6 +179,10 @@ pub(crate) fn inject_only(
         // A coded response body cannot be scanned for an echoed credential.
         request.set_header("Accept-Encoding", "identity");
         protocol.inject(request, &credential)?;
+        if !protocol.keeps_range() {
+            request.remove_header("Range");
+            request.remove_header("If-Range");
+        }
         Ok::<_, zs_protocol::Denied>((protocol, credential))
     }));
     let kind = match &outcome {
@@ -571,6 +575,28 @@ mod tests {
         }
     }
 
+    struct Signing;
+
+    impl Protocol for Signing {
+        fn matches(&self, _destination: &Destination) -> bool {
+            true
+        }
+        fn authorize(&self, _context: &FlowContext) -> Result<(), Denied> {
+            Ok(())
+        }
+        fn inject(
+            &self,
+            request: &mut InjectedRequest,
+            _credential: &Credential,
+        ) -> Result<(), Denied> {
+            request.set_header("Authorization", "AWS4-HMAC-SHA256 Signature=0");
+            Ok(())
+        }
+        fn keeps_range(&self) -> bool {
+            true
+        }
+    }
+
     struct Refuse;
 
     impl Protocol for Refuse {
@@ -692,6 +718,42 @@ mod tests {
             let _ = inject_only(&handler, &report, &facts(), &mut request, "h");
         }
         assert_eq!(materialized.load(Ordering::SeqCst), 0);
+    }
+
+    fn ranged_request() -> InjectedRequest {
+        let mut request = request();
+        request.set_header("Range", "bytes=0-9");
+        request.set_header("If-Range", "\"v1\"");
+        request
+    }
+
+    #[test]
+    fn a_signing_scheme_keeps_the_range_header() {
+        let (handler, _) = handler(Some(Arc::new(Signing)));
+        let report = Recorder::default();
+        let mut request = ranged_request();
+        let injected = inject_only(&handler, &report, &facts(), &mut request, "h")
+            .expect("the inject layer answers");
+        assert!(injected.is_some());
+        assert!(request.header("Authorization").is_some());
+        assert_eq!(request.header("Range"), Some("bytes=0-9"));
+        assert_eq!(request.header("If-Range"), Some("\"v1\""));
+    }
+
+    #[test]
+    fn a_credential_scheme_loses_range_and_if_range() {
+        let (handler, _) = handler(Some(Arc::new(Allow)));
+        let report = Recorder::default();
+        let mut request = ranged_request();
+        let injected = inject_only(&handler, &report, &facts(), &mut request, "h")
+            .expect("the inject layer answers");
+        assert!(injected.is_some());
+        assert_eq!(
+            request.header("Authorization"),
+            Some(format!("Bearer {CANARY}").as_str())
+        );
+        assert_eq!(request.header("Range"), None);
+        assert_eq!(request.header("If-Range"), None);
     }
 
     #[test]

@@ -285,6 +285,10 @@ fn signed_headers_of(authorization: Option<&str>) -> Vec<String> {
 }
 
 impl Protocol for AwsSigV4 {
+    fn keeps_range(&self) -> bool {
+        true
+    }
+
     fn matches(&self, destination: &Destination) -> bool {
         destination.host.eq_ignore_ascii_case(&self.host)
     }
@@ -461,6 +465,10 @@ impl HmacBodySignature {
 }
 
 impl Protocol for HmacBodySignature {
+    fn keeps_range(&self) -> bool {
+        true
+    }
+
     fn matches(&self, destination: &Destination) -> bool {
         destination.host.eq_ignore_ascii_case(&self.host)
     }

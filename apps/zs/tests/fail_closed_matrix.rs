@@ -5483,3 +5483,152 @@ fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
         "row 109: {renewal}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_123_an_open_database_session_closes_when_its_grant_is_revoked() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const REVOKED: &str = "grant revoked";
+    let granted = Arc::new(AtomicBool::new(true));
+    let state = granted.clone();
+    let materialize: zs_protocol::Materialize = Arc::new(move || {
+        if !state.load(Ordering::SeqCst) {
+            return Err(zs_protocol::Denied::new(REVOKED));
+        }
+        let state = state.clone();
+        let check: zs_protocol::SessionCheck = Arc::new(move || {
+            if state.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(REVOKED)
+            }
+        });
+        Ok(zs_protocol::Materialized::new(
+            zs_credential::Credential::from_bytes(redis_fake::PASSWORD.as_bytes().to_vec())
+                .unwrap(),
+            check,
+        ))
+    });
+    let fake = redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_fake::listen(
+        fake.addr,
+        None,
+        redis_fake::auth(),
+        materialize,
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+
+    let mut session = redis_fake::logged_in(local).await;
+    assert_eq!(
+        session.command(&[b"GET", b"row-123-before"]).await,
+        redis_fake::OK,
+        "row 123 positive control: the session relays while the grant is valid"
+    );
+    assert!(
+        fake.saw_bytes(b"row-123-before"),
+        "row 123 positive control"
+    );
+
+    granted.store(false, Ordering::SeqCst);
+    let mut second = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        second.read_reply().await,
+        zs_proto_redis::DENIED.frame(),
+        "row 123 negative control: a new connection is denied after the revocation"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert_eq!(
+        session.read_to_end().await,
+        Vec::<u8>::new(),
+        "row 123: the agent wrote a reply on the session that it ended"
+    );
+    let _ = session.send_command(&[b"GET", b"row-123-after"]).await;
+    assert!(
+        !redis_fake::eventually(|| fake.saw_bytes(b"row-123-after")).await,
+        "row 123: a command reached the upstream 6 s after the revocation"
+    );
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", REVOKED)],
+        "row 123: not audited"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_124_range_is_removed_from_a_request_whose_scheme_sends_the_credential() {
+    let key = ControlSigningKey::generate("k1");
+    let ranged = "Range: bytes=0-9\r\nIf-Range: \"v1\"\r\n";
+
+    let signing = serve(
+        with_auth(sigv4()),
+        granted(&key, &["GET"], "https"),
+        &key,
+        Some(CREDENTIAL),
+    )
+    .await;
+    let client_auth = "AWS4-HMAC-SHA256 Credential=x/20261016/auto/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=00";
+    let sent = common::raw_exchange(
+        &signing.addr.to_string(),
+        format!(
+            "GET https://api.stripe.com/bucket/k HTTP/1.1\r\nHost: api.stripe.com\r\nx-amz-date: 20261016T120000Z\r\nx-amz-content-sha256: UNSIGNED-PAYLOAD\r\n{ranged}Authorization: {client_auth}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(
+        sent.starts_with("HTTP/1.1 200"),
+        "row 124 positive control: {sent}"
+    );
+    let head = signing.upstream.heads.lock().unwrap()[0].clone();
+    assert!(
+        head.contains("Credential=AKIDMATRIX/"),
+        "row 124 positive control: the request was signed: {head}"
+    );
+    assert_eq!(
+        common::header_lines(&head, "Range"),
+        vec!["Range: bytes=0-9"],
+        "row 124 positive control: a signing scheme keeps `Range`: {head}"
+    );
+    assert_eq!(
+        common::header_lines(&head, "If-Range"),
+        vec!["If-Range: \"v1\""],
+        "row 124 positive control: a signing scheme keeps `If-Range`: {head}"
+    );
+
+    let bearer = serve(
+        binding(),
+        vec![key.sign(grant(now_ms() + 300_000, "g-1")).unwrap()],
+        &key,
+        Some(CREDENTIAL),
+    )
+    .await;
+    let sent = common::raw_exchange(
+        &bearer.addr.to_string(),
+        format!(
+            "GET https://api.stripe.com/v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\n{ranged}Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(sent.starts_with("HTTP/1.1 200"), "row 124: {sent}");
+    let head = bearer.upstream.heads.lock().unwrap()[0].clone();
+    assert!(
+        head.contains(CREDENTIAL),
+        "row 124 positive control: the credential was injected"
+    );
+    assert!(
+        common::header_lines(&head, "Range").is_empty(),
+        "row 124: `Range` reached the upstream with the credential: {head}"
+    );
+    assert!(
+        common::header_lines(&head, "If-Range").is_empty(),
+        "row 124: `If-Range` reached the upstream with the credential: {head}"
+    );
+}

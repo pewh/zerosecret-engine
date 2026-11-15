@@ -110,13 +110,13 @@ Rewritten 2026-11-15 after the owner accepted the [session-end spec](../specs/20
 **Interfaces:**
 - Produces: `fn keeps_range(&self) -> bool { false }` as a default method on `zs_protocol::Protocol`; the two signing protocols return `true`.
 
-- [ ] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test range_on_injected_request`. Expected: FAIL, "two `Range` requests returned the injected credential".
-- [ ] **Step 2: Add `keeps_range` to the trait and the two overrides.**
-- [ ] **Step 3: Write the sigv4 test** in the unit tests of `crates/zs-mitm/src/pipeline.rs` (use the existing test handler there, `:547`): `a_signing_scheme_keeps_the_range_header` asserts that an injected request through a protocol with `keeps_range() == true` still has `Range: bytes=0-9`, and `a_credential_scheme_loses_range_and_if_range` asserts that both headers are gone when it is `false`. Run: `cargo test -p zs-mitm --lib range`. Expected: the second test FAILS.
-- [ ] **Step 4: Implement.** In the closure at `pipeline.rs:176-181`, after `protocol.inject(...)` succeeds: `if !protocol.keeps_range() { request.remove_header("Range"); request.remove_header("If-Range"); }`.
-- [ ] **Step 5: Run.** `cargo test -p zs-mitm --lib range` and `cargo test -p zs --test range_on_injected_request`. Expected: PASS. Then `cargo test -p zs-mitm` and `cargo test -p zs-proto-http`: all pass.
-- [ ] **Step 6: Documents.** `docs/SECURITY.md` §4 rule 9 (`:513-528`): add "An injected request on a scheme that sends the credential loses `Range` and `If-Range`, so the workload cannot ask for an echoed value in parts." Add one §7 row after `:1005` with the same fact.
-- [ ] **Step 7: Gate and commit.** `fix(mitm): remove Range from requests that carry the credential`.
+- [x] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs --test range_on_injected_request`. Expected: FAIL, "two `Range` requests returned the injected credential".
+- [x] **Step 2: Add `keeps_range` to the trait and the two overrides.**
+- [x] **Step 3: Write the sigv4 test** in the unit tests of `crates/zs-mitm/src/pipeline.rs` (use the existing test handler there, `:547`): `a_signing_scheme_keeps_the_range_header` asserts that an injected request through a protocol with `keeps_range() == true` still has `Range: bytes=0-9`, and `a_credential_scheme_loses_range_and_if_range` asserts that both headers are gone when it is `false`. Run: `cargo test -p zs-mitm --lib range`. Expected: the second test FAILS.
+- [x] **Step 4: Implement.** In the closure at `pipeline.rs:176-181`, after `protocol.inject(...)` succeeds: `if !protocol.keeps_range() { request.remove_header("Range"); request.remove_header("If-Range"); }`.
+- [x] **Step 5: Run.** `cargo test -p zs-mitm --lib range` and `cargo test -p zs --test range_on_injected_request`. Expected: PASS. Then `cargo test -p zs-mitm` and `cargo test -p zs-proto-http`: all pass.
+- [x] **Step 6: Documents.** `docs/SECURITY.md` §4 rule 9 (`:513-528`): add "An injected request on a scheme that sends the credential loses `Range` and `If-Range`, so the workload cannot ask for an echoed value in parts." Add one §7 row with the same fact at the end of §7. Correction (2026-11-15): `every_security_7_row_has_a_named_test_in_this_file` pins the row count and gives row N the test `fn row_N_…` in `apps/zs/tests/fail_closed_matrix.rs`, so a row goes at the end, never in the middle. Task 2 step 10 put its row at position 11 and broke that test; this task moves it to row 123, adds this task's row as row 124, sets the count to 124, and adds `row_123_…` and `row_124_…`.
+- [x] **Step 7: Gate and commit.** `fix(mitm): remove Range from requests that carry the credential`.
 
 ---
 

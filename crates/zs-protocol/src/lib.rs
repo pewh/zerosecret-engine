@@ -215,6 +215,10 @@ pub trait Protocol: Send + Sync {
     ) -> Result<String, Denied> {
         Err(Denied::new("this auth scheme cannot sign a URL"))
     }
+
+    fn keeps_range(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

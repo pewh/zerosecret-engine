@@ -527,8 +527,10 @@ These are enforced in code review and in CI, not by convention.
    value shorter than 8 bytes, `Host`, `Accept-Encoding`, and every `x-amz-*` header except
    `x-amz-security-token` are not matched. When an injected value is `<scheme> <token>`
    (`Basic …`, `Bearer …`), a token of 8 bytes or more is also matched alone. An injected
-   request asks the upstream for `Accept-Encoding: identity`. A response with any other
-   `Content-Encoding` is refused with 502 and audited `deny` `response encoded`, because its
+   request asks the upstream for `Accept-Encoding: identity`. An injected request on a scheme
+   that sends the credential loses `Range` and `If-Range`, so the workload cannot ask for an
+   echoed value in parts. A response with any other `Content-Encoding` is refused with 502 and
+   audited `deny` `response encoded`, because its
    body cannot be scanned. The body and its trailers are checked as a stream: the agent holds
    back only the end of a chunk that is the start of a matched value, so a value split across
    chunks is seen whole, and releases the other bytes at once. A body that carries a matched value, or that ends with
@@ -932,7 +934,6 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Materialization failed | Deny. Never fall back to a weaker path |
 | Protocol implementation panicked | Deny that resource. Agent stays up |
 | Grant revoked | Deny before expiry. Lag bounded by the refresh interval (ADR-0018) |
-| Grant revoked or expired while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. Audit `deny` `connect`, reason `grant revoked` (ADR-0059) |
 | Local CA storage locked, denied, unavailable, ambiguous, malformed or mismatched | Deny startup before any listener or child. Never mint a replacement CA (§6) |
 | Grant revoked, then renewed | Deny. A renewal keeps each revoked grant's ID in the chain of the grant it replaced, for the last 32 renewals (ADR-0026) |
 | Request method not in the grant | Deny that request. Audit the method (ADR-0026) |
@@ -1045,6 +1046,8 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | A Redis upstream reply carries an 8-byte window of the credential | Close the connection before those bytes reach the client. Audit `deny` `connect`, reason `credential echo` (`apps/zs/tests/fail_closed_matrix.rs` row 120) |
 | A Redis top-level reply is `-MOVED` or `-ASK` | Refuse with `-ERR ZeroSecret refused a cluster redirect`. Audit `deny` `connect`, reason `cluster redirect`. Close the connection (`apps/zs/tests/fail_closed_matrix.rs` row 121) |
 | A Redis upstream answers the broker's `AUTH` with no password configured, and the binding does not set `upstream_auth_optional` (with or without `user: "default"`) | Refuse with `-ERR ZeroSecret upstream authentication failed`. Audit `deny` `connect`, reason `upstream authentication failed`. No client command reaches the upstream (`apps/zs/tests/fail_closed_matrix.rs` row 122; `crates/zs-proto-redis/tests/redis_real.rs`) |
+| Grant revoked or expired while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. Audit `deny` `connect`, reason `grant revoked` (ADR-0059, `apps/zs/tests/fail_closed_matrix.rs` row 123) |
+| Workload sends `Range` or `If-Range` on an injected request whose scheme sends the credential (every scheme except `aws-sigv4` and `hmac-body-signature`) | Remove both headers before the request reaches the upstream, so the workload cannot get an echoed credential in parts (ADR-0059, `apps/zs/tests/range_on_injected_request.rs`, `apps/zs/tests/fail_closed_matrix.rs` row 124) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
