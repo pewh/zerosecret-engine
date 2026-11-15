@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-15
+
 ### Security
 
 - An open PostgreSQL, MySQL, MongoDB or Redis session ends within 5 s when its grant is revoked
