@@ -639,3 +639,74 @@ async fn client_startup_cannot_switch_the_mode_off() {
     assert_eq!(fixture.rows().await, "1");
     fixture.remove().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dblink_functions_are_refused() {
+    let Some(fixture) = Fixture::new("zs_ro_dblink").await else {
+        return;
+    };
+    let mut setup = admin(&fixture.db).await;
+    let existed = setup
+        .simple("SELECT count(*) FROM pg_extension WHERE extname = 'dblink'")
+        .await
+        .value()
+        == Some("1");
+    let created = setup.simple("CREATE EXTENSION IF NOT EXISTS dblink").await;
+    let address = setup.simple("SELECT host(inet_server_addr())").await;
+    setup.close().await;
+    if !created.ok() {
+        eprintln!("dblink_functions_are_refused: the dblink extension is not available, skipped");
+        fixture.remove().await;
+        return;
+    }
+    let address = address.value().unwrap().to_string();
+    let connection = format!(
+        "host={address} port=5432 dbname={} user={ROLE} password={ROLE_PASSWORD}",
+        fixture.db.name
+    );
+    let write = format!(
+        "SELECT dblink_exec('{connection}', 'INSERT INTO {} VALUES (2)')",
+        fixture.table
+    );
+
+    let mut control = fixture.session(SessionAccess::ReadWrite).await;
+    let written = control.simple(&write).await;
+    control.close().await;
+    assert!(
+        written.ok(),
+        "negative control: dblink_exec writes on a read-write session: {:?}",
+        written.errors
+    );
+    assert_eq!(fixture.rows().await, "2");
+
+    let mut session = fixture.session(SessionAccess::ReadOnly).await;
+    let read = session
+        .simple(&format!("SELECT count(*) FROM {}", fixture.table))
+        .await;
+    assert_eq!(read.value(), Some("2"), "positive control: a read works");
+    for statement in [
+        write.clone(),
+        format!("SELECT dblink_connect('zs', '{connection}')"),
+        format!("SELECT dblink_connect_u('zs', '{connection}')"),
+        "SELECT dblink_send_query('zs', 'SELECT 1')".to_string(),
+        "SELECT dblink_open('zs', 'cursor', 'SELECT 1')".to_string(),
+    ] {
+        let refused = session.simple(&statement).await;
+        assert!(refused.refused_with(READ_ONLY), "{:?}", refused.errors);
+        assert_eq!(refused.message(), REFUSED);
+        assert_still_read_only(&mut session, &fixture, "a dblink function").await;
+    }
+    session.close().await;
+    assert_eq!(
+        fixture.rows().await,
+        "2",
+        "the read-only session wrote a row"
+    );
+
+    if !existed {
+        let mut teardown = admin(&fixture.db).await;
+        teardown.simple("DROP EXTENSION IF EXISTS dblink").await;
+        teardown.close().await;
+    }
+    fixture.remove().await;
+}

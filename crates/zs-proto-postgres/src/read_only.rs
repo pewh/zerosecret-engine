@@ -13,7 +13,7 @@ const AGENT_OPTION: &[u8] = b"-c default_transaction_read_only=on";
 const SETTINGS: [&[u8]; 2] = [b"default_transaction_read_only", b"transaction_read_only"];
 const ARGUMENT_OPTIONS: &[u8] = b"BCcDdfhkNprStvW-";
 const FLAG_OPTIONS: &[u8] = b"bEeFijlnOPsT";
-const WORDS: [&str; 9] = [
+const WORDS: [&str; 8] = [
     "set_config",
     "default_transaction_read_only",
     "transaction_read_only",
@@ -22,8 +22,8 @@ const WORDS: [&str; 9] = [
     "query_to_xml_and_xmlschema",
     "ts_stat",
     "ts_rewrite",
-    "dblink",
 ];
+const DBLINK: &str = "dblink";
 const READ_WRITE: &str = "read write";
 const DO: &str = "do";
 const UNICODE_ESCAPE: &str = "u&";
@@ -186,12 +186,17 @@ fn identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
 }
 
-fn word_at(text: &[u8], at: usize, word: &str) -> bool {
-    let end = at + word.len();
-    text.get(at..end)
+fn prefix_at(text: &[u8], at: usize, word: &str) -> bool {
+    text.get(at..at + word.len())
         .is_some_and(|found| found.eq_ignore_ascii_case(word.as_bytes()))
         && (at == 0 || !identifier(text[at - 1]))
-        && text.get(end).is_none_or(|next| !identifier(*next))
+}
+
+fn word_at(text: &[u8], at: usize, word: &str) -> bool {
+    prefix_at(text, at, word)
+        && text
+            .get(at + word.len())
+            .is_none_or(|next| !identifier(*next))
 }
 
 fn comment_end(text: &[u8], mut at: usize) -> usize {
@@ -242,6 +247,9 @@ pub fn scan(text: &[u8], _superuser: bool) -> Option<&'static str> {
     for at in 0..text.len() {
         if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
             return Some(word);
+        }
+        if prefix_at(text, at, DBLINK) {
+            return Some(DBLINK);
         }
         if text[at].eq_ignore_ascii_case(&b'u') && text.get(at + 1) == Some(&b'&') {
             return Some(UNICODE_ESCAPE);
@@ -381,7 +389,7 @@ mod tests {
             "select readwrite, read_only, writer from t",
             "select \"read\", write from t",
             "select done, undo, todo from t; select doer from t",
-            "select * from dblinks join ts_statistics using (id)",
+            "select * from my_dblinks join ts_statistics using (id)",
             "select query_to_xml_x, my_set_config, set_configs from t",
             "select u & 1, menu.id from menu",
             "SELECT \"t\".\"id\", \"t\".\"name\" FROM \"public\".\"users\" AS \"t\" WHERE \"t\".\"id\" = $1 LIMIT $2 OFFSET $3",
@@ -404,7 +412,6 @@ mod tests {
             "query_to_xml_and_xmlschema",
             "ts_stat",
             "ts_rewrite",
-            "dblink",
         ];
         for word in words {
             let upper = word.to_ascii_uppercase();
@@ -431,6 +438,34 @@ mod tests {
             ] {
                 assert_eq!(scan(text.as_bytes(), false), None, "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn dblink_matches_as_a_prefix_of_every_dblink_function() {
+        for text in [
+            "dblink",
+            "select * from dblink('dbname=x', 'select 1') as t(a int)",
+            "select dblink_exec('dbname=x', 'insert into t values (1)')",
+            "select dblink_connect('c', 'dbname=x')",
+            "select dblink_connect_u('c', 'dbname=x')",
+            "select dblink_send_query('c', 'select 1')",
+            "select dblink_open('c', 'cur', 'select 1')",
+            "select pg_catalog.DBLINK_EXEC('x', 'y')",
+            "select \"dblink_exec\"('x', 'y')",
+            "select 1;DBLinkX",
+            "select dblinks from t",
+        ] {
+            assert_eq!(scan(text.as_bytes(), false), Some("dblink"), "{text}");
+        }
+        for text in [
+            "select xdblink('x')",
+            "select my_dblink from t",
+            "select $dblink_exec",
+            "select 0dblink",
+            "select \u{e9}dblink_exec('x', 'y')",
+        ] {
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
         }
     }
 
