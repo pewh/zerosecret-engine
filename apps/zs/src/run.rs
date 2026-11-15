@@ -1734,6 +1734,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
+    mod access_change;
+
     fn rebinds_within(addr: std::net::SocketAddr, limit: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < limit {
