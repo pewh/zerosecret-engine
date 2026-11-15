@@ -2178,9 +2178,6 @@ where
             }
             None => {
                 trace.escaped();
-                let _ = client
-                    .write_all(&error_frame(READ_ONLY_ESCAPED.0, READ_ONLY_ESCAPED.1))
-                    .await;
                 return Ok(());
             }
         },
@@ -2225,7 +2222,6 @@ const READ_ONLY_REFUSED: (&str, &str) = (
     "28000",
     "connection options not accepted on a read-only resource",
 );
-const READ_ONLY_ESCAPED: (&str, &str) = ("08006", "upstream did not keep the session read-only");
 
 async fn refuse(
     client: &mut TcpStream,
@@ -2744,7 +2740,7 @@ where
                             trace.superuser();
                         }
                     }
-                    Some(Status::Other) => {}
+                    Some(Status::ReadOnly | Status::Other) => {}
                 }
             }
             writer.write_all(&message).await?;

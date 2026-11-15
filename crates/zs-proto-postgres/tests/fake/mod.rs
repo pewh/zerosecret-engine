@@ -273,6 +273,13 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
     seen.lock().unwrap().authenticated = true;
     write_tagged(&mut stream, b'R', &0u32.to_be_bytes()).await?;
     write_tagged(&mut stream, b'S', b"server_version\x0016.4\0").await?;
+    let read_only = packet
+        .windows(32)
+        .any(|window| window == b"default_transaction_read_only=on");
+    let mode = if read_only { "on" } else { "off" };
+    stream
+        .write_all(&parameter_status("default_transaction_read_only", mode))
+        .await?;
     write_tagged(&mut stream, b'K', &[0, 0, 0, 7, 0, 0, 0, 9]).await?;
     write_tagged(&mut stream, b'Z', b"I").await?;
     if script.close_after_auth {

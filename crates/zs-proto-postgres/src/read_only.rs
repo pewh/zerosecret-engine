@@ -27,10 +27,12 @@ const SUPERUSER_WORDS: [&str; 9] = [
     "pg_read_binary_file",
     "pg_ls_dir",
 ];
-const SUPERUSER_PHRASES: [(&str, &str, &str); 3] = [
-    ("alter", "system", "alter system"),
-    ("session", "authorization", "session authorization"),
-    ("set", "role", "set role"),
+const SUPERUSER_PHRASES: [(&[&str], &str); 5] = [
+    (&["alter", "system"], "alter system"),
+    (&["session", "authorization"], "session authorization"),
+    (&["set", "role"], "set role"),
+    (&["set", "session", "role"], "set session role"),
+    (&["set", "local", "role"], "set local role"),
 ];
 
 const FUNCTION_CALL: &str = "function_call";
@@ -273,10 +275,26 @@ fn superuser_match(text: &[u8], at: usize, budget: &mut usize) -> Option<&'stati
     }
     SUPERUSER_PHRASES
         .iter()
-        .find(|(first, second, _)| {
-            word_at(text, at, first) && followed_by(text, at + first.len(), second, budget)
-        })
-        .map(|(_, _, phrase)| *phrase)
+        .find(|(words, _)| phrase_at(text, at, words, budget))
+        .map(|(_, phrase)| *phrase)
+}
+
+fn phrase_at(text: &[u8], at: usize, words: &[&str], budget: &mut usize) -> bool {
+    let Some((first, rest)) = words.split_first() else {
+        return false;
+    };
+    if !word_at(text, at, first) {
+        return false;
+    }
+    let mut end = at + first.len();
+    for word in rest {
+        match skip_blank(text, end, budget) {
+            None => return true,
+            Some(next) if word_at(text, next, word) => end = next + word.len(),
+            Some(_) => return false,
+        }
+    }
+    true
 }
 
 pub fn scan(text: &[u8], superuser: bool) -> Option<&'static str> {
@@ -343,6 +361,7 @@ pub(crate) fn refusal(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     Escaped,
+    ReadOnly,
     Superuser,
     Other,
 }
@@ -354,14 +373,15 @@ pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
         return None;
     }
     Some(match name {
-        MODE_SETTING if value != b"on" => Status::Escaped,
+        MODE_SETTING if value == b"on" => Status::ReadOnly,
+        MODE_SETTING => Status::Escaped,
         SUPERUSER_SETTING if value == b"on" => Status::Superuser,
         _ => Status::Other,
     })
 }
 
 pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
-    let mut superuser = false;
+    let (mut superuser, mut reported) = (false, false);
     let mut rest = tail;
     while let [tag, a, b, c, d, after @ ..] = rest {
         let size = (u32::from_be_bytes([*a, *b, *c, *d]) as usize).checked_sub(4)?;
@@ -369,13 +389,14 @@ pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
         if *tag == b'S' {
             match parameter_status(body)? {
                 Status::Escaped => return None,
+                Status::ReadOnly => reported = true,
                 Status::Superuser => superuser = true,
                 Status::Other => {}
             }
         }
         rest = &after[size..];
     }
-    rest.is_empty().then_some(superuser)
+    (rest.is_empty() && reported).then_some(superuser)
 }
 
 #[derive(Default)]
@@ -813,6 +834,45 @@ mod tests {
     }
 
     #[test]
+    fn set_session_role_and_set_local_role_match_with_blanks_and_comments_between() {
+        for (middle, phrase) in [("session", "set session role"), ("local", "set local role")] {
+            let upper = phrase.to_ascii_uppercase();
+            for text in [
+                format!("set {middle} role other"),
+                format!("SET {} ROLE other", middle.to_ascii_uppercase()),
+                format!("set\t{middle}\n role"),
+                format!("set/**/{middle}/**/role"),
+                format!("set /* a /* nested */ b */ {middle} -- c\nrole"),
+                format!("set {middle}\x0b\x0crole"),
+                format!("begin; {upper} other"),
+                format!("select '{phrase}'"),
+            ] {
+                assert_eq!(scan(text.as_bytes(), true), Some(phrase), "{text:?}");
+                assert_eq!(scan(text.as_bytes(), false), None, "{text:?}");
+            }
+            for text in [
+                format!("set {middle}role"),
+                format!("set{middle} role"),
+                format!("set {middle}_role"),
+                format!("set {middle}, role"),
+                format!("set {middle} roles"),
+                format!("reset {middle} role"),
+                format!("set {middle} /* unterminated role"),
+                format!("set {middle} -- role"),
+                format!("set {middle}\u{a0}role"),
+                format!("set {middle} x role"),
+            ] {
+                assert_eq!(scan(text.as_bytes(), true), None, "{text:?}");
+            }
+        }
+        assert_eq!(
+            scan(b"SET SESSION AUTHORIZATION other", true),
+            Some("session authorization")
+        );
+        assert_eq!(scan(b"SET ROLE other", true), Some("set role"));
+    }
+
+    #[test]
     fn a_superuser_session_still_matches_every_ordinary_word() {
         assert_eq!(
             scan(b"SET default_transaction_read_only = off", true),
@@ -837,7 +897,7 @@ mod tests {
         let read_only = "default_transaction_read_only";
         assert_eq!(
             parameter_status(&status(read_only, "on")),
-            Some(Status::Other)
+            Some(Status::ReadOnly)
         );
         for value in ["off", "On", "ON", "", "true", "on "] {
             assert_eq!(
@@ -877,7 +937,18 @@ mod tests {
         assert_eq!(startup_superuser(&tail), Some(false));
         let superuser = [tail.clone(), frame_status("is_superuser", "on")].concat();
         assert_eq!(startup_superuser(&superuser), Some(true));
-        assert_eq!(startup_superuser(&[]), Some(false));
+        assert_eq!(startup_superuser(&[]), None, "no report of the mode");
+        let unreported = [
+            frame_status("server_version", "16.4"),
+            frame_status("is_superuser", "on"),
+            key.clone(),
+        ]
+        .concat();
+        assert_eq!(
+            startup_superuser(&unreported),
+            None,
+            "no report of the mode"
+        );
         let escaped = [
             frame_status("default_transaction_read_only", "off"),
             key.clone(),

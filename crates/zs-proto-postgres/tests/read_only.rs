@@ -311,7 +311,6 @@ async fn an_unknown_message_ends_a_read_only_session() {
 type Frames = Arc<Mutex<Vec<Vec<u8>>>>;
 type Status = &'static [(&'static str, &'static str)];
 
-const ESCAPED: (&str, &str) = ("08006", "upstream did not keep the session read-only");
 const SUPERUSER_LOGIN: [(&str, &str); 2] = [
     ("default_transaction_read_only", "on"),
     ("is_superuser", "on"),
@@ -784,12 +783,67 @@ async fn an_upstream_that_reports_read_write_at_login_fails_closed() {
 
     let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
     assert_eq!(
-        fake::login(session.local).await.err(),
-        Some(fake::error_frame(ESCAPED))
+        pipelined_login(session.local).await,
+        Vec::<u8>::new(),
+        "the session closes with nothing injected"
     );
     assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(upstream.frames(), vec![query("SELECT 1")]);
+}
+
+async fn pipelined_login(local: SocketAddr) -> Vec<u8> {
+    let mut client = TcpStream::connect(local).await.unwrap();
+    let mut first = zs_proto_postgres::startup_packet("alice", "appdb");
+    first.extend_from_slice(&query("SELECT 'first'"));
+    client.write_all(&first).await.unwrap();
+    closed(&mut client).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_that_never_reports_the_mode_fails_closed() {
+    const UNREPORTED_LOGIN: [(&str, &str); 1] = [("is_superuser", "off")];
+    let reported = emulated(&fake::READ_ONLY_LOGIN, false).await;
+    let control = listen_as(reported.addr.port(), SessionAccess::ReadOnly).await;
+    let mut allowed = fake::login(control.local)
+        .await
+        .expect("control: a login that reports the mode on works");
+    assert_eq!(
+        fake::query(&mut allowed, "SELECT 'first'").await,
+        "SELECT 1"
+    );
+    assert_eq!(reported.frames(), vec![query("SELECT 'first'")]);
+    assert!(control.refusals().is_empty());
+
+    let unreported = emulated(&UNREPORTED_LOGIN, false).await;
+    let read_write = listen_as(unreported.addr.port(), SessionAccess::ReadWrite).await;
+    let mut unaffected = fake::login(read_write.local)
+        .await
+        .expect("a read-write session does not need the report");
+    assert_eq!(
+        fake::query(&mut unaffected, "SELECT 'rw'").await,
+        "SELECT 1"
+    );
+    assert!(read_write.refusals().is_empty());
+
+    let session = listen_as(unreported.addr.port(), SessionAccess::ReadOnly).await;
+    assert_eq!(
+        pipelined_login(session.local).await,
+        Vec::<u8>::new(),
+        "the session closes with nothing injected and no server startup message"
+    );
+    assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        unreported.frames(),
+        vec![query("SELECT 'rw'")],
+        "the pipelined first Query never reached the upstream"
+    );
+    let events = session.events().await;
+    assert_eq!(
+        fake::named(&events, "client_refused")[0]["fields"]["reason"],
+        "read_only_escaped"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -863,6 +863,8 @@ async fn superuser_session_refuses_copy_to_program_and_alter_system() {
         format!("SELECT pg_terminate_backend({pid})"),
         format!("SET ROLE {ROLE}"),
         format!("SET SESSION AUTHORIZATION {ROLE}"),
+        format!("SET SESSION ROLE {ROLE}"),
+        format!("SET LOCAL ROLE {ROLE}; SELECT current_user"),
         "SELECT 1 AS program".to_string(),
     ];
     let mut replies = Vec::new();
