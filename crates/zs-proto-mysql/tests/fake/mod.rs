@@ -408,10 +408,15 @@ pub async fn listen_gated(
     local
 }
 
+pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
+    zs_protocol::Materialized::new(
+        zs_credential::Credential::from_bytes(password.to_vec()).unwrap(),
+        Arc::new(|| Ok(())),
+    )
+}
+
 pub fn materialize(password: &'static str) -> Materialize {
-    Arc::new(move || {
-        Ok(zs_credential::Credential::from_bytes(password.as_bytes().to_vec()).unwrap())
-    })
+    Arc::new(move || Ok(granted(password.as_bytes())))
 }
 
 pub fn counted(password: &'static str) -> (Materialize, Arc<AtomicUsize>) {
@@ -419,7 +424,7 @@ pub fn counted(password: &'static str) -> (Materialize, Arc<AtomicUsize>) {
     let count = calls.clone();
     let materialize: Materialize = Arc::new(move || {
         count.fetch_add(1, Ordering::SeqCst);
-        Ok(zs_credential::Credential::from_bytes(password.as_bytes().to_vec()).unwrap())
+        Ok(granted(password.as_bytes()))
     });
     (materialize, calls)
 }

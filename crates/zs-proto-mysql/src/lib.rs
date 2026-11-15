@@ -22,8 +22,7 @@ use packet::{
 };
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
-pub use zs_protocol::Materialize;
-pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
+pub use zs_protocol::{AuditRefusal, Materialize};
 
 pub const CHANGE_USER_REFUSED_REASON: &str = "client COM_CHANGE_USER is refused";
 pub const USER_MISMATCH_REASON: &str = "user mismatch";
@@ -200,16 +199,7 @@ impl MysqlListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            let admitted = match (&self.caller_check, client.local_addr()) {
-                (Some(check), Ok(local)) => {
-                    let check = check.clone();
-                    tokio::task::spawn_blocking(move || check(peer, local))
-                        .await
-                        .unwrap_or(false)
-                }
-                _ => false,
-            };
-            if !admitted {
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mysql, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -292,7 +282,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
     conn.emit(conn.event("conn_accepted"));
     let outcome = tokio::time::timeout(HANDSHAKE_BUDGET, handshake(&mut client, &conn)).await;
     match outcome {
-        Ok(Ok(upstream)) => relay(client, upstream, &conn).await,
+        Ok(Ok((upstream, watch))) => relay(client, upstream, watch, &conn).await,
         Ok(Err(Stopped(by))) => conn.closed(0, 0, by),
         Err(_) => {
             conn.upstream_failed("handshake", "timed_out");
@@ -302,7 +292,10 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
     }
 }
 
-async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, Stopped> {
+async fn handshake(
+    client: &mut TcpStream,
+    conn: &Conn,
+) -> Result<(Box<dyn Io>, zs_protocol::SessionWatch), Stopped> {
     let (tcp, greeting) = open_upstream(client, conn).await?;
     if greeting.scramble.len() != SCRAMBLE_LEN {
         return Err(conn
@@ -330,7 +323,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, S
         conn.refuse(client, &USER_REFUSED).await;
         return Err(Stopped("refused"));
     }
-    let password = materialize(client, conn).await?;
+    let (password, watch) = materialize(client, conn).await?;
     let (plugin, auth_data) = first_answer(&greeting, &password);
     let tls = greeting.capabilities & CLIENT_SSL != 0;
     let mut flags = (response.capabilities & offered) | REQUIRED_SERVER_CAPABILITIES;
@@ -364,7 +357,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, S
         Ok(ok) => {
             let seq = conn.client_seq.load(Ordering::SeqCst);
             return match write_packet(client, seq, &ok).await {
-                Ok(()) => Ok(upstream),
+                Ok(()) => Ok((upstream, watch)),
                 Err(_) => Err(Stopped("client")),
             };
         }
@@ -376,11 +369,15 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, S
     Err(Stopped("refused"))
 }
 
-async fn materialize(client: &mut TcpStream, conn: &Conn) -> Result<Zeroizing<Vec<u8>>, Stopped> {
+async fn materialize(
+    client: &mut TcpStream,
+    conn: &Conn,
+) -> Result<(Zeroizing<Vec<u8>>, zs_protocol::SessionWatch), Stopped> {
     match (conn.shared.materialize)() {
-        Ok(credential) => {
+        Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
-            Ok(Zeroizing::new(credential.expose().to_vec()))
+            let (credential, watch) = materialized.into_parts();
+            Ok((Zeroizing::new(credential.expose().to_vec()), watch))
         }
         Err(denied) => {
             conn.emit(
@@ -748,6 +745,7 @@ enum Ending {
     Server,
     ChangeUser,
     Broken(&'static str),
+    Revoked(&'static str),
 }
 
 impl Ending {
@@ -756,6 +754,7 @@ impl Ending {
             Ending::Client => "client",
             Ending::Server | Ending::Broken(_) => "upstream",
             Ending::ChangeUser => "change_user",
+            Ending::Revoked(_) => "revoked",
         }
     }
 }
@@ -826,7 +825,12 @@ where
     }
 }
 
-async fn relay(client: TcpStream, upstream: Box<dyn Io>, conn: &Conn) {
+async fn relay(
+    client: TcpStream,
+    upstream: Box<dyn Io>,
+    watch: zs_protocol::SessionWatch,
+    conn: &Conn,
+) {
     let up = AtomicU64::new(0);
     let down = AtomicU64::new(0);
     let (mut client_read, mut client_write) = client.into_split();
@@ -844,25 +848,41 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, conn: &Conn) {
         let backward = copy_counted(&mut upstream_read, &mut client_write, &down);
         tokio::pin!(forward);
         tokio::pin!(backward);
-        tokio::select! {
-            ending = &mut forward => match ending {
-                Ending::ChangeUser | Ending::Broken(_) => ending,
-                other => match backward.as_mut().await {
-                    broken @ Ending::Broken(_) if !quit.load(Ordering::SeqCst) => broken,
-                    _ => other,
+        let relayed = async {
+            tokio::select! {
+                ending = &mut forward => match ending {
+                    Ending::ChangeUser | Ending::Broken(_) => ending,
+                    other => match backward.as_mut().await {
+                        broken @ Ending::Broken(_) if !quit.load(Ordering::SeqCst) => broken,
+                        _ => other,
+                    },
                 },
-            },
-            ending = &mut backward => {
-                if quit.load(Ordering::SeqCst) {
-                    Ending::Client
-                } else {
-                    ending
+                ending = &mut backward => {
+                    if quit.load(Ordering::SeqCst) {
+                        Ending::Client
+                    } else {
+                        ending
+                    }
                 }
             }
+        };
+        tokio::select! {
+            ending = relayed => ending,
+            reason = watch.ended() => Ending::Revoked(reason),
         }
     };
     if let Ending::Broken(kind) = ending {
         conn.upstream_failed("relay", kind);
+    }
+    if let Ending::Revoked(reason) = ending {
+        let mut event = conn
+            .event("client_refused")
+            .warn()
+            .code("reason", "revoked");
+        if let Some(seq) = (conn.shared.audit_refusal)("connect", reason) {
+            event = event.audit_seq(seq);
+        }
+        conn.emit(event);
     }
     if ending == Ending::ChangeUser {
         let mut event = conn.event("change_user_refused").warn();

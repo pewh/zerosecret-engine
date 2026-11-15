@@ -42,7 +42,66 @@ impl DenyKind {
     }
 }
 
-pub type Materialize = std::sync::Arc<dyn Fn() -> Result<Credential, Denied> + Send + Sync>;
+pub const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub type SessionCheck = std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>;
+
+pub struct Materialized {
+    credential: Credential,
+    check: SessionCheck,
+}
+
+impl Materialized {
+    pub fn new(credential: Credential, check: SessionCheck) -> Self {
+        Self { credential, check }
+    }
+
+    pub fn into_parts(self) -> (Credential, SessionWatch) {
+        (self.credential, SessionWatch { check: self.check })
+    }
+}
+
+#[must_use]
+pub struct SessionWatch {
+    #[cfg_attr(not(feature = "session"), allow(dead_code))]
+    check: SessionCheck,
+}
+
+#[cfg(feature = "session")]
+impl SessionWatch {
+    pub async fn ended(self) -> &'static str {
+        let mut ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + REVALIDATE_EVERY,
+            REVALIDATE_EVERY,
+        );
+        loop {
+            ticks.tick().await;
+            if let Err(reason) = (self.check)() {
+                return reason;
+            }
+        }
+    }
+}
+
+pub type Materialize = std::sync::Arc<dyn Fn() -> Result<Materialized, Denied> + Send + Sync>;
+
+pub type AuditRefusal =
+    std::sync::Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
+
+#[cfg(feature = "session")]
+pub async fn admitted(
+    check: Option<&CallerCheck>,
+    client: &tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+) -> bool {
+    let (Some(check), Ok(local)) = (check, client.local_addr()) else {
+        return false;
+    };
+    let check = check.clone();
+    tokio::task::spawn_blocking(move || check(peer, local))
+        .await
+        .unwrap_or(false)
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("denied: {reason}")]
@@ -319,5 +378,78 @@ mod tests {
         assert_eq!(InterceptedProtocol::Mysql.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Mongo.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Redis.layer(), Layer::L3);
+    }
+
+    #[cfg(feature = "session")]
+    mod session {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use super::super::*;
+
+        const REVOKED: &str = "grant revoked";
+
+        fn watch(fails_from: usize) -> (SessionWatch, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let check: SessionCheck = Arc::new(move || {
+                if count.fetch_add(1, Ordering::SeqCst) + 1 >= fails_from {
+                    Err(REVOKED)
+                } else {
+                    Ok(())
+                }
+            });
+            let credential = Credential::from_bytes(b"secret".to_vec()).unwrap();
+            let (_, watch) = Materialized::new(credential, check).into_parts();
+            (watch, calls)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ended_returns_the_first_reason() {
+            let (watch, calls) = watch(3);
+            let started = tokio::time::Instant::now();
+            assert_eq!(watch.ended().await, REVOKED);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(started.elapsed(), REVALIDATE_EVERY * 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ended_waits_one_interval_before_the_first_check() {
+            let (watch, calls) = watch(1);
+            let ended = watch.ended();
+            tokio::pin!(ended);
+            let early = REVALIDATE_EVERY - Duration::from_millis(1);
+            assert!(tokio::time::timeout(early, &mut ended).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(2), &mut ended).await,
+                Ok(REVOKED)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ended_does_not_return_while_the_check_passes() {
+            let (watch, calls) = watch(usize::MAX);
+            let waited = REVALIDATE_EVERY * 12 + Duration::from_secs(2);
+            assert!(tokio::time::timeout(waited, watch.ended()).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 12);
+        }
+
+        #[tokio::test]
+        async fn admitted_is_false_without_a_check() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (accepted, peer) = listener.accept().await.unwrap();
+            let allow: CallerCheck = Arc::new(|_, _| true);
+            let refuse: CallerCheck = Arc::new(|_, _| false);
+            let panics: CallerCheck = Arc::new(|_, _| panic!("the caller check panicked"));
+            assert!(admitted(Some(&allow), &accepted, peer).await);
+            assert!(!admitted(None, &accepted, peer).await);
+            assert!(!admitted(Some(&refuse), &accepted, peer).await);
+            assert!(!admitted(Some(&panics), &accepted, peer).await);
+        }
     }
 }

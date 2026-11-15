@@ -710,7 +710,7 @@ async fn a_slow_materializer_is_bounded_by_the_handshake_budget() {
     let (audit, refusals) = fake::audit_recorder();
     let slow: zs_protocol::Materialize = std::sync::Arc::new(|| {
         std::thread::sleep(Duration::from_secs(2));
-        Ok(zs_credential::Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap())
+        Ok(fake::granted(PASSWORD.as_bytes()))
     });
     let local = fake::listen_with(
         fake.addr,

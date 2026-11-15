@@ -459,8 +459,15 @@ mod tests {
         addr
     }
 
+    fn granted(password: &[u8]) -> zs_protocol::Materialized {
+        zs_protocol::Materialized::new(
+            Credential::from_bytes(password.to_vec()).unwrap(),
+            Arc::new(|| Ok(())),
+        )
+    }
+
     fn materialize_password(password: &'static str) -> Materialize {
-        Arc::new(move || Ok(Credential::from_bytes(password.as_bytes().to_vec()).unwrap()))
+        Arc::new(move || Ok(granted(password.as_bytes())))
     }
 
     async fn serve_scripted<C, F>(connect: C, materialize: Materialize) -> SocketAddr
@@ -606,7 +613,7 @@ mod tests {
         let count = materialized.clone();
         let materialize: Materialize = Arc::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
-            Ok(Credential::from_bytes(SENTINEL.as_bytes().to_vec()).unwrap())
+            Ok(granted(SENTINEL.as_bytes()))
         });
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = front.local_addr().unwrap();
@@ -935,7 +942,7 @@ mod tests {
         let count = materialized.clone();
         let materialize: Materialize = Arc::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
-            Ok(Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap())
+            Ok(granted(PASSWORD.as_bytes()))
         });
         let local = serve_scripted(connect, materialize).await;
 
@@ -1118,7 +1125,7 @@ mod tests {
         let count = materialized.clone();
         let materialize: Materialize = Arc::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
-            Ok(Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap())
+            Ok(granted(PASSWORD.as_bytes()))
         });
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let handled = tokio::spawn(async move {
@@ -1447,8 +1454,7 @@ pub enum SslPolicy {
 }
 
 // A `Denied` must deny the connection, never relay it unauthenticated.
-pub use zs_protocol::Materialize;
-pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
+pub use zs_protocol::{AuditRefusal, Materialize};
 pub type CancelAuthorize =
     Arc<dyn Fn() -> std::result::Result<(), zs_protocol::Denied> + Send + Sync>;
 
@@ -1491,6 +1497,17 @@ impl Trace {
         self.cancel_authorize
             .as_ref()
             .is_some_and(|authorize| authorize().is_ok())
+    }
+
+    fn revoked(&self, reason: &'static str) {
+        let mut event = self
+            .event("client_refused")
+            .warn()
+            .code("reason", "revoked");
+        if let Some(seq) = (self.audit_refusal)("connect", reason) {
+            event = event.audit_seq(seq);
+        }
+        self.diag.emit(event);
     }
 
     fn refuse_cancel(&self) {
@@ -1805,16 +1822,7 @@ impl PostgresListener {
     {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            let admitted = match (&self.caller_check, client.local_addr()) {
-                (Some(check), Ok(local)) => {
-                    let check = check.clone();
-                    tokio::task::spawn_blocking(move || check(peer, local))
-                        .await
-                        .unwrap_or(false)
-                }
-                _ => false,
-            };
-            if !admitted {
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
                 self.diag.emit(
                     Event::new(Component::Postgres, "caller_refused")
                         .conn(self.diag.next_conn())
@@ -1919,12 +1927,12 @@ where
         return Ok(());
     }
 
-    let credential = match materialize() {
-        Ok(credential) => {
+    let (credential, watch) = match materialize() {
+        Ok(materialized) => {
             trace
                 .diag
                 .emit(trace.event("materialized").code("decision", "allow"));
-            credential
+            materialized.into_parts()
         }
         Err(denied) => {
             trace.diag.emit(
@@ -2085,7 +2093,7 @@ where
         .map_err(at("ready"))?;
 
     let started = std::time::Instant::now();
-    let relayed = relay(client, upstream, trace).await;
+    let relayed = relay(client, upstream, watch, trace).await;
     trace.diag.emit(
         trace
             .event("conn_closed")
@@ -2365,7 +2373,12 @@ fn counted(joined: Copied, counter: &AtomicU64) -> std::io::Result<u64> {
     }
 }
 
-async fn relay(client: TcpStream, upstream: Box<dyn Io>, trace: &Trace) -> Relayed {
+async fn relay(
+    client: TcpStream,
+    upstream: Box<dyn Io>,
+    watch: zs_protocol::SessionWatch,
+    trace: &Trace,
+) -> Relayed {
     let (client_read, client_write) = client.into_split();
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     let up_bytes = Arc::new(AtomicU64::new(0));
@@ -2380,6 +2393,7 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, trace: &Trace) -> Relay
     let first = tokio::select! {
         up = &mut to_upstream => First::Up(up),
         down = &mut to_client => First::Down(down),
+        reason = watch.ended() => First::Revoked(reason),
     };
     let (closed_by, up, down) = match first {
         First::Up(up) => {
@@ -2389,6 +2403,12 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, trace: &Trace) -> Relay
         First::Down(down) => {
             to_upstream.abort();
             ("upstream", to_upstream.await, down)
+        }
+        First::Revoked(reason) => {
+            to_upstream.abort();
+            to_client.abort();
+            trace.revoked(reason);
+            ("revoked", to_upstream.await, to_client.await)
         }
     };
     let (up, down) = (counted(up, &up_bytes), counted(down, &down_bytes));
@@ -2404,6 +2424,7 @@ async fn relay(client: TcpStream, upstream: Box<dyn Io>, trace: &Trace) -> Relay
 enum First {
     Up(Copied),
     Down(Copied),
+    Revoked(&'static str),
 }
 
 const MAX_FRONTEND_MESSAGE: u32 = i32::MAX as u32;

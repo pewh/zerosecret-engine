@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zs-protocol.workspace = true
+zs-protocol = { workspace = true, features = ["session"] }
 zs-diag.workspace = true
 zs-upstream.workspace = true
 zeroize.workspace = true

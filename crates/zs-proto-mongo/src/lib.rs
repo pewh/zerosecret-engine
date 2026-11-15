@@ -22,8 +22,7 @@ use topology::{Discovery, Hello, Role};
 use wire::{OpMsg, OpQuery};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
-pub use zs_protocol::Materialize;
-pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
+pub use zs_protocol::{AuditRefusal, Materialize};
 
 pub const AUTHENTICATE_REFUSED_REASON: &str = "client authentication commands are refused";
 
@@ -200,16 +199,7 @@ impl MongoListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            let admitted = match (&self.caller_check, client.local_addr()) {
-                (Some(check), Ok(local)) => {
-                    let check = check.clone();
-                    tokio::task::spawn_blocking(move || check(peer, local))
-                        .await
-                        .unwrap_or(false)
-                }
-                _ => false,
-            };
-            if !admitted {
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mongo, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -396,6 +386,7 @@ struct Session {
     upstream: Box<dyn Io>,
     max_message: usize,
     pinned: Option<String>,
+    watch: zs_protocol::SessionWatch,
 }
 
 struct Found {
@@ -407,10 +398,11 @@ struct Found {
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
     let first = read_first(client, conn).await?;
-    let password = match (conn.shared.materialize)() {
-        Ok(credential) => {
+    let (password, watch) = match (conn.shared.materialize)() {
+        Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
-            Zeroizing::new(credential.expose().to_vec())
+            let (credential, watch) = materialized.into_parts();
+            (Zeroizing::new(credential.expose().to_vec()), watch)
         }
         Err(denied) => {
             conn.emit(
@@ -445,6 +437,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopp
         upstream: found.upstream,
         max_message: found.hello.max_message,
         pinned: found.pinned,
+        watch,
     })
 }
 
@@ -782,6 +775,7 @@ enum Ending {
     AuthCommand(i32),
     StepDown(&'static str),
     Broken(&'static str),
+    Revoked(&'static str),
 }
 
 impl Ending {
@@ -791,6 +785,7 @@ impl Ending {
             Ending::Server | Ending::Broken(_) => "upstream",
             Ending::Refused(_) | Ending::AuthCommand(_) => "refused",
             Ending::StepDown(_) => "stepdown",
+            Ending::Revoked(_) => "revoked",
         }
     }
 }
@@ -1004,16 +999,22 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
         tokio::pin!(forward);
         tokio::pin!(backward);
         tokio::pin!(watch);
-        tokio::select! {
-            ending = &mut forward => match ending {
-                Ending::Client => match backward.as_mut().await {
-                    broken @ Ending::Broken(_) => broken,
-                    _ => Ending::Client,
+        let relayed = async {
+            tokio::select! {
+                ending = &mut forward => match ending {
+                    Ending::Client => match backward.as_mut().await {
+                        broken @ Ending::Broken(_) => broken,
+                        _ => Ending::Client,
+                    },
+                    other => other,
                 },
-                other => other,
-            },
-            ending = &mut backward => ending,
-            trigger = &mut watch => Ending::StepDown(trigger),
+                ending = &mut backward => ending,
+                trigger = &mut watch => Ending::StepDown(trigger),
+            }
+        };
+        tokio::select! {
+            ending = relayed => ending,
+            reason = session.watch.ended() => Ending::Revoked(reason),
         }
     };
     match ending {
@@ -1026,6 +1027,9 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             let _ = client_write.write_all(&refusal).await;
         }
         Ending::StepDown(trigger) => conn.emit(conn.event("stepdown").code("trigger", trigger)),
+        Ending::Revoked(reason) => {
+            conn.refused("revoked", (conn.shared.audit_refusal)("connect", reason));
+        }
         Ending::Client | Ending::Server => {}
     }
     conn.closed(

@@ -149,7 +149,10 @@ own expiry. An open WebSocket session that carries an injected credential, a hea
 session (`bearer`, `basic`, `api-key-header`) included, is checked again every 5 s: it ends
 within 5 s of a revocation that the agent has learned of, or of grant expiry. The workload
 gets a Close frame with code 1008 (or the connection drops if a frame was partly written),
-and the agent audits `deny` `websocket revoked` (§7 row 91).
+and the agent audits `deny` `websocket revoked` (§7 row 91). An open PostgreSQL, MySQL,
+MongoDB or Redis session is checked again every 5 s too: it ends within 5 s of a revocation
+that the agent has learned of, or of grant expiry. The agent closes both directions and writes
+no reply, and it audits `deny` `connect`, reason `grant revoked` (ADR-0059).
 
 **The bound is the refresh interval, not the grant TTL.** Revocation does not wait for a
 grant to expire — that is the distinction between revocation and expiry, and it is why
@@ -929,6 +932,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Materialization failed | Deny. Never fall back to a weaker path |
 | Protocol implementation panicked | Deny that resource. Agent stays up |
 | Grant revoked | Deny before expiry. Lag bounded by the refresh interval (ADR-0018) |
+| Grant revoked or expired while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. Audit `deny` `connect`, reason `grant revoked` (ADR-0059) |
 | Local CA storage locked, denied, unavailable, ambiguous, malformed or mismatched | Deny startup before any listener or child. Never mint a replacement CA (§6) |
 | Grant revoked, then renewed | Deny. A renewal keeps each revoked grant's ID in the chain of the grant it replaced, for the last 32 renewals (ADR-0026) |
 | Request method not in the grant | Deny that request. Audit the method (ADR-0026) |

@@ -14,7 +14,7 @@ zs-diag.workspace = true
 zs-credential.workspace = true
 zs-identity.workspace = true
 zs-mitm.workspace = true
-zs-protocol.workspace = true
+zs-protocol = { workspace = true, features = ["session"] }
 zs-proto-http.workspace = true
 zs-proto-postgres.workspace = true
 zs-proto-mysql.workspace = true
@@ -41,6 +41,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 hmac.workspace = true
 sha1.workspace = true

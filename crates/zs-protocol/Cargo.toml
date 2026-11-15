@@ -11,3 +11,10 @@ workspace = true
 zs-credential.workspace = true
 zs-identity.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+session = ["dep:tokio"]

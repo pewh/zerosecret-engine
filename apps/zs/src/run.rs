@@ -243,6 +243,8 @@ impl L3Audit {
 
 type L3Materialize = zs_protocol::Materialize;
 
+const GRANT_REVOKED_REASON: &str = "grant revoked";
+
 fn l3_materialize(audit: L3Audit) -> L3Materialize {
     std::sync::Arc::new(move || {
         let outcome = audit
@@ -266,7 +268,14 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
                     .with_kind(zs_protocol::DenyKind::AuditUnavailable),
             );
         }
-        outcome
+        let credential = outcome?;
+        let (handler, resource) = (audit.handler.clone(), audit.resource.clone());
+        let check: zs_protocol::SessionCheck = std::sync::Arc::new(move || {
+            handler
+                .authorize_message(&resource, "connect")
+                .map_err(|_| GRANT_REVOKED_REASON)
+        });
+        Ok(zs_protocol::Materialized::new(credential, check))
     })
 }
 
@@ -1984,6 +1993,14 @@ mod tests {
         key: &zs_grant::ControlSigningKey,
         binding: &zs::ResourceBinding,
     ) -> AgentHandler {
+        agent_with_store(key, binding, std::path::Path::new("/nonexistent"))
+    }
+
+    fn agent_with_store(
+        key: &zs_grant::ControlSigningKey,
+        binding: &zs::ResourceBinding,
+        store: &std::path::Path,
+    ) -> AgentHandler {
         let grants = GrantCache::new();
         grants.insert(mysql_grant(key, 3306, "g-1", 60_000));
         AgentHandler::from_grants(
@@ -1997,11 +2014,129 @@ mod tests {
             )]),
             std::sync::Arc::new(zs_materializer::Materializer::new(
                 zs_materializer::StoreRegistry::new(std::sync::Arc::new(
-                    zs_materializer::FileStore::new("/nonexistent"),
+                    zs_materializer::FileStore::new(store),
                 )),
                 std::sync::Arc::new(UnconfiguredExchange),
             )),
         )
+    }
+
+    struct OpenSession {
+        _home: tempfile::TempDir,
+        key: zs_grant::ControlSigningKey,
+        binding: zs::ResourceBinding,
+        agent: std::sync::Arc<AgentHandler>,
+        watch: zs_protocol::SessionWatch,
+    }
+
+    fn open_session(expires_in_ms: u64) -> OpenSession {
+        let home = tempfile::tempdir().unwrap();
+        let key = zs_grant::ControlSigningKey::generate("k1");
+        let mut binding: zs::ResourceBinding = serde_json::from_value(serde_json::json!({
+            "resource": "orders-mysql",
+            "host": "mysql.orders.test",
+            "protocol": "mysql",
+        }))
+        .unwrap();
+        zs::connection::reconcile(&mut binding, &mysql_grant(&key, 3306, "g-1", 60_000)).unwrap();
+        std::fs::write(home.path().join("orders-mysql"), "synthetic-mysql-value\n").unwrap();
+        let agent = std::sync::Arc::new(agent_with_store(&key, &binding, home.path()));
+        agent.cache_grant(mysql_grant(&key, 3306, "g-1", expires_in_ms));
+        let materialize = l3_materialize(L3Audit {
+            journal: std::sync::Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
+            subject: "alice".into(),
+            workload: "default".into(),
+            resource: "orders-mysql".into(),
+            protocol: "mysql",
+            handler: agent.clone(),
+        });
+        let materialized = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                materialize().unwrap_or_else(|denied| panic!("positive control: {}", denied.reason))
+            });
+        let (_, watch) = materialized.into_parts();
+        OpenSession {
+            _home: home,
+            key,
+            binding,
+            agent,
+            watch,
+        }
+    }
+
+    fn paused_clock() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    const TWO_CHECKS: std::time::Duration = std::time::Duration::from_secs(11);
+    const SHORT_GRANT_MS: u64 = 1_500;
+
+    fn outlive_the_short_grant() {
+        std::thread::sleep(std::time::Duration::from_millis(SHORT_GRANT_MS + 200));
+    }
+
+    #[test]
+    fn the_session_check_denies_after_revocation() {
+        let session = open_session(60_000);
+        paused_clock().block_on(async {
+            let ended = session.watch.ended();
+            tokio::pin!(ended);
+            assert!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await.is_err(),
+                "the check ended a session whose grant is valid"
+            );
+            session.agent.apply_revocations(&["g-1".into()]);
+            assert_eq!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await,
+                Ok("grant revoked")
+            );
+        });
+    }
+
+    #[test]
+    fn the_session_check_denies_after_expiry() {
+        let session = open_session(SHORT_GRANT_MS);
+        outlive_the_short_grant();
+        paused_clock().block_on(async {
+            assert_eq!(
+                tokio::time::timeout(TWO_CHECKS, session.watch.ended()).await,
+                Ok("grant revoked")
+            );
+        });
+    }
+
+    #[test]
+    fn the_session_check_passes_after_renewal() {
+        let session = open_session(SHORT_GRANT_MS);
+        assert_eq!(
+            renewal(
+                &session.agent,
+                &session.binding,
+                Ok(mysql_grant(&session.key, 3306, "g-2", 600_000).into()),
+                true,
+                &DiagLog::disabled()
+            ),
+            Ok("zs: renewed grant g-2 for orders-mysql".to_string())
+        );
+        outlive_the_short_grant();
+        paused_clock().block_on(async {
+            let ended = session.watch.ended();
+            tokio::pin!(ended);
+            assert!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await.is_err(),
+                "the check ended a session whose grant was renewed"
+            );
+            session.agent.apply_revocations(&["g-2".into()]);
+            assert_eq!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await,
+                Ok("grant revoked")
+            );
+        });
     }
 
     #[test]

@@ -175,8 +175,11 @@ fn client_nonce(bare: &str) -> Option<&str> {
     bare.split(',').find_map(|p| p.strip_prefix("r="))
 }
 
-fn credential() -> Credential {
-    Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap()
+fn credential() -> zs_protocol::Materialized {
+    zs_protocol::Materialized::new(
+        Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap(),
+        Arc::new(|| Ok(())),
+    )
 }
 
 #[tokio::test]

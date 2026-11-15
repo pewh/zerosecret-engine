@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
 use zs_credential::Credential;
-use zs_protocol::{InjectedRequest, Protocol};
+use zs_protocol::{InjectedRequest, Protocol, REVALIDATE_EVERY};
 
 use crate::echo::{HOLD_PREFIX, started_prefix};
 
@@ -12,7 +12,6 @@ const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 // A frame's buffer grows as its bytes arrive; the header's length is not reserved up front.
 const INITIAL_RESERVE: u64 = 16 * 1024;
 const HOLD_FOR: std::time::Duration = std::time::Duration::from_secs(5);
-pub(crate) const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 const POLICY_VIOLATION: u16 = 1008;
 
 const CONTINUATION: u8 = 0x0;

@@ -15,10 +15,8 @@ use zs_diag::{Component, DiagLog, Event};
 use guard::EchoGuard;
 use resp::{Command, Refusal};
 
-pub use zs_protocol::Materialize;
+pub use zs_protocol::{AuditRefusal, Materialize};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
-
-pub type AuditRefusal = Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
 
 pub const CLIENT_TLS_REFUSED_REASON: &str = "client tls";
 pub const UPSTREAM_AUTH_REFUSED_REASON: &str = "upstream authentication failed";
@@ -191,16 +189,7 @@ impl RedisListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            let admitted = match (&self.caller_check, client.local_addr()) {
-                (Some(check), Ok(local)) => {
-                    let check = check.clone();
-                    tokio::task::spawn_blocking(move || check(peer, local))
-                        .await
-                        .unwrap_or(false)
-                }
-                _ => false,
-            };
-            if !admitted {
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
                 self.shared.diag.emit(
                     Event::new(Component::Redis, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -330,14 +319,16 @@ struct Session {
     upstream: Box<dyn Io>,
     credential: Zeroizing<Vec<u8>>,
     guard: EchoGuard,
+    watch: zs_protocol::SessionWatch,
 }
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
     let materialize = conn.shared.materialize.clone();
-    let credential = match tokio::task::spawn_blocking(move || materialize()).await {
-        Ok(Ok(credential)) => {
+    let (credential, watch) = match tokio::task::spawn_blocking(move || materialize()).await {
+        Ok(Ok(materialized)) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
-            Zeroizing::new(credential.expose().to_vec())
+            let (credential, watch) = materialized.into_parts();
+            (Zeroizing::new(credential.expose().to_vec()), watch)
         }
         Ok(Err(denied)) => {
             conn.emit(
@@ -418,6 +409,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopp
         upstream,
         credential,
         guard,
+        watch,
     })
 }
 
@@ -572,6 +564,7 @@ enum Ending {
     Echo,
     Redirect,
     Broken(&'static str),
+    Revoked(&'static str),
 }
 
 impl Ending {
@@ -582,6 +575,7 @@ impl Ending {
             Ending::Refused { .. } => "refused",
             Ending::Echo => "echo",
             Ending::Redirect => "redirect",
+            Ending::Revoked(_) => "revoked",
         }
     }
 }
@@ -758,7 +752,8 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
         );
         tokio::pin!(forward);
         tokio::pin!(backward);
-        tokio::select! {
+        let relayed = async {
+            tokio::select! {
             ending = &mut forward => match ending {
                 Ending::Client => match backward.as_mut().await {
                     broken @ Ending::Broken(_) => broken,
@@ -784,6 +779,11 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
                 other => other,
             },
             ending = &mut backward => ending,
+            }
+        };
+        tokio::select! {
+            ending = relayed => ending,
+            reason = session.watch.ended() => Ending::Revoked(reason),
         }
     };
     match ending {
@@ -801,6 +801,7 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             answer_then_drain(&mut client_read, &mut client_write, Some(CLUSTER_REDIRECT)).await;
         }
         Ending::Broken(kind) => conn.upstream_failed("relay", kind),
+        Ending::Revoked(reason) => conn.refused("revoked", conn.audit(reason)),
         Ending::Client | Ending::Server => {}
     }
     conn.closed(

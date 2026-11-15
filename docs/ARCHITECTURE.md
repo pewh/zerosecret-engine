@@ -71,7 +71,9 @@ crates/
                        and `permits`, the operation check the agent runs on each request. The
                        control plane decides with `cedar-go` (ADR-0048 D3)
   zs-grant             signed grant: control mints, agent and gateway verify
-  zs-protocol          protocol trait: match, authorize, inject
+  zs-protocol          protocol trait: match, authorize, inject. For the L3 listeners: the
+                       accept gate, and the session check that travels with the credential
+                       and ends an open session when its grant ends (ADR-0059)
   zs-upstream          upstream connect for the L3 listeners and zs-mitm; TLS verification and
                        leaf pin for the L3 listeners;
                        `http`: the one outbound HTTP client (rustls on ring, explicit timeouts,

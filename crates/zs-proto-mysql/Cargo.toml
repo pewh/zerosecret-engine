@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 zs-credential.workspace = true
-zs-protocol.workspace = true
+zs-protocol = { workspace = true, features = ["session"] }
 zs-diag.workspace = true
 zs-upstream.workspace = true
 thiserror.workspace = true

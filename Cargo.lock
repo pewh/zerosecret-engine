@@ -4215,6 +4215,7 @@ name = "zs-protocol"
 version = "0.6.0"
 dependencies = [
  "thiserror 1.0.69",
+ "tokio",
  "zs-credential",
  "zs-identity",
 ]
