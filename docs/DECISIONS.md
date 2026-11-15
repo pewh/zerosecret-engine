@@ -7,6 +7,118 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0061 — v2 work does not wait for the v1 exit
+
+**2026-11-15 · Accepted** · owner decision 2026-11-15 ("no gate") · changes ROADMAP "v2 — reach
+and delegation"
+
+ROADMAP put an order between its phases: v2 started "only after v1's exit criteria are met", and
+the v1 exit is five design-partner teams that pilot the product and say they would pay. The work
+did not follow that order. MySQL (ADR-0029), MongoDB (ADR-0031) and Redis (ADR-0057) are v2 items
+and shipped before the v1 exit, each for a real application that needed it. No entry in this log
+changed the rule, so the roadmap and the work said different things.
+
+**Decision.**
+- **No order.** A v2 item can start before the v1 exit. The sentence "Only after v1's exit
+  criteria are met" leaves ROADMAP.
+- **The v1 exit is unchanged.** It stays the criterion for v1: five design-partner teams, ten
+  developers each, and the answer that they would pay. The instruction to stop and re-plan when
+  they say an existing product covers enough also stays.
+- **Each item still starts with its own record.** A v2 item needs its spec, plan and review, as
+  ROADMAP says for the database protocols, and a new capability or a trust-boundary change needs
+  a spec or an ADR first (AGENTS.md hard rule 1).
+- **"Deliberately unscheduled" is unchanged.** An item on that list still needs a written
+  decision that says which constraint no longer holds.
+
+**Consequence.** The roadmap now describes the work as it is done. The order was the guard
+against building before a customer confirms the core claim; the owner accepts that risk. The
+section "Why this shape" stays as the record of the earlier repository and gains one sentence
+that names this entry.
+
+**Reverse it if** the code and the documents grow toward the size that "Why this shape" records
+while no team has said it would pay. Then a new entry restores an order between the phases.
+
+---
+
+## ADR-0060 — Databases keep a stored password; no temporary role and no short-lived database identity
+
+**2026-11-15 · Accepted** · owner ruling of 2026-11-01, recorded here on 2026-11-15 · removes the
+PostgreSQL temporary role from the v1 scope of ROADMAP
+
+ROADMAP listed a PostgreSQL temporary role as a v1 scope line, and ARCHITECTURE §6 named a
+"temporary database role" as one form of exchange. A research spike of 2026-10-24 (not published)
+compared three models for a database identity: one database role for each person, one role for
+each access level, and a role that the agent creates for each session. The owner ruled on
+2026-11-01. The ruling had no entry in this log, so the owner documents still read as if the
+temporary role was planned.
+
+**Decision.**
+- **Stored password.** Every database resource (PostgreSQL, MySQL, MongoDB, Redis, a managed
+  service such as AWS RDS included) authenticates upstream with a stored password from a
+  credential source.
+- **One access level is one resource.** A resource has its own database account. A person gets an
+  access level through a grant for that resource. The grant does not sign a database role.
+- **No temporary role.** The agent does not create a database role for a session. To do it, the
+  agent would hold a standing `CREATEROLE` or admin credential for each database, which is a
+  stronger password than the one it removes. A failed cleanup leaves the role behind, a replica
+  sees the role late, and a pooler cannot reuse a connection. This is also the product of a vault
+  (PRODUCT §6: integrate, do not replace).
+- **No identity that ZeroSecret mints.** The agent does not present a client certificate from a
+  ZeroSecret CA or a cloud IAM token to a database. Each needs a signed database user in the
+  grant, a new credential source, and for PostgreSQL a second upstream authentication method.
+- **Scope of this entry.** It decides the database protocols only. The `exchange` mode for other
+  destinations (AWS STS, OAuth token exchange) stays not implemented and has no schedule; the
+  agent refuses it.
+
+**Consequence.** A database password stays valid until its owner rotates it at the source. When a
+person leaves, ZeroSecret stops the grants, and a password that the person's OS user could read
+needs rotation (SECURITY §2 and §3). The ROADMAP v1 scope has two lines that are not implemented,
+not three. The data model keeps `materialization.mode`, so a later entry needs no migration.
+
+**Reverse it if** a customer needs IAM database authentication for AWS RDS or Aurora, or a vault
+credential source can give a session user without an admin credential in ZeroSecret. Then the
+replacement starts with a credential-source spec, and that spec signs the database user in the
+grant.
+
+---
+
+## ADR-0059 — Database sessions end on revocation; `Range` is removed from credential-bearing requests
+
+**2026-11-15 · Accepted** · spec `docs/specs/2026-11-15-database-session-end.md`, accepted by the
+owner 2026-11-15 · corrects ADR-0026 for database sessions
+
+The agent checked a database grant once, when the connection opened. An open PostgreSQL, MySQL,
+MongoDB or Redis session then continued after its grant was revoked or expired. The WebSocket
+relay already checks its grant again every 5 s. On the HTTP path, a workload could ask for a
+response in parts with `Range`, and each part of an echoed credential could pass the echo guard.
+
+**Decision.**
+- **Re-check.** Each database relay (PostgreSQL, MySQL, MongoDB, Redis) checks the grant again
+  every 5 s, with the same check as a CancelRequest (`authorize_message(resource, "connect")`:
+  revocation, signature and expiry, connection match). The first check runs 5 s after the relay
+  starts.
+- **On a denial** the agent closes both directions and writes no reply. It audits `deny`
+  `connect` with the fixed reason `grant revoked`, and the diagnostic `conn_closed` event has the
+  code `revoked`.
+- **Renewal.** A renewed grant keeps the session open, because the check reads the current grant
+  of the resource.
+- **The check travels with the credential.** `Materialize` returns both, so a listener cannot
+  take the credential without the check.
+- **`Range`.** On an injected request whose scheme sends the credential (`bearer`, `basic`,
+  `api-key-header`, `query-param`) the agent removes `Range` and `If-Range`. The signing schemes
+  (`aws-sigv4`, `hmac-body-signature`) keep them: they never send the secret, so the upstream
+  cannot return it.
+
+**Consequence.** An open database session ends within 5 s of a revocation that the agent has
+learned of, or of grant expiry. A pool reconnects and gets a new decision. A ranged download
+through a `bearer` binding becomes a full download. The words of ADR-0026, "revoking any ID in
+that chain stops the session", are true for database sessions from this ADR on.
+
+**Reverse it if** a supported client needs ranged downloads with a bearer credential. Then the
+replacement is to refuse a 206 answer whose body the guard cannot bound.
+
+---
+
 ## ADR-0058 — Redis broker: an upstream with no password, empty lines, refusal delivery
 
 **2026-11-11 · Accepted** · spec `docs/specs/2026-11-11-redis-broker-amendments.md`, owner choice

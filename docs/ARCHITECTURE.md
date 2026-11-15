@@ -552,10 +552,11 @@ not exactly one `chunked` is refused, a body over 32 MiB is refused, and a head 
 | Mode | Meaning | Strength |
 |---|---|---|
 | Retrieve | Pull a stored credential from a vault | Works everywhere. Weakest |
-| Exchange | Identity to ephemeral credential: AWS STS, OAuth token exchange, temporary database role. Not implemented: the agent wires `UnconfiguredExchange` (`apps/zs/src/run.rs`), which refuses | Preferred wherever the provider supports it |
+| Exchange | Identity to ephemeral credential: AWS STS, OAuth token exchange. Not for a database: a database keeps a stored password (ADR-0060). Not implemented: the agent wires `UnconfiguredExchange` (`apps/zs/src/run.rs`), which refuses | Preferred wherever the provider supports it |
 
 Mode is a property of the resource and is visible to the user. The long-term product
-story is moving resources from Retrieve to Exchange:
+story is moving resources from Retrieve to Exchange, where the destination supports it and a
+decision does not exclude it (ADR-0060 excludes the database protocols):
 
 ```mermaid
 flowchart TD

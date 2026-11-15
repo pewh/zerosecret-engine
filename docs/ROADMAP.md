@@ -59,9 +59,9 @@ The demo in [PRODUCT.md §4](PRODUCT.md#4-the-demo), end to end.
 **Data plane**
 - HTTPS: bearer, basic, api-key header, query parameter, custom signing (not implemented as a
   general scheme; two named signing schemes ship, ADR-0035 and ADR-0046)
-- PostgreSQL: wire protocol, SCRAM, static password. Temporary role: not implemented
+- PostgreSQL: wire protocol, SCRAM, static password. Temporary role: removed from the scope (ADR-0060)
 - Interception L1, L2, L3
-- Materialization: retrieve. Exchange: not implemented (the agent refuses it)
+- Materialization: retrieve. Exchange: not implemented (the agent refuses it); not planned for a database (ADR-0060)
 
 **Control plane**
 - OIDC relying party. Federates to the customer IdP. ZeroSecret runs no user directory
@@ -138,7 +138,8 @@ needs an idle measuring host: 31 of 37 runs pass at load average under 4, 8 of 2
 Every scope line above is implemented **except** three: the PostgreSQL temporary role, the
 exchange materialization mode, and custom signing as a general scheme. ADR-0014 deferred
 custom signing to v2, and ADR-0035 and ADR-0046 later shipped two named schemes
-(`aws-sigv4`, `hmac-body-signature`). "Organizations, **projects**, resources, policy" is now fully
+(`aws-sigv4`, `hmac-body-signature`). ADR-0060 later removed the PostgreSQL temporary role from the
+scope. "Organizations, **projects**, resources, policy" is now fully
 met: project scoping landed 2026-09-17 as step 21b, with ten tests that all run inside a
 single organization so only the project can produce the denial.
 
@@ -179,10 +180,10 @@ claimed for unintercepted traffic.
 
 ## v2 — reach and delegation
 
-Only after v1's exit criteria are met.
+A v2 item can start before the v1 exit (ADR-0061). Each item starts with its own spec.
 
 - Gateway: private resource connectivity, resource-side materialization
-- Database protocols for a customer's wider adoption, each with its own spec, plan and review: MySQL (ADR-0029), then MongoDB (ADR-0031)
+- Database protocols for a customer's wider adoption, each with its own spec, plan and review: MySQL (ADR-0029), then MongoDB (ADR-0031), then Redis
 - Cryptographic workload identity, replacing the declared label
 - Approvals for production operations
 - Device posture
@@ -205,4 +206,5 @@ deployment, a vault of our own, the webhook product.
 The previous repository reached 198k lines of Go, 153k lines of docs,
 and 491 commits across two products, five protocols, and a signed plugin system — before
 one customer validated the core claim. Every phase above is a customer conversation, not
-a technical milestone.
+a technical milestone. ADR-0061 removed the order between the v1 exit and v2 work on 2026-11-15;
+the v1 exit criterion is unchanged.

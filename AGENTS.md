@@ -105,6 +105,9 @@ The conformance suite (Docker and real PostgreSQL, MySQL and MongoDB) is in
   history.
 - The five owner documents exist in both repositories and can drift. An engine-facing change
   to one is made here, and in the commercial copy when it describes the engine.
+- The marketing site repeats PRODUCT §7 and the lists of protocols, sources and
+  materialization modes. A change to one of these is also made in the `zerosecret-site`
+  repository.
 - There is no `STATE.md` or `JOURNAL.md`; the commit and the pull request carry the record.
 
 ## Scope discipline

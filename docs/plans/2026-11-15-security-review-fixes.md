@@ -4,11 +4,11 @@
 
 **Goal:** Fix the six proven findings of the 0.6.0 security review (commit 616216d), so that each of the 15 saved failing tests passes, and correct the documents where they differ from the code.
 
-**Architecture:** Each finding is one small change in the crate that owns the behaviour, proven by a test that already exists and fails today. Finding 0.1 adds one shared re-check type to `zs-protocol` and a 5 s re-check to the four database relays, the same rule the WebSocket relay already has. The other five findings are local filters. One ADR records the two behaviour changes (0.1 and `Range`) before the code changes.
+**Architecture:** Each finding is one small change in the crate that owns the behaviour, proven by a test that already exists and fails today. Finding 0.1 adds one session check to `zs-protocol` that travels with the credential, and a 5 s re-check to the four database relays, the same rule the WebSocket relay already has ([session-end spec](../specs/2026-11-15-database-session-end.md)). The other five findings are local filters. One ADR records the two behaviour changes (0.1 and `Range`) before the code changes.
 
 **Tech Stack:** Rust (toolchain in `rust-toolchain.toml`), tokio, hyper, the per-crate fake upstreams in `crates/zs-proto-*/tests/fake/`.
 
-**Spec:** this file. The review notes are deleted; the section "Findings" below is the record. The saved failing tests are in `security-review-tests.local/` (same relative paths as their place in the repository). The test folder is git-excluded and must never be committed. Do not push this plan while a finding is open: this repository is public.
+**Spec:** this file, and for Task 2 the [session-end spec](../specs/2026-11-15-database-session-end.md) (accepted 2026-11-15), which owns the types. The review notes are deleted; the section "Findings" below is the record. The saved failing tests are in `security-review-tests.local/` (same relative paths as their place in the repository). The test folder is git-excluded and must never be committed. Do not push this plan while a finding is open: this repository is public.
 
 ## Findings
 
@@ -40,7 +40,7 @@
 
 ## Review Focus
 
-1. **The glue forgets the re-check on one broker.** The session then outlives its grant again, and no proto-crate test sees it. Pinned in Task 2, step 9.
+1. **A relay does not await its `SessionWatch`, or the glue builds a check that always passes.** The session then outlives its grant again. Pinned in Task 2, step 2 (one test for each relay) and step 9 (two tests on the closure that the glue builds).
 2. **A session with a valid, renewed grant is closed by the re-check.** A pool would lose every connection each 5 s. Pinned in Task 2, step 2 (the session survives 6 s while the grant is valid).
 3. **A ranged S3 download through an `aws-sigv4` binding.** `Range` can be a signed header; removing it breaks the request. Pinned in Task 3, step 3.
 4. **A MySQL packet of exactly 16 MiB - 1 bytes whose continuation packet starts with `0x11`.** It is data, not a command, and must be forwarded. Pinned in Task 6, step 2.
@@ -55,45 +55,46 @@
 
 `AGENTS.md` hard rule 1: a trust-boundary change starts with a spec or an ADR.
 
-- [ ] **Step 1: Write the ADR entry "Database sessions end on revocation; `Range` is removed from credential-bearing requests".** It decides exactly this:
+- [x] **Step 1 (done 2026-11-15, ADR-0059, unstaged): Write the ADR entry "Database sessions end on revocation; `Range` is removed from credential-bearing requests".** It decides exactly this:
   - Each database relay (PostgreSQL, MySQL, MongoDB, Redis) checks the grant again every 5 s, with the same check as a CancelRequest (`authorize_message(resource, "connect")`: revocation, signature and expiry, connection match). The first check runs 5 s after the relay starts.
   - On a denial the agent closes both directions and writes no reply. It audits `deny` `connect` with the fixed reason `grant revoked`, and the diagnostic `conn_closed` event has the code `revoked`.
   - A renewed grant keeps the session open, because the check reads the current grant of the resource.
+  - The check reaches the relay with the credential: `Materialize` returns both, so a listener cannot take the credential without the check ([session-end spec](../specs/2026-11-15-database-session-end.md)).
   - On an injected request whose scheme sends the credential (`bearer`, `basic`, `api-key-header`, `query-param`) the agent removes `Range` and `If-Range`. The signing schemes (`aws-sigv4`, `hmac-body-signature`) keep them: they never send the secret, so the upstream cannot return it.
   - Consequence to state: a ranged download through a `bearer` binding becomes a full download. "Reverse it if" a supported client needs ranged downloads with a bearer credential; then the replacement is to refuse a 206 answer whose body the guard cannot bound.
   - Corrects, by reference, the words of ADR-0026 ("revoking any ID in that chain stops the session") for database sessions: true from this ADR on.
-- [ ] **Step 2: Commit** `docs/DECISIONS.md` (`docs(adr): database sessions end on revocation, Range removed`).
+- [x] **Step 2 (done 2026-11-15 in the document commit, ADR-0059): Commit** `docs/DECISIONS.md` (`docs(adr): database sessions end on revocation, Range removed`).
 
 ---
 
 ### Task 2: Finding 0.1, re-check the grant in the four database relays
 
+Rewritten 2026-11-15 after the owner accepted the [session-end spec](../specs/2026-11-15-database-session-end.md). That spec owns the signatures; this task does not restate them. `Revalidate`, `with_revalidate` and `listen_revalidated` are not built.
+
 **Files:**
-- Modify: `crates/zs-protocol/src/lib.rs` (next to `Materialize`, line 45)
-- Modify: `crates/zs-proto-redis/src/lib.rs`, `crates/zs-proto-postgres/src/lib.rs`, `crates/zs-proto-mysql/src/lib.rs`, `crates/zs-proto-mongo/src/lib.rs` (listener builder, shared state, `relay`)
-- Modify: `crates/zs-proto-{redis,postgres,mysql,mongo}/tests/fake/mod.rs` (one helper each)
-- Modify: `apps/zs/src/run.rs:273-275` and the four listener builds (`:997`, `:1055`, `:1119`, `:1163-1166`)
+- Modify: `crates/zs-protocol/Cargo.toml` (feature `session`; the workspace `tokio` as an optional dependency of that feature), `crates/zs-protocol/src/lib.rs` (`Materialize`, line 45)
+- Modify: `crates/zs-proto-{redis,postgres,mysql,mongo}/Cargo.toml` (enable `session`) and `src/lib.rs` (the `materialize` call in the handshake, `serve`, `relay`, the `AuditRefusal` alias)
+- Modify: each test that builds a `Materialize`: `crates/zs-proto-{redis,postgres,mysql,mongo}/tests/fake/mod.rs`, `crates/zs-proto-mysql/tests/listener.rs`, `crates/zs-proto-redis/tests/listener.rs`, `crates/zs-proto-redis/tests/redis_real.rs`
+- Modify: `crates/zs-mitm/src/websocket.rs:15` (reads the shared constant)
+- Modify: `apps/zs/src/run.rs:246-275` (`l3_materialize`); the four listener builds do not change
 - Test (copy from `security-review-tests.local/`): `crates/zs-proto-{redis,postgres,mysql,mongo}/tests/review_session_outlives_grant.rs`, renamed to `session_ends_with_grant.rs`
 
 **Interfaces:**
-- Produces, in `zs-protocol`:
-  - `pub type Revalidate = std::sync::Arc<dyn Fn() -> Result<(), Denied> + Send + Sync>;`
-  - `pub const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);`
-- Produces, on each of `RedisListener`, `PostgresListener` (the type that has `with_cancel_authorize`), the MySQL listener and the MongoDB listener: `pub fn with_revalidate(mut self, revalidate: zs_protocol::Revalidate) -> Self`.
-- Produces, in each `tests/fake/mod.rs`: a `listen` variant that takes one more argument `revalidate: zs_protocol::Revalidate` and calls `with_revalidate`. Name it `listen_revalidated`; keep the existing helper unchanged.
+- Produces, in `zs-protocol`: `REVALIDATE_EVERY`, `SessionCheck`, `Materialized`, `SessionWatch`, the new `Materialize`, `AuditRefusal` and `admitted`, as the spec's section "Types in `zs-protocol`" gives them.
+- Each relay crate re-exports `Materialize` and `AuditRefusal`. The fake `listen` helpers keep their signatures.
 - Fixed strings: audit operation `connect`, audit reason `grant revoked`, close code `revoked`.
 
 - [ ] **Step 1: Copy the four test files into place** under the new name `session_ends_with_grant.rs`.
-- [ ] **Step 2: Adapt each test.** `grant_state()` returns `(Materialize, Revalidate, Arc<AtomicBool>)`; the `Revalidate` closure returns `Ok(())` while the flag is true and `Err(Denied::new("grant revoked"))` after. The listener is built with `listen_revalidated`. Add one assertion before the flag changes: sleep 6 s, send a command with the marker `still-granted`, and assert that the fake upstream received it (Review Focus 2). Keep both controls and the final assertion as they are.
-- [ ] **Step 3: Run one test to verify it fails to compile.** Run: `cargo test -p zs-proto-redis --test session_ends_with_grant`. Expected: error, `Revalidate` and `listen_revalidated` not found.
-- [ ] **Step 4: Add `Revalidate` and `REVALIDATE_EVERY` to `crates/zs-protocol/src/lib.rs`.**
-- [ ] **Step 5: Redis.** Add `revalidate: Option<Revalidate>` to `Shared`, the builder, and a new `Ending::Revoked` whose `code()` is `revoked`. In `relay` (`:726-811`), add a third branch to the outer `tokio::select!`: a `tokio::time::interval_at(now + REVALIDATE_EVERY, REVALIDATE_EVERY)` loop that calls the closure inline on each tick and ends with `Ending::Revoked` on `Err`. With no closure the branch never completes (`std::future::pending`). On `Ending::Revoked`: `conn.refused("revoked", conn.audit("grant revoked"))`, no reply written, both halves dropped. Add the `fake` helper.
+- [ ] **Step 2: Adapt each test.** `grant_state()` returns `(Materialize, Arc<AtomicBool>)`. The `Materialize` returns `Materialized::new(credential, check)`; the check returns `Ok(())` while the flag is true and `Err("grant revoked")` after. The listener is built with the existing `listen` helper. Add one assertion before the flag changes: sleep 6 s, send a command with the marker `still-granted`, and assert that the fake upstream received it (Review Focus 2). Keep both controls and the final assertion as they are.
+- [ ] **Step 3: Run one test to verify it fails to compile.** Run: `cargo test -p zs-proto-redis --test session_ends_with_grant`. Expected: error, `Materialized` not found.
+- [ ] **Step 4: `zs-protocol`.** Add the feature and the items of the spec. Add the four unit tests that the spec's section "Tests" names for `zs-protocol`; use paused tokio time. Run: `cargo test -p zs-protocol --features session`. Expected: PASS. From this step until step 9, `zs` does not compile; build one crate at a time.
+- [ ] **Step 5: Redis.** The handshake calls `into_parts` and `Session` carries the `SessionWatch`. In `relay` (`:726-811`), add a third branch to the outer `tokio::select!` that awaits `SessionWatch::ended`, and a new `Ending::Revoked(&'static str)` whose `code()` is `revoked`. On it: `conn.refused("revoked", conn.audit(reason))`, no reply written, both halves dropped. `serve` calls `zs_protocol::admitted`. The local `AuditRefusal` alias becomes a re-export. In `tests/fake/mod.rs` and the two other test files, each `Materialize` wraps its credential with a check that returns `Ok(())`.
 - [ ] **Step 6: Run the Redis test.** Run: `cargo test -p zs-proto-redis --test session_ends_with_grant`. Expected: PASS (about 12 s). Then `cargo test -p zs-proto-redis`: all pass.
-- [ ] **Step 7: PostgreSQL, MySQL, MongoDB.** The same change in each `relay` (`postgres :2368-2402`, `mysql :829-880`, `mongo :984+`), with each crate's own refusal-audit call and close event. `zs_proto_postgres::CancelAuthorize` stays; do not merge the two types in this task.
+- [ ] **Step 7: PostgreSQL, MySQL, MongoDB.** The same change in each crate (`relay` at `postgres :2368-2402`, `mysql :829-880`, `mongo :984+`), with each crate's own refusal-audit call and close event. PostgreSQL aborts both copy tasks and reports `closed_by` `revoked`. `zs_proto_postgres::CancelAuthorize` stays.
 - [ ] **Step 8: Run the three tests and each crate's full suite.** Run, one at a time: `cargo test -p zs-proto-postgres`, `cargo test -p zs-proto-mysql`, `cargo test -p zs-proto-mongo`. Expected: all pass, the three new tests included.
-- [ ] **Step 9: Glue.** In `apps/zs/src/run.rs` add `fn l3_revalidate(audit: L3Audit) -> zs_protocol::Revalidate` with the body of `l3_cancel_authorize` (`:273-275`), and call `.with_revalidate(l3_revalidate(audit.clone()))` on all four listener builds. Add a unit test in the `run.rs` test module, `every_database_listener_gets_a_revalidate`, that asserts the source text of the non-test part of `run.rs` holds `with_revalidate(` exactly four times (`include_str!("run.rs")`, cut at the first `#[cfg(test)]`). Run: `cargo test -p zs --lib every_database_listener`. Expected: PASS.
+- [ ] **Step 9: Glue.** In `apps/zs/src/run.rs`, `l3_materialize` builds the check beside the credential: the check calls `audit.handler.authorize_message(&audit.resource, "connect")` and maps a denial to `grant revoked`; an allowed outcome returns `Materialized::new(credential, check)`. The audit record of the `connect` and the audit-unavailable denial stay as they are. Add two unit tests in the `run.rs` test module on the closure that `l3_materialize` builds: `the_session_check_denies_after_revocation` and `the_session_check_passes_after_renewal`. `crates/zs-mitm/src/websocket.rs` reads `zs_protocol::REVALIDATE_EVERY`. Run: `cargo test -p zs --lib the_session_check`, then `cargo test -p zs-mitm --lib websocket`. Expected: PASS.
 - [ ] **Step 10: Documents.** `docs/SECURITY.md:141-149`: add that an open database session is checked every 5 s and ends within 5 s of a revocation the agent has learned of, or of grant expiry, with no reply. Add one §7 row after the "Grant revoked" row (`:925`): "Grant revoked or expired while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s, no reply. Audit `deny` `connect`, reason `grant revoked` (ADR of Task 1)". `docs/ARCHITECTURE.md`: add the re-check where the L3 relay is described, if it is.
-- [ ] **Step 11: Gate and commit.** Per-crate gate for the five crates and `zs`. Commit: `fix(l3): end an open database session when its grant is revoked or expires`.
+- [ ] **Step 11: Gate and commit.** Per-crate gate for `zs-protocol` (with `--features session`), the four relay crates, `zs-mitm` and `zs`. Run the four `grep` checks of the spec's section "Verification". Commit: `fix(l3): end an open database session when its grant is revoked or expires`.
 
 ---
 
@@ -176,7 +177,7 @@
 
 **Files:**
 - Modify: `crates/zs-materializer/src/lib.rs:135-147`
-- Modify: `docs/SECURITY.md`, `docs/DECISIONS.md` (one new entry), `CHANGELOG.md`
+- Modify: `docs/SECURITY.md`, `docs/DECISIONS.md` (one new entry, the next free number; ADR-0059 to ADR-0061 are taken), `CHANGELOG.md`
 - Test (copy): `crates/zs-materializer/tests/review_file_reference.rs` as `file_reference_parts.rs`
 
 - [ ] **Step 1: Copy the test into place** and run it. Run: `cargo test -p zs-materializer --test file_reference_parts`. Expected: FAIL, `["a/./b", "a//b"]` resolved.
@@ -191,7 +192,7 @@
   - `:935` and §4 rule 7: the diagnostic log can hold a user or database name inside server error text.
   - `:218-219`: the cite `apps/zs/src/lib.rs:1055-1066` is stale; `materialize` and `authorized` are the functions to name.
   - New paragraph near `:388`: a PostgreSQL client sees the agent's denial reason (resource name, grant ID, journal path on an audit failure); it never holds a credential value.
-- [ ] **Step 5: `docs/DECISIONS.md`**: one new entry that amends ADR-0028: the `materialize_failed` event also has `credential_ref`, and for some errors `step` and `provider_code`.
+- [ ] **Step 5: `docs/DECISIONS.md`**: one new entry, with the next free number, that amends ADR-0028: the `materialize_failed` event also has `credential_ref`, and for some errors `step` and `provider_code`.
 - [ ] **Step 6: `CHANGELOG.md`**: one "Security" section that lists the six fixes in one line each.
 - [ ] **Step 7: Full gate.** Check `df -h` first. Run `cargo fmt --all -- --check`, then `cargo clippy --workspace --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic` if 12 GB or more is free, else per crate. Run `cargo test -p <crate>` for each crate this plan changed.
 - [ ] **Step 8: Commit** (`fix(materializer): refuse a file reference with an empty or dot part`; `docs: security review corrections`). Then delete `security-review-tests.local/` and this file.
@@ -202,4 +203,4 @@
 
 - Tests against real servers (`*_real.rs`, the conformance suite) and the agent-spawning tests in `apps/zs/tests`: they need Docker or a disposable keychain. The owner or CI runs them before a release.
 - The "leads not confirmed" of the review (MySQL user name and client character set, the WebSocket fragment-scanner memory growth, Redis 5 behaviours). None is proven.
-- A release. After the tasks land, the owner decides on 0.6.1.
+- A release. After the tasks land, the owner decides on 0.6.1. This release comes before the engine release of the read-only database access plan (its T9): that plan's T2 needs Task 2 of this plan, and a security fix does not wait for a feature.

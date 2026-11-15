@@ -59,9 +59,12 @@ letting one test stand in for the set.
 
 - A credential leaking through a committed `.env`, a shell history, a screenshot, or a
   chat paste.
-- A coding agent reading credentials out of its own environment, process memory, or the
-  files it can access.
-- A developer keeping a working production credential after leaving the team.
+- A coding agent reading credentials out of its own environment, its process memory, or the
+  files of the workspace. A `file` source keeps the value in the developer's home directory,
+  where a process of the same user can read it (§3).
+- A developer keeping access through ZeroSecret after leaving the team: a removed member or a
+  revoked device gets no new grant. A static credential that the developer's user could read
+  stays valid until its owner rotates it (§3).
 - Credential reuse across workloads that should have different authority.
 - An unaudited use of a shared credential.
 - A compromised dependency in the workspace exfiltrating a long-lived key.
@@ -480,8 +483,11 @@ These are enforced in code review and in CI, not by convention.
    `[redacted]`, and its `MarshalJSON` returns an error.
 3. No credential value reaches a log line, an audit record, an error message, a metric
    label, a panic payload, or a core dump.
-4. No credential value is written to disk. Ever. Including cache, including swap-prone
-   long-lived buffers where the platform allows locking.
+4. The agent never writes a credential value to disk. Ever. Including cache, including
+   swap-prone long-lived buffers where the platform allows locking. One exception is outside
+   the agent: a `file` source reads its value from a file under `~/.zs-credentials/`, and
+   `zs init` writes that file (0600) and a backup of `.env` under `~/.zs-backups/` (0600).
+   These files are the standing credential of a `file` source; §3 gives the limit.
 5. Raw wire content — SQL text, request bodies, headers — never reaches an audit record.
    Audit stores decisions and metadata.
 6. A grant carries a credential reference. Never a value.

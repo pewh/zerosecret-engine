@@ -191,7 +191,7 @@ mail-relay         mail.internal   smtp      -   exchange  not-strict
 
 The `exchange` rows are an illustration of the report format. Exchange materialization is
 roadmap and not implemented (the agent refuses it), so a real resource reports `retrieve`
-today.
+today. A database resource always reports `retrieve`: ADR-0060 keeps a stored password there.
 
 **Strict is decided by interception, not by materialization (2026-09-18, ADR-0022).** This
 section's definition asks *who holds the credential*, and both interception layers answer it
