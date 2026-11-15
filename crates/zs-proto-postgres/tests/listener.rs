@@ -178,6 +178,7 @@ fn client_nonce(bare: &str) -> Option<&str> {
 fn credential() -> zs_protocol::Materialized {
     zs_protocol::Materialized::new(
         Credential::from_bytes(PASSWORD.as_bytes().to_vec()).unwrap(),
+        zs_protocol::SessionAccess::ReadWrite,
         Arc::new(|| Ok(())),
     )
 }

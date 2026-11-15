@@ -46,14 +46,29 @@ pub const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs
 
 pub type SessionCheck = std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
 pub struct Materialized {
     credential: Credential,
+    access: SessionAccess,
     check: SessionCheck,
 }
 
 impl Materialized {
-    pub fn new(credential: Credential, check: SessionCheck) -> Self {
-        Self { credential, check }
+    pub fn new(credential: Credential, access: SessionAccess, check: SessionCheck) -> Self {
+        Self {
+            credential,
+            access,
+            check,
+        }
+    }
+
+    pub fn access(&self) -> SessionAccess {
+        self.access
     }
 
     pub fn into_parts(self) -> (Credential, SessionWatch) {
@@ -405,7 +420,8 @@ mod tests {
                 }
             });
             let credential = Credential::from_bytes(b"secret".to_vec()).unwrap();
-            let (_, watch) = Materialized::new(credential, check).into_parts();
+            let (_, watch) =
+                Materialized::new(credential, SessionAccess::ReadWrite, check).into_parts();
             (watch, calls)
         }
 

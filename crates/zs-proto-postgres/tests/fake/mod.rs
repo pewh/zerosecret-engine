@@ -393,6 +393,7 @@ pub async fn listen_gated(
 pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
     zs_protocol::Materialized::new(
         Credential::from_bytes(password.to_vec()).unwrap(),
+        zs_protocol::SessionAccess::ReadWrite,
         Arc::new(|| Ok(())),
     )
 }

@@ -1342,6 +1342,20 @@ impl FlowHandler for AgentHandler {
             })
     }
 
+    fn session_access(&self, resource: &str) -> Result<zs_protocol::SessionAccess, Denied> {
+        let binding = self
+            .bindings
+            .get(resource)
+            .ok_or_else(|| Denied::new("unknown resource"))?;
+        let (verified, _) = self
+            .authorized(binding, zs_policy::CONNECT)
+            .map_err(Denied::new)?;
+        Ok(match verified.grant().access {
+            zs_policy::Access::ReadWrite => zs_protocol::SessionAccess::ReadWrite,
+            zs_policy::Access::ReadOnly => zs_protocol::SessionAccess::ReadOnly,
+        })
+    }
+
     fn credential_ref(&self, resource: &str) -> Option<String> {
         let binding = match self.bindings.get(resource) {
             Some(binding) => binding,

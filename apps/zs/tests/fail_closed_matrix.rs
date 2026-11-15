@@ -5506,6 +5506,7 @@ async fn row_123_an_open_database_session_closes_when_its_grant_is_revoked() {
         Ok(zs_protocol::Materialized::new(
             zs_credential::Credential::from_bytes(redis_fake::PASSWORD.as_bytes().to_vec())
                 .unwrap(),
+            zs_protocol::SessionAccess::ReadWrite,
             check,
         ))
     });

@@ -95,6 +95,13 @@ pub trait FlowHandler: Send + Sync {
     fn authorize_message(&self, resource: &str, operation: &str)
     -> Result<(), zs_protocol::Denied>;
 
+    fn session_access(
+        &self,
+        _resource: &str,
+    ) -> Result<zs_protocol::SessionAccess, zs_protocol::Denied> {
+        Err(zs_protocol::Denied::new("access unknown"))
+    }
+
     fn credential_ref(&self, _resource: &str) -> Option<String> {
         None
     }

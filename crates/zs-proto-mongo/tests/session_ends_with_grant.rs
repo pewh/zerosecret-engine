@@ -35,6 +35,7 @@ fn grant_state() -> (Materialize, Arc<AtomicBool>) {
         });
         Ok(Materialized::new(
             zs_credential::Credential::from_bytes(fake::PASSWORD.as_bytes().to_vec()).unwrap(),
+            zs_protocol::SessionAccess::ReadWrite,
             check,
         ))
     });

@@ -244,12 +244,19 @@ impl L3Audit {
 type L3Materialize = zs_protocol::Materialize;
 
 const GRANT_REVOKED_REASON: &str = "grant revoked";
+const ACCESS_CHANGED_REASON: &str = "access changed";
 
 fn l3_materialize(audit: L3Audit) -> L3Materialize {
     std::sync::Arc::new(move || {
         let outcome = audit
             .handler
-            .materialize(&audit.resource, "connect")
+            .session_access(&audit.resource)
+            .and_then(|access| {
+                audit
+                    .handler
+                    .materialize(&audit.resource, "connect")
+                    .map(|credential| (credential, access))
+            })
             .map_err(|denied| denied.with_kind(zs_protocol::DenyKind::Materialize));
         let decision = match &outcome {
             Ok(_) => zs_audit::Decision::Allow,
@@ -268,14 +275,19 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
                     .with_kind(zs_protocol::DenyKind::AuditUnavailable),
             );
         }
-        let credential = outcome?;
+        let (credential, access) = outcome?;
         let (handler, resource) = (audit.handler.clone(), audit.resource.clone());
         let check: zs_protocol::SessionCheck = std::sync::Arc::new(move || {
             handler
                 .authorize_message(&resource, "connect")
-                .map_err(|_| GRANT_REVOKED_REASON)
+                .map_err(|_| GRANT_REVOKED_REASON)?;
+            match handler.session_access(&resource) {
+                Ok(current) if current == access => Ok(()),
+                Ok(_) => Err(ACCESS_CHANGED_REASON),
+                Err(_) => Err(GRANT_REVOKED_REASON),
+            }
         });
-        Ok(zs_protocol::Materialized::new(credential, check))
+        Ok(zs_protocol::Materialized::new(credential, access, check))
     })
 }
 
@@ -1818,6 +1830,12 @@ mod tests {
         ) -> Result<(), zs_protocol::Denied> {
             Err(zs_protocol::Denied::new("not in this test"))
         }
+        fn session_access(
+            &self,
+            _resource: &str,
+        ) -> Result<zs_protocol::SessionAccess, zs_protocol::Denied> {
+            Ok(zs_protocol::SessionAccess::ReadWrite)
+        }
     }
 
     #[test]
@@ -1964,6 +1982,26 @@ mod tests {
         grant_id: &str,
         expires_in_ms: u64,
     ) -> zs_grant::SignedGrant {
+        mysql_grant_with_access(
+            key,
+            port,
+            grant_id,
+            expires_in_ms,
+            zs_policy::Access::ReadWrite,
+        )
+    }
+
+    fn mysql_grant_with_access(
+        key: &zs_grant::ControlSigningKey,
+        port: u16,
+        grant_id: &str,
+        expires_in_ms: u64,
+        access: zs_policy::Access,
+    ) -> zs_grant::SignedGrant {
+        let version = match access {
+            zs_policy::Access::ReadWrite => zs_grant::GRANT_VERSION,
+            zs_policy::Access::ReadOnly => zs_grant::GRANT_VERSION_ACCESS,
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1984,8 +2022,8 @@ mod tests {
             upstream_port: port,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
-            access: zs_policy::Access::ReadWrite,
-            version: zs_grant::GRANT_VERSION,
+            access,
+            version,
         })
         .unwrap()
     }
@@ -2027,10 +2065,30 @@ mod tests {
         key: zs_grant::ControlSigningKey,
         binding: zs::ResourceBinding,
         agent: std::sync::Arc<AgentHandler>,
+        materialize: L3Materialize,
+        access: zs_protocol::SessionAccess,
         watch: zs_protocol::SessionWatch,
     }
 
+    fn begin(
+        materialize: &L3Materialize,
+    ) -> (zs_protocol::SessionAccess, zs_protocol::SessionWatch) {
+        let materialize = materialize.clone();
+        let materialized = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                materialize().unwrap_or_else(|denied| panic!("positive control: {}", denied.reason))
+            });
+        let access = materialized.access();
+        let (_, watch) = materialized.into_parts();
+        (access, watch)
+    }
+
     fn open_session(expires_in_ms: u64) -> OpenSession {
+        open_session_with(expires_in_ms, zs_policy::Access::ReadWrite)
+    }
+
+    fn open_session_with(expires_in_ms: u64, access: zs_policy::Access) -> OpenSession {
         let home = tempfile::tempdir().unwrap();
         let key = zs_grant::ControlSigningKey::generate("k1");
         let mut binding: zs::ResourceBinding = serde_json::from_value(serde_json::json!({
@@ -2042,7 +2100,13 @@ mod tests {
         zs::connection::reconcile(&mut binding, &mysql_grant(&key, 3306, "g-1", 60_000)).unwrap();
         std::fs::write(home.path().join("orders-mysql"), "synthetic-mysql-value\n").unwrap();
         let agent = std::sync::Arc::new(agent_with_store(&key, &binding, home.path()));
-        agent.cache_grant(mysql_grant(&key, 3306, "g-1", expires_in_ms));
+        agent.cache_grant(mysql_grant_with_access(
+            &key,
+            3306,
+            "g-1",
+            expires_in_ms,
+            access,
+        ));
         let materialize = l3_materialize(L3Audit {
             journal: std::sync::Arc::new(Journal::open(home.path().join("audit.jsonl")).unwrap()),
             subject: "alice".into(),
@@ -2051,19 +2115,35 @@ mod tests {
             protocol: "mysql",
             handler: agent.clone(),
         });
-        let materialized = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                materialize().unwrap_or_else(|denied| panic!("positive control: {}", denied.reason))
-            });
-        let (_, watch) = materialized.into_parts();
+        let (access, watch) = begin(&materialize);
         OpenSession {
             _home: home,
             key,
             binding,
             agent,
+            materialize,
+            access,
             watch,
         }
+    }
+
+    fn renew_with_access(
+        agent: &AgentHandler,
+        binding: &zs::ResourceBinding,
+        key: &zs_grant::ControlSigningKey,
+        grant_id: &str,
+        access: zs_policy::Access,
+    ) {
+        assert_eq!(
+            renewal(
+                agent,
+                binding,
+                Ok(mysql_grant_with_access(key, 3306, grant_id, 600_000, access).into()),
+                true,
+                &DiagLog::disabled()
+            ),
+            Ok(format!("zs: renewed grant {grant_id} for orders-mysql"))
+        );
     }
 
     fn paused_clock() -> tokio::runtime::Runtime {
@@ -2133,6 +2213,84 @@ mod tests {
                 "the check ended a session whose grant was renewed"
             );
             session.agent.apply_revocations(&["g-2".into()]);
+            assert_eq!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await,
+                Ok("grant revoked")
+            );
+        });
+    }
+
+    #[test]
+    fn renewal_that_changes_access_fails_the_check_with_access_changed() {
+        for (before, after) in [
+            (zs_policy::Access::ReadWrite, zs_policy::Access::ReadOnly),
+            (zs_policy::Access::ReadOnly, zs_policy::Access::ReadWrite),
+        ] {
+            let session = open_session_with(60_000, before);
+            paused_clock().block_on(async {
+                let ended = session.watch.ended();
+                tokio::pin!(ended);
+                assert!(
+                    tokio::time::timeout(TWO_CHECKS, &mut ended).await.is_err(),
+                    "the check ended a session whose access is unchanged"
+                );
+                renew_with_access(&session.agent, &session.binding, &session.key, "g-2", after);
+                assert_eq!(
+                    tokio::time::timeout(TWO_CHECKS, &mut ended).await,
+                    Ok("access changed")
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn renewal_with_same_access_passes_the_check() {
+        for access in [zs_policy::Access::ReadWrite, zs_policy::Access::ReadOnly] {
+            let session = open_session_with(60_000, access);
+            renew_with_access(
+                &session.agent,
+                &session.binding,
+                &session.key,
+                "g-2",
+                access,
+            );
+            paused_clock().block_on(async {
+                let ended = session.watch.ended();
+                tokio::pin!(ended);
+                assert!(
+                    tokio::time::timeout(TWO_CHECKS, &mut ended).await.is_err(),
+                    "the check ended a session whose access is unchanged"
+                );
+                session.agent.apply_revocations(&["g-2".into()]);
+                assert_eq!(
+                    tokio::time::timeout(TWO_CHECKS, &mut ended).await,
+                    Ok("grant revoked")
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_session_opened_after_the_change_passes_the_check() {
+        let before = open_session_with(60_000, zs_policy::Access::ReadWrite);
+        assert_eq!(before.access, zs_protocol::SessionAccess::ReadWrite);
+        renew_with_access(
+            &before.agent,
+            &before.binding,
+            &before.key,
+            "g-2",
+            zs_policy::Access::ReadOnly,
+        );
+        let (access, watch) = begin(&before.materialize);
+        assert_eq!(access, zs_protocol::SessionAccess::ReadOnly);
+        paused_clock().block_on(async {
+            let ended = watch.ended();
+            tokio::pin!(ended);
+            assert!(
+                tokio::time::timeout(TWO_CHECKS, &mut ended).await.is_err(),
+                "the check ended a session opened after the change"
+            );
+            before.agent.apply_revocations(&["g-2".into()]);
             assert_eq!(
                 tokio::time::timeout(TWO_CHECKS, &mut ended).await,
                 Ok("grant revoked")
