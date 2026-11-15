@@ -21,7 +21,6 @@ const TOKENS: [&str; 2] = ["/*!", "/*m!"];
 const READ_WRITE: &str = "read write";
 const QUERY_ATTRIBUTES: &str = "query_attributes";
 const EMPTY_ATTRIBUTES: [u8; 2] = [0x00, 0x01];
-const SINGLE_BYTE_SPACES: [u8; 2] = [0xa0, 0xff];
 
 const COM_QUIT: u8 = 0x01;
 const COM_INIT_DB: u8 = 0x02;
@@ -105,14 +104,11 @@ pub(crate) fn command_name(command: Option<u8>) -> &'static str {
 }
 
 fn identifier(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || byte == b'_'
-        || byte == b'$'
-        || (byte >= 0x80 && !SINGLE_BYTE_SPACES.contains(&byte))
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 
 fn blank(byte: u8) -> bool {
-    byte <= b' ' || SINGLE_BYTE_SPACES.contains(&byte)
+    byte <= b' ' || byte >= 0x80
 }
 
 fn prefix_at(text: &[u8], at: usize, word: &str) -> bool {
@@ -315,7 +311,6 @@ mod tests {
                 format!("SELECT x{word}"),
                 format!("SELECT ${word}"),
                 format!("SELECT {word}$"),
-                format!("SELECT \u{e9}{word}"),
             ] {
                 assert_eq!(found(&near), None, "{near}");
             }
@@ -424,17 +419,36 @@ mod tests {
     }
 
     #[test]
-    fn a_no_break_space_of_a_single_byte_charset_separates_words() {
-        for (text, word) in [
-            (&b"SET\xa0GLOBAL x = 1"[..], "global"),
-            (b"PREPARE\xa0s FROM @q", "prepare"),
-            (b"SET TRANSACTION READ\xa0WRITE", "read write"),
-            (b"SET TRANSACTION READ\xffWRITE", "read write"),
-            (b"EXECUTE\xffs", "execute"),
-        ] {
-            assert_eq!(scan(text), Some(word), "{text:?}");
+    fn every_high_byte_is_a_boundary_and_a_blank() {
+        for high in [0x80u8, 0x9a, 0xa0, 0xca, 0xff] {
+            for word in WORDS {
+                for text in [
+                    [&[high][..], word.as_bytes()].concat(),
+                    [word.as_bytes(), &[high]].concat(),
+                    [b"SELECT x", &[high][..], word.as_bytes(), &[high], b"y"].concat(),
+                ] {
+                    assert_eq!(scan(&text), Some(word), "{text:?}");
+                }
+            }
+            for text in [
+                [b"SET TRANSACTION READ", &[high][..], b"WRITE"].concat(),
+                [b"READ", &[high, high][..], b"/* c */", &[high], b"WRITE"].concat(),
+                [b"x", &[high][..], b"READ", &[high], b"WRITE", &[high]].concat(),
+            ] {
+                assert_eq!(scan(&text), Some("read write"), "{text:?}");
+            }
+            let persist = [b"SET", &[high][..], b"PERSIST_ONLY x = 1"].concat();
+            assert_eq!(scan(&persist), Some("persist"));
         }
-        assert_eq!(scan(b"SELECT \xc3\xa9execute"), None);
+        assert_eq!(scan(b"SELECT \xc3\xa9execute"), Some("execute"));
+        assert_eq!(scan("SELECT caf\u{e9}_prepare".as_bytes()), None);
+    }
+
+    #[test]
+    fn a_word_directly_after_a_gbk_letter_trail_byte_is_part_of_an_identifier() {
+        assert_eq!(scan(b"SELECT \x81APREPARE"), None);
+        assert_eq!(scan(b"SELECT \x81zexecute_prepared_stmt"), None);
+        assert_eq!(scan(b"SELECT \x81\x5cPREPARE"), Some("prepare"));
     }
 
     #[test]
