@@ -481,3 +481,50 @@ async fn query_attributes_are_refused_unless_empty_on_a_real_server() {
     assert!(error(&answer).is_none(), "{:?}", error(&answer));
     drop_database(&mut admin, db).await;
 }
+
+const ACCENTED_ESCAPES: [(&str, &[u8]); 4] = [
+    ("utf8mb4", b"SET SESSION trans\xc3\xa1ction_read_only = OFF"),
+    ("utf8mb4", b"SET SESSION transact\xc4\xb0on_read_only = OFF"),
+    (
+        "utf8mb4",
+        b"CALL sys.ex\xc3\xa9cute_prepared_stmt(CONCAT('SET SESSION transaction', '_read_only = 0'))",
+    ),
+    ("latin1", b"SET SESSION trans\xe1ction_read_only = OFF"),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn escapes_spelled_with_accented_letters_are_refused() {
+    let Some(server) = plain() else { return };
+    let db = "zs_ro_accent";
+    let mut admin = fresh_database(&server, db).await;
+    let empty = rows(&mut admin, db).await;
+
+    for (charset, escape) in ACCENTED_ESCAPES {
+        let mut control = read_write(&server).await;
+        works(&mut control, &format!("SET NAMES {charset}")).await;
+        works(&mut control, "SET SESSION transaction_read_only = ON").await;
+        insert_is_read_only(&mut control, db, "control setup").await;
+        let answer = bytes(&mut control, escape).await;
+        assert!(error(&answer).is_none(), "{escape:?}: {:?}", error(&answer));
+        works(&mut control, &format!("INSERT INTO {db}.t VALUES (1)")).await;
+        works(&mut admin, &format!("DELETE FROM {db}.t")).await;
+    }
+
+    for (charset, escape) in ACCENTED_ESCAPES {
+        let mut session = read_only(&server).await;
+        works(&mut session, &format!("SET NAMES {charset}")).await;
+        let answer = bytes(&mut session, escape).await;
+        let insert = session
+            .query(&format!("INSERT INTO {db}.t VALUES (1)"))
+            .await
+            .unwrap();
+        assert!(
+            is_refusal(&answer) && is_read_only_error(&insert),
+            "{escape:?}: escape {:?}, then INSERT {:?}",
+            error(&answer),
+            error(&insert)
+        );
+    }
+    assert_eq!(rows(&mut admin, db).await, empty);
+    drop_database(&mut admin, db).await;
+}

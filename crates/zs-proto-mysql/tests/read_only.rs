@@ -160,8 +160,14 @@ async fn a_session_start_that_is_not_ok_denies_the_connection() {
     positive.login(CLIENT_CAPS).await;
 
     let refused = packet::err_packet(1227, "42000", "Access denied; you need the privilege");
-    for reply in [refused, vec![0x01], vec![0xfe, 0, 0, 2, 0]] {
-        let rig = Rig::start(native().with_first_reply(reply), SessionAccess::ReadOnly).await;
+    for (reply, seq) in [
+        (refused, 1),
+        (vec![0x01], 1),
+        (vec![0xfe, 0, 0, 2, 0], 1),
+        (packet::ok_packet(fake::OK_INFO), 2),
+    ] {
+        let script = native().with_first_reply(reply).with_first_reply_seq(seq);
+        let rig = Rig::start(script, SessionAccess::ReadOnly).await;
         let mut session = fake::login(rig.local, CLIENT_CAPS).await;
         assert_eq!(session.reply.payload, READ_ONLY_REFUSED.packet());
         assert_eq!(session.reply.seq, 2);

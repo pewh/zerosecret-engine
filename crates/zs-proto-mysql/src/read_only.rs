@@ -124,6 +124,61 @@ fn word_at(text: &[u8], at: usize, word: &str) -> bool {
             .is_none_or(|next| !identifier(*next))
 }
 
+fn high_run(text: &[u8], at: usize) -> usize {
+    text.get(at..).map_or(0, |rest| {
+        rest.iter()
+            .take(4)
+            .take_while(|byte| **byte >= 0x80)
+            .count()
+    })
+}
+
+fn folded_ends(text: &[u8], at: usize, word: &str, budget: &mut usize) -> Option<u128> {
+    let mut ends: u128 = 1;
+    for expected in word.bytes() {
+        let mut next: u128 = 0;
+        let mut rest = ends;
+        while rest != 0 {
+            let offset = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            *budget = budget.checked_sub(1)?;
+            let position = at + offset;
+            if text
+                .get(position)
+                .is_some_and(|byte| byte.eq_ignore_ascii_case(&expected))
+            {
+                next |= 1 << (offset + 1);
+            }
+            for run in 1..=high_run(text, position) {
+                next |= 1 << (offset + run);
+            }
+        }
+        if next == 0 {
+            return Some(0);
+        }
+        ends = next;
+    }
+    Some(ends)
+}
+
+fn folded_at(text: &[u8], at: usize, word: &str, whole: bool, budget: &mut usize) -> bool {
+    let first = text[at];
+    if !(first.eq_ignore_ascii_case(&word.as_bytes()[0]) || first >= 0x80) {
+        return false;
+    }
+    let Some(mut ends) = folded_ends(text, at, word, budget) else {
+        return true;
+    };
+    while ends != 0 {
+        let offset = ends.trailing_zeros() as usize;
+        ends &= ends - 1;
+        if !whole || text.get(at + offset).is_none_or(|next| !identifier(*next)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn line_end(text: &[u8], at: usize) -> usize {
     text[at..]
         .iter()
@@ -161,6 +216,7 @@ fn followed_by(text: &[u8], at: usize, word: &str, budget: &mut usize) -> bool {
 
 pub fn scan(text: &[u8]) -> Option<&'static str> {
     let mut budget = 4 * text.len() + 1024;
+    let mut fold_budget = 64 * text.len() + 4096;
     for at in 0..text.len() {
         if let Some(token) = TOKENS.iter().find(|token| {
             text.get(at..at + token.len())
@@ -168,13 +224,18 @@ pub fn scan(text: &[u8]) -> Option<&'static str> {
         }) {
             return Some(token);
         }
-        if !text[at].is_ascii_alphabetic() || (at > 0 && identifier(text[at - 1])) {
+        if !(text[at].is_ascii_alphabetic() || text[at] >= 0x80)
+            || (at > 0 && identifier(text[at - 1]))
+        {
             continue;
         }
-        if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
+        if let Some(word) = WORDS
+            .iter()
+            .find(|word| folded_at(text, at, word, true, &mut fold_budget))
+        {
             return Some(word);
         }
-        if prefix_at(text, at, PERSIST) {
+        if folded_at(text, at, PERSIST, false, &mut fold_budget) {
             return Some(PERSIST);
         }
         if word_at(text, at, "read") && followed_by(text, at + 4, "write", &mut budget) {
@@ -442,6 +503,112 @@ mod tests {
         }
         assert_eq!(scan(b"SELECT \xc3\xa9execute"), Some("execute"));
         assert_eq!(scan("SELECT caf\u{e9}_prepare".as_bytes()), None);
+    }
+
+    fn spelled(word: &str, at: usize, character: &[u8]) -> Vec<u8> {
+        let mut out = word.as_bytes().to_vec();
+        out.splice(at..=at, character.iter().copied());
+        out
+    }
+
+    #[test]
+    fn a_word_with_a_non_ascii_letter_in_place_of_an_ascii_letter_matches() {
+        for (text, word) in [
+            (
+                &b"SET SESSION trans\xc3\xa1ction_read_only = OFF"[..],
+                "transaction_read_only",
+            ),
+            (
+                b"SET SESSION transact\xc4\xb0on_read_only = OFF",
+                "transaction_read_only",
+            ),
+            (
+                b"SET SESSION trans\xe1ction_read_only = OFF",
+                "transaction_read_only",
+            ),
+            (
+                b"CALL sys.ex\xc3\xa9cute_prepared_stmt(CONCAT('SET SESSION transaction', '_read_only = 0'))",
+                "execute_prepared_stmt",
+            ),
+            (b"SET P\xc3\x89RSIST_ONLY x = 1", "persist"),
+            (b"SET @@p\xe9rsist.x = 1", "persist"),
+        ] {
+            assert_eq!(scan(text), Some(word), "{text:?}");
+        }
+        let characters: [&[u8]; 4] = [b"\xe9", b"\xc3\xa9", b"\xe3\x80\x81", b"\xf0\x9f\x98\x80"];
+        let refused_as = |text: &[u8], word: &str| {
+            let matched = scan(text);
+            assert!(
+                matched.is_some_and(|found| word.starts_with(found)),
+                "{text:?}: {matched:?}"
+            );
+        };
+        for word in WORDS {
+            for at in 0..word.len() {
+                for character in characters {
+                    let text = [b"SELECT ", &spelled(word, at, character)[..], b" FROM t"].concat();
+                    refused_as(&text, word);
+                }
+                if at + 1 < word.len() {
+                    let twice = spelled(word, at, b"\xc3\xa9");
+                    let twice = [&twice[..at + 2], b"\xe9", &twice[at + 3..]].concat();
+                    refused_as(&twice, word);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_spelling_checked_on_the_server_is_refused() {
+        for (text, word) in [
+            (
+                &b"SET SESSION tx_r\xc3\xa9ad_only = OFF"[..],
+                "tx_read_only",
+            ),
+            (b"SET @@gl\xc3\xb6bal.net_retry_count = 11", "global"),
+            (b"SET GL\xc3\x96BAL net_retry_count = 11", "global"),
+            (b"SET @@p\xc3\xa9rsist.net_retry_count = 11", "persist"),
+            (b"SET @@p\xc3\xa9rsist_only.net_retry_count = 11", "persist"),
+            (b"SELECT LOAD_F\xc3\x8dLE('/etc/hostname')", "load_file"),
+            (b"PR\xc3\x89PARE s FROM 'SELECT 1'", "prepare"),
+            (b"EX\xc3\x89CUTE s", "execute"),
+            (b"K\xc3\x8dLL 999999", "kill"),
+            (b"SH\xc3\x9aTDOWN", "shutdown"),
+            (
+                b"SET SESSION \xef\xbd\x94ransaction_read_only = OFF",
+                "transaction_read_only",
+            ),
+            (
+                b"SET SESSION transaction\xef\xbc\xbfread_only = OFF",
+                "transaction_read_only",
+            ),
+        ] {
+            assert_eq!(scan(text), Some(word), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn folded_near_misses_and_ascii_keywords_do_not_match() {
+        for word in WORDS {
+            let mut shorter = word.as_bytes().to_vec();
+            shorter.remove(1);
+            let last = shorter.len() - 1;
+            shorter.splice(last.., b"\xc3\xa9".iter().copied());
+            let text = [b"SELECT ", &shorter[..], b" FROM t"].concat();
+            assert_eq!(scan(&text), None, "{text:?}");
+
+            let dotted: Vec<String> = word.chars().map(String::from).collect();
+            let text = format!("SELECT '{} \u{fc}'", dotted.join("."));
+            assert_eq!(found(&text), None, "{text}");
+        }
+        for text in [
+            &b"SET TRANSACTION R\xc3\x89AD WRITE"[..],
+            b"START TRANSACTION READ WR\xc3\x8dTE",
+            b"SELECT * FROM users WHERE name = 'Jos\xc3\xa9 M\xc3\xbcller'",
+            b"SELECT 'caf\xc3\xa9', 'na\xc3\xafve'",
+        ] {
+            assert_eq!(scan(text), None, "{text:?}");
+        }
     }
 
     #[test]

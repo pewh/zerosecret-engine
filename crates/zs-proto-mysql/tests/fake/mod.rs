@@ -74,6 +74,7 @@ pub struct Script {
     pub server_version: &'static [u8],
     pub extra_capabilities: u32,
     pub first_reply: Option<Vec<u8>>,
+    pub first_reply_seq: Option<u8>,
 }
 
 impl Script {
@@ -86,6 +87,7 @@ impl Script {
             server_version: SERVER_VERSION,
             extra_capabilities: 0,
             first_reply: None,
+            first_reply_seq: None,
         }
     }
 
@@ -106,6 +108,11 @@ impl Script {
 
     pub fn with_first_reply(mut self, reply: Vec<u8>) -> Self {
         self.first_reply = Some(reply);
+        self
+    }
+
+    pub fn with_first_reply_seq(mut self, seq: u8) -> Self {
+        self.first_reply_seq = Some(seq);
         self
     }
 
@@ -335,10 +342,13 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
         if script.flow == Flow::ResetAfterCommand {
             return Ok(());
         }
-        let reply = first_reply
-            .take()
-            .unwrap_or_else(|| packet::ok_packet(OK_INFO));
-        packet::write_packet(&mut stream, command.seq.wrapping_add(1), &reply).await?;
+        let first = first_reply.take();
+        let reply_seq = match (&first, script.first_reply_seq) {
+            (Some(_), Some(seq)) => seq,
+            _ => command.seq.wrapping_add(1),
+        };
+        let reply = first.unwrap_or_else(|| packet::ok_packet(OK_INFO));
+        packet::write_packet(&mut stream, reply_seq, &reply).await?;
     }
 }
 
