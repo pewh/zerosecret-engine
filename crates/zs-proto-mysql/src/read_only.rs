@@ -2,6 +2,7 @@ pub const REFUSAL: &str = "SIGNAL SQLSTATE '25006' SET MESSAGE_TEXT = 'zs: refus
 pub const READ_ONLY_REASON: &str = "read-only";
 pub const SESSION_START: &str = "SET SESSION transaction_read_only = ON";
 pub const MAX_SCREENED_COMMAND: usize = 64 << 20;
+pub(crate) const INLINE_SCAN_LIMIT: usize = 1 << 20;
 
 const WORDS: [&str; 11] = [
     "transaction_read_only",
@@ -129,137 +130,170 @@ fn word_at(text: &[u8], at: usize, word: &str) -> bool {
             .is_none_or(|next| !identifier(*next))
 }
 
-fn high_run(text: &[u8], at: usize) -> usize {
-    text.get(at..).map_or(0, |rest| {
-        rest.iter()
-            .take(4)
-            .take_while(|byte| **byte >= 0x80)
-            .count()
-    })
+struct Fold {
+    word: &'static str,
+    done: u32,
+    letters: u32,
+    literal: [u32; 256],
 }
 
-fn folded_ends(text: &[u8], at: usize, word: &str, budget: &mut usize) -> Option<u128> {
-    let mut ends: u128 = 1;
-    for expected in word.bytes() {
-        let mut next: u128 = 0;
-        let mut rest = ends;
-        while rest != 0 {
-            let offset = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
-            *budget = budget.checked_sub(1)?;
-            let position = at + offset;
-            if text
-                .get(position)
-                .is_some_and(|byte| byte.eq_ignore_ascii_case(&expected))
-            {
-                next |= 1 << (offset + 1);
-            }
+impl Fold {
+    fn new(word: &'static str) -> Self {
+        let mut literal = [0u32; 256];
+        let mut letters = 0u32;
+        for (at, expected) in word.bytes().enumerate() {
             if expected.is_ascii_alphabetic() {
-                for run in 1..=high_run(text, position) {
-                    next |= 1 << (offset + run);
+                letters |= 1 << at;
+            }
+            for byte in 0..=u8::MAX {
+                if byte.eq_ignore_ascii_case(&expected) {
+                    literal[usize::from(byte)] |= 1 << at;
                 }
             }
         }
-        if next == 0 {
-            return Some(0);
-        }
-        ends = next;
-    }
-    Some(ends)
-}
-
-fn folded_at(text: &[u8], at: usize, word: &str, budget: &mut usize) -> bool {
-    let first = text[at];
-    if !(first.eq_ignore_ascii_case(&word.as_bytes()[0]) || first >= 0x80) {
-        return false;
-    }
-    let letters = word.bytes().take_while(|byte| *byte != b'_').count();
-    let window = text
-        .get(at + letters..)
-        .map_or(&[][..], |rest| &rest[..rest.len().min(3 * letters + 1)]);
-    if !window.contains(&b'_') {
-        return false;
-    }
-    let Some(mut ends) = folded_ends(text, at, word, budget) else {
-        return true;
-    };
-    while ends != 0 {
-        let offset = ends.trailing_zeros() as usize;
-        ends &= ends - 1;
-        if text.get(at + offset).is_none_or(|next| !identifier(*next)) {
-            return true;
+        Self {
+            word,
+            done: 1 << word.len(),
+            letters,
+            literal,
         }
     }
-    false
 }
 
-fn line_end(text: &[u8], at: usize) -> usize {
-    text[at..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(text.len(), |end| at + end + 1)
+#[derive(Clone, Copy, Default)]
+struct Live {
+    fresh: u32,
+    high: [u32; 3],
+    gb: [u32; 3],
 }
 
-fn comment_end(text: &[u8], at: usize) -> usize {
-    text[at + 2..]
-        .windows(2)
-        .position(|pair| pair == b"*/")
-        .map_or(text.len(), |end| at + 2 + end + 2)
-}
-
-fn skip_blank(text: &[u8], mut at: usize, budget: &mut usize) -> Option<usize> {
-    loop {
-        let from = at;
-        let rest = &text[at..];
-        if rest.first().is_some_and(|byte| blank(*byte)) {
-            at += 1;
-        } else if rest.starts_with(b"#") || rest.starts_with(b"--") {
-            at = line_end(text, at);
-        } else if rest.starts_with(b"/*") {
-            at = comment_end(text, at);
-        } else {
-            return Some(at);
+impl Live {
+    fn step(&mut self, fold: &Fold, byte: u8) -> bool {
+        let high = byte >= 0x80;
+        let lead = (0x81..=0xfe).contains(&byte);
+        let digit = byte.is_ascii_digit();
+        let open = self.fresh & fold.letters;
+        let mut fresh = (self.fresh & fold.literal[usize::from(byte)]) << 1;
+        if high {
+            fresh |= (open | self.high[0] | self.high[1] | self.high[2]) << 1;
         }
-        *budget = budget.checked_sub(at - from)?;
+        if digit {
+            fresh |= self.gb[2] << 1;
+        }
+        let keep = |on: bool, mask: u32| if on { mask } else { 0 };
+        *self = Live {
+            fresh,
+            high: [
+                keep(high, open),
+                keep(high, self.high[0]),
+                keep(high, self.high[1]),
+            ],
+            gb: [
+                keep(lead, open),
+                keep(digit, self.gb[0]),
+                keep(lead, self.gb[1]),
+            ],
+        };
+        fresh & fold.done != 0
     }
 }
 
-fn followed_by(text: &[u8], at: usize, word: &str, budget: &mut usize) -> bool {
-    skip_blank(text, at, budget).is_none_or(|next| word_at(text, next, word))
+fn folds() -> &'static [Fold; 3] {
+    static FOLDS: std::sync::OnceLock<[Fold; 3]> = std::sync::OnceLock::new();
+    FOLDS.get_or_init(|| FOLDED.map(Fold::new))
 }
 
-pub fn scan(text: &[u8]) -> Option<&'static str> {
-    let mut budget = 4 * text.len() + 1024;
-    let mut fold_budget = 64 * text.len() + 4096;
-    for at in 0..text.len() {
+fn folded_match(text: &[u8], folds: &[Fold]) -> Option<&'static str> {
+    let mut live = vec![Live::default(); folds.len()];
+    for (at, &byte) in text.iter().enumerate() {
+        let start = at == 0 || !identifier(text[at - 1]);
+        let ends = text.get(at + 1).is_none_or(|next| !identifier(*next));
+        for (fold, state) in folds.iter().zip(live.iter_mut()) {
+            if start {
+                state.fresh |= 1;
+            }
+            if state.step(fold, byte) && ends {
+                return Some(fold.word);
+            }
+        }
+    }
+    None
+}
+
+const BETWEEN: u8 = 1;
+const SLASH: u8 = 2;
+const DASH: u8 = 4;
+const LINE: u8 = 8;
+const BLOCK: u8 = 16;
+const STAR: u8 = 32;
+
+fn between_step(states: u8, byte: u8) -> u8 {
+    let mut next = 0;
+    if states & BETWEEN != 0 {
+        next |= match byte {
+            b'#' => LINE,
+            b'/' => SLASH,
+            b'-' => DASH,
+            _ if blank(byte) => BETWEEN,
+            _ => 0,
+        };
+    }
+    if states & SLASH != 0 && byte == b'*' {
+        next |= BLOCK;
+    }
+    if states & DASH != 0 && byte == b'-' {
+        next |= LINE;
+    }
+    if states & LINE != 0 {
+        next |= if byte == b'\n' { BETWEEN } else { LINE };
+    }
+    if states & BLOCK != 0 {
+        next |= if byte == b'*' { STAR } else { BLOCK };
+    }
+    if states & STAR != 0 {
+        next |= match byte {
+            b'/' => BETWEEN,
+            b'*' => STAR,
+            _ => BLOCK,
+        };
+    }
+    next
+}
+
+fn ascii_match(text: &[u8]) -> Option<&'static str> {
+    let mut between = 0u8;
+    let mut after_read = None;
+    for (at, &byte) in text.iter().enumerate() {
         if let Some(token) = TOKENS.iter().find(|token| {
             text.get(at..at + token.len())
                 .is_some_and(|found| found.eq_ignore_ascii_case(token.as_bytes()))
         }) {
             return Some(token);
         }
-        if !(text[at].is_ascii_alphabetic() || text[at] >= 0x80)
-            || (at > 0 && identifier(text[at - 1]))
-        {
-            continue;
+        if after_read == Some(at) {
+            between |= BETWEEN;
         }
-        if let Some(word) = WORDS.iter().find(|word| {
-            if FOLDED.contains(word) {
-                folded_at(text, at, word, &mut fold_budget)
-            } else {
-                word_at(text, at, word)
-            }
-        }) {
-            return Some(word);
-        }
-        if prefix_at(text, at, PERSIST) {
-            return Some(PERSIST);
-        }
-        if word_at(text, at, "read") && followed_by(text, at + 4, "write", &mut budget) {
+        if between & BETWEEN != 0 && word_at(text, at, "write") {
             return Some(READ_WRITE);
         }
+        if byte.is_ascii_alphabetic() && (at == 0 || !identifier(text[at - 1])) {
+            if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
+                return Some(word);
+            }
+            if prefix_at(text, at, PERSIST) {
+                return Some(PERSIST);
+            }
+            if word_at(text, at, "read") {
+                after_read = Some(at + 4);
+            }
+        }
+        between = between_step(between, byte);
     }
     None
+}
+
+pub fn scan(text: &[u8]) -> Option<&'static str> {
+    ascii_match(text).or_else(|| folded_match(text, folds()))
 }
 
 fn with_header(command: u8, attributes: bool, text: &str) -> Vec<u8> {
@@ -676,6 +710,179 @@ mod tests {
     }
 
     #[test]
+    fn a_gb18030_four_byte_letter_folds() {
+        for (text, word) in [
+            (
+                &b"SET SESSION trans\x81\x30\x89\x39ction_read_only = OFF"[..],
+                "transaction_read_only",
+            ),
+            (
+                b"CALL sys.ex\x81\x30\x8a\x35cute_prepared_stmt(CONCAT('SET SESSION transaction', '_read_only = 0'))",
+                "execute_prepared_stmt",
+            ),
+            (b"SET SESSION \x81\x30\x89\x39x_read_only = OFF", "tx_read_only"),
+            (
+                b"SET SESSION transaction_read_onl\x81\x30\x89\x39",
+                "transaction_read_only",
+            ),
+        ] {
+            assert_eq!(scan(text), Some(word), "{text:?}");
+        }
+        for text in [
+            &b"SET SESSION trans\x81\x30\x89ction_read_only = OFF"[..],
+            b"SET SESSION trans\x81\x30\x89\x39\x30ction_read_only = OFF",
+            b"SET SESSION trans\x30\x81\x30\x89\x39ction_read_only = OFF",
+        ] {
+            assert_eq!(scan(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_non_latin_snake_case_reads_pass() {
+        let many = format!(
+            "SELECT {}",
+            [
+                "'\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44c}_\u{441}\u{438}\u{441}\u{442}\u{435}\u{43c}\u{44b}'",
+                "'\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{540d}_\u{30c7}\u{30fc}\u{30bf}\u{30d9}\u{30fc}\u{30b9}'",
+                "'\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}'",
+                "'\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}_\u{795e}\u{5357}'",
+            ]
+            .repeat(40)
+            .join(", ")
+        );
+        for text in [
+            "SELECT * FROM t WHERE note = '\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}\u{795e}\u{5357}\u{4e00}\u{4e01}\u{76ee}_\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}\u{795e}\u{5357}\u{4e00}\u{4e01}\u{76ee}_'".to_string(),
+            format!("SELECT {}", ["'\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44c}_\u{441}\u{438}\u{441}\u{442}\u{435}\u{43c}\u{44b}'"; 3].join(", ")),
+            "'\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f} '".repeat(13),
+            "'\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{540d}_\u{30c7}\u{30fc}\u{30bf}\u{30d9}\u{30fc}\u{30b9} '".repeat(8),
+            many,
+        ] {
+            assert_eq!(found(&text), None, "{text}");
+        }
+    }
+
+    fn reference_ends(text: &[u8], at: usize, word: &[u8]) -> Vec<usize> {
+        let Some((&expected, rest)) = word.split_first() else {
+            return vec![at];
+        };
+        let mut ends = Vec::new();
+        if text
+            .get(at)
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(&expected))
+        {
+            ends.extend(reference_ends(text, at + 1, rest));
+        }
+        if expected.is_ascii_alphabetic() {
+            for run in 1..=4 {
+                if text
+                    .get(at..at + run)
+                    .is_some_and(|bytes| bytes.iter().all(|byte| *byte >= 0x80))
+                {
+                    ends.extend(reference_ends(text, at + run, rest));
+                }
+            }
+            let lead = |byte: u8| (0x81..=0xfe).contains(&byte);
+            if let Some(&[a, b, c, d]) = text.get(at..at + 4)
+                && lead(a)
+                && b.is_ascii_digit()
+                && lead(c)
+                && d.is_ascii_digit()
+            {
+                ends.extend(reference_ends(text, at + 4, rest));
+            }
+        }
+        ends
+    }
+
+    fn reference(text: &[u8], word: &str) -> bool {
+        (0..=text.len()).any(|at| {
+            (at == 0 || !identifier(text[at - 1]))
+                && reference_ends(text, at, word.as_bytes())
+                    .into_iter()
+                    .any(|end| text.get(end).is_none_or(|next| !identifier(*next)))
+        })
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+            items[(self.next() % items.len() as u64) as usize]
+        }
+    }
+
+    const ALPHABET: &[u8] = b"transctiodlyexupmTRANSCTIODLYEXUPM_0123456789 \x81\x89\xc3\xa1\xfe";
+    const HIGH: [u8; 5] = [0x81, 0x89, 0xc3, 0xa1, 0xfe];
+
+    fn mutated(rng: &mut Rng, word: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..rng.next() % 3 {
+            out.push(rng.pick(ALPHABET));
+        }
+        for byte in word.bytes() {
+            match rng.next() % 24 {
+                0..=4 if byte.is_ascii_alphabetic() => {
+                    for _ in 0..=rng.next() % 4 {
+                        out.push(rng.pick(&HIGH));
+                    }
+                }
+                5..=7 if byte.is_ascii_alphabetic() => {
+                    out.push(rng.pick(&HIGH));
+                    out.push(b'0' + (rng.next() % 10) as u8);
+                    out.push(rng.pick(&HIGH));
+                    out.push(b'0' + (rng.next() % 10) as u8);
+                }
+                8 => out.push(rng.pick(ALPHABET)),
+                9 => {}
+                10 => {
+                    out.push(byte.to_ascii_uppercase());
+                    out.push(rng.pick(ALPHABET));
+                }
+                11..=13 => out.push(byte.to_ascii_uppercase()),
+                _ => out.push(byte),
+            }
+        }
+        for _ in 0..rng.next() % 3 {
+            out.push(rng.pick(ALPHABET));
+        }
+        out
+    }
+
+    #[test]
+    fn the_fold_match_agrees_with_a_slow_reference_matcher() {
+        let mut rng = Rng(0x5eed_2026_1116_0006);
+        let mut matched = 0;
+        for round in 0..6000 {
+            let word = rng.pick(&FOLDED);
+            let text: Vec<u8> = if round % 3 == 0 {
+                (0..rng.next() % 40).map(|_| rng.pick(ALPHABET)).collect()
+            } else {
+                mutated(&mut rng, word)
+            };
+            for name in FOLDED {
+                let expected = reference(&text, name);
+                matched += usize::from(expected);
+                assert_eq!(
+                    folded_match(&text, &[Fold::new(name)]).is_some(),
+                    expected,
+                    "{name} in {text:?}"
+                );
+            }
+        }
+        assert!(
+            matched > 200,
+            "the generator reached real matches: {matched}"
+        );
+    }
+
+    #[test]
     fn folded_near_misses_and_ascii_keywords_do_not_match() {
         for word in WORDS {
             let mut shorter = word.as_bytes().to_vec();
@@ -725,9 +932,11 @@ mod tests {
     }
 
     #[test]
-    fn a_scan_that_runs_out_of_budget_refuses() {
-        let mut text = "read -- ".repeat(2000);
+    fn many_reads_inside_one_comment_are_scanned_exactly() {
+        let mut text = "read -- ".repeat(20_000);
         text.push_str("\nSELECT 1");
+        assert_eq!(found(&text), None);
+        text.push_str(" read /* read -- x */ -- y\n write");
         assert_eq!(found(&text), Some("read write"));
         assert_eq!(found(&"read -- ".repeat(5)), None);
     }

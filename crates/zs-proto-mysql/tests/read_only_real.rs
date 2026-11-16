@@ -143,6 +143,8 @@ async fn session_starts_read_only_and_insert_gets_1792() {
         "\u{6771}_\u{4eac}_\u{90fd}",
         "\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}",
         "\u{6771}\u{4eac}_\u{5927}\u{962a}",
+        TOKYO_NOTE,
+        SYSTEM_USER,
     ];
     works(
         &mut admin,
@@ -173,6 +175,28 @@ async fn session_starts_read_only_and_insert_gets_1792() {
             "{name}: the row and the literal come back through the read-only session"
         );
     }
+    let answer = works(
+        &mut session,
+        &format!("SELECT * FROM {db}.names WHERE name = '{TOKYO_NOTE}'"),
+    )
+    .await;
+    assert!(
+        answer
+            .windows(TOKYO_NOTE.len())
+            .any(|w| w == TOKYO_NOTE.as_bytes())
+    );
+    let answer = works(
+        &mut session,
+        &format!("SELECT '{SYSTEM_USER}', '{SYSTEM_USER}', '{SYSTEM_USER}'"),
+    )
+    .await;
+    assert!(
+        answer
+            .windows(SYSTEM_USER.len())
+            .filter(|w| *w == SYSTEM_USER.as_bytes())
+            .count()
+            >= 3
+    );
     insert_is_read_only(&mut session, db, "login").await;
     assert_eq!(rows(&mut admin, db).await, empty);
 
@@ -518,7 +542,15 @@ async fn query_attributes_are_refused_unless_empty_on_a_real_server() {
     drop_database(&mut admin, db).await;
 }
 
-const ACCENTED_ESCAPES: [(&str, &[u8]); 4] = [
+const TOKYO_NOTE: &str = "\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}\u{795e}\u{5357}\u{4e00}\u{4e01}\u{76ee}_\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}\u{795e}\u{5357}\u{4e00}\u{4e01}\u{76ee}_";
+const SYSTEM_USER: &str = "\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44c}_\u{441}\u{438}\u{441}\u{442}\u{435}\u{43c}\u{44b}";
+
+const ACCENTED_ESCAPES: [(&str, &[u8]); 6] = [
+    ("gb18030", b"SET SESSION trans\x81\x30\x89\x39ction_read_only = OFF"),
+    (
+        "gb18030",
+        b"CALL sys.ex\x81\x30\x8a\x35cute_prepared_stmt(CONCAT('SET SESSION transaction', '_read_only = 0'))",
+    ),
     ("utf8mb4", b"SET SESSION trans\xc3\xa1ction_read_only = OFF"),
     ("utf8mb4", b"SET SESSION transact\xc4\xb0on_read_only = OFF"),
     (

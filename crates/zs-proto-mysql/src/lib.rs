@@ -880,7 +880,27 @@ where
         }
         reassemble(client, payload, conn).await?;
     }
-    match read_only::refusal(payload, screen.attributes) {
+    let found = if payload.len() > read_only::INLINE_SCAN_LIMIT {
+        let owned = std::mem::take(payload);
+        let attributes = screen.attributes;
+        let scanned = tokio::task::spawn_blocking(move || {
+            let found = read_only::refusal(&owned, attributes);
+            (owned, found)
+        })
+        .await;
+        let Ok((owned, found)) = scanned else {
+            conn.refused(Refused::Command(
+                read_only::command_name(command),
+                "scan_failed",
+            ));
+            return Err(Ending::ReadOnly);
+        };
+        *payload = owned;
+        found
+    } else {
+        read_only::refusal(payload, screen.attributes)
+    };
+    match found {
         Some((refused, mut replacement)) => {
             conn.refused(refused);
             if split {
