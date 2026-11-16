@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+- A PostgreSQL, MySQL, MongoDB or Redis resource can be read-only (ADR-0063). A policy resource
+  has `access: read_only`, and the control plane signs it into the grant, which is then version 2.
+  A read-write grant has no `access` record and stays version 1, byte for byte. This is a
+  guardrail, not a security boundary: whoever holds the database password can connect without
+  the agent. A database account with read privileges only is the control that stops writes.
+  `zs resources` ends the row of such a resource with `read-only (guardrail)`.
+- An agent from 0.6.1 or older refuses a read-only grant: its signature does not verify there.
+  Update the agent before the control plane issues the first one.
+- PostgreSQL and MySQL: the agent opens the session in the database's read-only mode and refuses
+  the known ways to switch it off, with SQLSTATE `25006` (PostgreSQL) or error 1792 (MySQL).
+  A PostgreSQL server that does not report `default_transaction_read_only` at startup, such as
+  a transaction-mode pooler that drops the server's startup parameters, cannot be a read-only
+  resource: the agent closes the session. The agent also refuses a read-only session to a
+  MariaDB server. `SHOW default_transaction_read_only` is refused by name, as are
+  `SET SESSION CHARACTERISTICS ... READ WRITE` and `SET SESSION TRANSACTION READ WRITE`.
+- MongoDB and Redis: the agent admits an allowlist of read commands and refuses the rest, with
+  code 13 (`Unauthorized`) or `-NOPERM read-only resource`. MongoDB transactions
+  (`commitTransaction`) and `OP_MSG` messages with a document sequence are refused. Redis
+  scripts (`EVAL`, `EVALSHA` and their `_RO` forms, `SCRIPT`, `FUNCTION`), `INFO` and
+  `CLIENT SETINFO` are refused. ioredis skips its ready check, because `INFO` is refused, and
+  prints a warning; it then works.
+- Tested against PostgreSQL 16, MySQL 8.4, MongoDB 8.0 and Redis 7.4: libpq, node-postgres,
+  pgx, psycopg, mysql2, the MongoDB Node driver and ioredis read through a read-only session
+  and are refused a write.
+- Audit: a refused command is a `deny` with reason `read-only`. A session that the agent closes
+  because the access of its grant changed has reason `access changed`, and one closed after a
+  revoke has `grant revoked`.
+
 ## [0.6.1] - 2026-11-15
 
 ### Security
