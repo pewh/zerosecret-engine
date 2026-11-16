@@ -16,6 +16,12 @@ const WORDS: [&str; 11] = [
     "shutdown",
     "load_file",
 ];
+const FOLDED: [&str; 4] = [
+    "transaction_read_only",
+    "tx_read_only",
+    "execute_prepared_stmt",
+    "load_file",
+];
 const PERSIST: &str = "persist";
 const TOKENS: [&str; 2] = ["/*!", "/*m!"];
 const READ_WRITE: &str = "read write";
@@ -149,8 +155,10 @@ fn folded_ends(text: &[u8], at: usize, word: &str, budget: &mut usize) -> Option
             {
                 next |= 1 << (offset + 1);
             }
-            for run in 1..=high_run(text, position) {
-                next |= 1 << (offset + run);
+            if expected.is_ascii_alphabetic() {
+                for run in 1..=high_run(text, position) {
+                    next |= 1 << (offset + run);
+                }
             }
         }
         if next == 0 {
@@ -161,9 +169,16 @@ fn folded_ends(text: &[u8], at: usize, word: &str, budget: &mut usize) -> Option
     Some(ends)
 }
 
-fn folded_at(text: &[u8], at: usize, word: &str, whole: bool, budget: &mut usize) -> bool {
+fn folded_at(text: &[u8], at: usize, word: &str, budget: &mut usize) -> bool {
     let first = text[at];
     if !(first.eq_ignore_ascii_case(&word.as_bytes()[0]) || first >= 0x80) {
+        return false;
+    }
+    let letters = word.bytes().take_while(|byte| *byte != b'_').count();
+    let window = text
+        .get(at + letters..)
+        .map_or(&[][..], |rest| &rest[..rest.len().min(3 * letters + 1)]);
+    if !window.contains(&b'_') {
         return false;
     }
     let Some(mut ends) = folded_ends(text, at, word, budget) else {
@@ -172,7 +187,7 @@ fn folded_at(text: &[u8], at: usize, word: &str, whole: bool, budget: &mut usize
     while ends != 0 {
         let offset = ends.trailing_zeros() as usize;
         ends &= ends - 1;
-        if !whole || text.get(at + offset).is_none_or(|next| !identifier(*next)) {
+        if text.get(at + offset).is_none_or(|next| !identifier(*next)) {
             return true;
         }
     }
@@ -229,13 +244,16 @@ pub fn scan(text: &[u8]) -> Option<&'static str> {
         {
             continue;
         }
-        if let Some(word) = WORDS
-            .iter()
-            .find(|word| folded_at(text, at, word, true, &mut fold_budget))
-        {
+        if let Some(word) = WORDS.iter().find(|word| {
+            if FOLDED.contains(word) {
+                folded_at(text, at, word, &mut fold_budget)
+            } else {
+                word_at(text, at, word)
+            }
+        }) {
             return Some(word);
         }
-        if folded_at(text, at, PERSIST, false, &mut fold_budget) {
+        if prefix_at(text, at, PERSIST) {
             return Some(PERSIST);
         }
         if word_at(text, at, "read") && followed_by(text, at + 4, "write", &mut budget) {
@@ -530,61 +548,130 @@ mod tests {
                 b"CALL sys.ex\xc3\xa9cute_prepared_stmt(CONCAT('SET SESSION transaction', '_read_only = 0'))",
                 "execute_prepared_stmt",
             ),
-            (b"SET P\xc3\x89RSIST_ONLY x = 1", "persist"),
-            (b"SET @@p\xe9rsist.x = 1", "persist"),
+            (b"SET SESSION tx_r\xc3\xa9ad_only = OFF", "tx_read_only"),
+            (b"SELECT LOAD_F\xc3\x8dLE('/etc/hostname')", "load_file"),
+            (
+                b"SET SESSION \xef\xbd\x94ransaction_read_only = OFF",
+                "transaction_read_only",
+            ),
         ] {
             assert_eq!(scan(text), Some(word), "{text:?}");
         }
         let characters: [&[u8]; 4] = [b"\xe9", b"\xc3\xa9", b"\xe3\x80\x81", b"\xf0\x9f\x98\x80"];
-        let refused_as = |text: &[u8], word: &str| {
-            let matched = scan(text);
-            assert!(
-                matched.is_some_and(|found| word.starts_with(found)),
-                "{text:?}: {matched:?}"
-            );
-        };
-        for word in WORDS {
-            for at in 0..word.len() {
+        for word in FOLDED {
+            let letters: Vec<usize> = (0..word.len())
+                .filter(|at| word.as_bytes()[*at].is_ascii_alphabetic())
+                .collect();
+            for &at in &letters {
                 for character in characters {
                     let text = [b"SELECT ", &spelled(word, at, character)[..], b" FROM t"].concat();
-                    refused_as(&text, word);
+                    assert_eq!(scan(&text), Some(word), "{text:?}");
                 }
-                if at + 1 < word.len() {
+                if letters.contains(&(at + 1)) {
                     let twice = spelled(word, at, b"\xc3\xa9");
                     let twice = [&twice[..at + 2], b"\xe9", &twice[at + 3..]].concat();
-                    refused_as(&twice, word);
+                    assert_eq!(scan(&twice), Some(word), "{twice:?}");
                 }
             }
         }
     }
 
+    fn every_letter_two_bytes(word: &str) -> Vec<u8> {
+        word.bytes()
+            .flat_map(|byte| {
+                if byte == b'_' {
+                    vec![b'_']
+                } else {
+                    vec![0xc3, 0x80 + byte % 0x20]
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn every_spelling_checked_on_the_server_is_refused() {
-        for (text, word) in [
-            (
-                &b"SET SESSION tx_r\xc3\xa9ad_only = OFF"[..],
-                "tx_read_only",
+    fn only_letters_fold_and_an_underscore_stays_literal() {
+        let all = every_letter_two_bytes("transaction_read_only");
+        let text = [b"SET SESSION ", &all[..], b" = OFF"].concat();
+        assert_eq!(scan(&text), Some("transaction_read_only"), "{text:?}");
+
+        let first = all.iter().position(|byte| *byte == b'_').unwrap();
+        let mut replaced = all.clone();
+        replaced.splice(first..=first, b"\xc3\xa9".iter().copied());
+        let text = [b"SET SESSION ", &replaced[..], b" = OFF"].concat();
+        assert_eq!(
+            scan(&text),
+            Some("load_file"),
+            "not transaction_read_only; the remaining underscore sits between two runs of 4+ high bytes: {text:?}"
+        );
+        let both = all
+            .iter()
+            .flat_map(|byte| {
+                if *byte == b'_' {
+                    b"\xc3\xa9".to_vec()
+                } else {
+                    vec![*byte]
+                }
+            })
+            .collect::<Vec<u8>>();
+        let text = [b"SET SESSION ", &both[..], b" = OFF"].concat();
+        assert_eq!(scan(&text), None, "{text:?}");
+        assert_eq!(
+            found(
+                "SELECT '\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}'"
             ),
-            (b"SET @@gl\xc3\xb6bal.net_retry_count = 11", "global"),
-            (b"SET GL\xc3\x96BAL net_retry_count = 11", "global"),
-            (b"SET @@p\xc3\xa9rsist.net_retry_count = 11", "persist"),
-            (b"SET @@p\xc3\xa9rsist_only.net_retry_count = 11", "persist"),
-            (b"SELECT LOAD_F\xc3\x8dLE('/etc/hostname')", "load_file"),
-            (b"PR\xc3\x89PARE s FROM 'SELECT 1'", "prepare"),
-            (b"EX\xc3\x89CUTE s", "execute"),
-            (b"K\xc3\x8dLL 999999", "kill"),
-            (b"SH\xc3\x9aTDOWN", "shutdown"),
-            (
-                b"SET SESSION \xef\xbd\x94ransaction_read_only = OFF",
-                "transaction_read_only",
-            ),
-            (
-                b"SET SESSION transaction\xef\xbc\xbfread_only = OFF",
-                "transaction_read_only",
-            ),
+            Some("load_file"),
+            "documented cost: two non-Latin segments of 4+ bytes joined by an underscore"
+        );
+
+        for candidate in [
+            &b"\xef\xbc\xbf"[..],
+            b"\xef\xb9\x8f",
+            b"\xcb\x8d",
+            b"\xe2\x80\x97",
+            b"\xcc\xb2",
+            b"\xaf",
         ] {
-            assert_eq!(scan(text), Some(word), "{text:?}");
+            let text = [b"SET SESSION transaction", candidate, b"read_only = OFF"].concat();
+            assert_eq!(scan(&text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn keywords_match_ascii_only_as_the_server_parses_them() {
+        for text in [
+            &b"SET @@gl\xc3\xb6bal.net_retry_count = 11"[..],
+            b"SET GL\xc3\x96BAL net_retry_count = 11",
+            b"SET @@p\xc3\xa9rsist.net_retry_count = 11",
+            b"SET P\xc3\x89RSIST_ONLY x = 1",
+            b"PR\xc3\x89PARE s FROM 'SELECT 1'",
+            b"EX\xc3\x89CUTE s",
+            b"K\xc3\x8dLL 999999",
+            b"SH\xc3\x9aTDOWN",
+            b"SELECT 1 INTO \xc3\x93UTFILE '/tmp/x'",
+        ] {
+            assert_eq!(scan(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn non_latin_reads_pass() {
+        for text in [
+            "SELECT '\u{6771}\u{4eac}'",
+            "SELECT 'ok \u{1f44d}'",
+            "SELECT '\u{418}\u{432}\u{430}\u{43d}'",
+            "SELECT 'Jos\u{e9} M\u{fc}ller'",
+            "SELECT * FROM shops WHERE city = '\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a}\u{795e}\u{5357}\u{4e00}\u{4e01}\u{76ee}'",
+            "SELECT '\u{6771}_\u{4eac}_\u{90fd}'",
+            "SELECT '\u{44f}_\u{442}\u{44b}'",
+        ] {
+            assert_eq!(found(text), None, "{text}");
+        }
+        let long = format!(
+            "SELECT '{}', '{}'",
+            "\u{6771}\u{4eac}\u{1f44d}".repeat(20_000),
+            "\u{418}\u{432}\u{430}\u{43d} ".repeat(20_000)
+        );
+        assert_eq!(found(&long), None);
     }
 
     #[test]

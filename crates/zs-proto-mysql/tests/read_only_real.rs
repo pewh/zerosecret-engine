@@ -135,8 +135,42 @@ async fn session_starts_read_only_and_insert_gets_1792() {
     let mut admin = fresh_database(&server, db).await;
     let empty = rows(&mut admin, db).await;
 
+    let names = [
+        "\u{6771}\u{4eac}",
+        "\u{418}\u{432}\u{430}\u{43d}",
+        "ok \u{1f44d}",
+        "Jos\u{e9} M\u{fc}ller",
+        "\u{6771}_\u{4eac}_\u{90fd}",
+    ];
+    works(
+        &mut admin,
+        &format!("CREATE TABLE {db}.names (name VARCHAR(64)) CHARACTER SET utf8mb4"),
+    )
+    .await;
+    for name in names {
+        works(
+            &mut admin,
+            &format!("INSERT INTO {db}.names VALUES ('{name}')"),
+        )
+        .await;
+    }
+
     let mut session = read_only(&server).await;
     works(&mut session, "SELECT 1").await;
+    works(&mut session, "SET NAMES utf8mb4").await;
+    for name in names {
+        let answer = works(
+            &mut session,
+            &format!("SELECT name, '{name}' AS echoed FROM {db}.names WHERE name = '{name}'"),
+        )
+        .await;
+        let bytes = name.as_bytes();
+        assert_eq!(
+            answer.windows(bytes.len()).filter(|w| *w == bytes).count(),
+            2,
+            "{name}: the row and the literal come back through the read-only session"
+        );
+    }
     insert_is_read_only(&mut session, db, "login").await;
     assert_eq!(rows(&mut admin, db).await, empty);
 
