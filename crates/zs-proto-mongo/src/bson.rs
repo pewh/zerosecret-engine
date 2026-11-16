@@ -149,6 +149,38 @@ pub fn exceeds_depth(bytes: &[u8], at: usize, limit: usize) -> Result<bool, Malf
     Ok(false)
 }
 
+pub fn contains_key(bytes: &[u8], names: &[&str]) -> Result<bool, Malformed> {
+    let total_end = document_frame(bytes, 0, bytes.len())?;
+    let mut stack: Vec<(usize, usize)> = vec![(4, total_end - 1)];
+    while let Some((mut cursor, mut end)) = stack.pop() {
+        while cursor < end {
+            let kind = *bytes.get(cursor).ok_or(Malformed)?;
+            if kind == 0 {
+                return Err(Malformed);
+            }
+            let name_end = cstring_end(bytes, cursor + 1)?;
+            let name = bytes.get(cursor + 1..name_end).ok_or(Malformed)?;
+            if names.iter().any(|wanted| wanted.as_bytes() == name) {
+                return Ok(true);
+            }
+            let value_at = name_end + 1;
+            if matches!(kind, DOCUMENT | ARRAY | 0x0F) {
+                let (doc_at, doc_end, element_end) = child_document(kind, bytes, value_at, end)?;
+                stack.push((element_end, end));
+                cursor = doc_at + 4;
+                end = doc_end - 1;
+                continue;
+            }
+            let len = value_len(kind, bytes, value_at)?;
+            if value_at.checked_add(len).is_none_or(|next| next > end) {
+                return Err(Malformed);
+            }
+            cursor = value_at + len;
+        }
+    }
+    Ok(false)
+}
+
 pub fn str_value(text: &str) -> Vec<u8> {
     let mut value = ((text.len() + 1) as i32).to_le_bytes().to_vec();
     value.extend_from_slice(text.as_bytes());
@@ -666,5 +698,42 @@ mod tests {
         assert_eq!(first_key(&bytes), Some("find"));
         assert_eq!(first_key(&Doc::new().encode()), None);
         assert_eq!(first_key(&[1, 2]), None);
+    }
+
+    #[test]
+    fn contains_key_walks_documents_arrays_and_scopes() {
+        let bytes = every_kind().encode();
+        for name in ["double", "a", "0", "x", "scoped"] {
+            assert_eq!(contains_key(&bytes, &[name]), Ok(true), "{name}");
+        }
+        assert_eq!(contains_key(&bytes, &["zz", "text"]), Ok(false));
+        assert_eq!(contains_key(&bytes, &["zz", "x"]), Ok(true));
+        assert_eq!(contains_key(&bytes, &[]), Ok(false));
+    }
+
+    #[test]
+    fn contains_key_matches_whole_names_and_not_values() {
+        let bytes = Doc::new()
+            .with_str("note", "$out")
+            .with_doc("inner", &Doc::new().with_i32("$outer", 1))
+            .encode();
+        assert_eq!(contains_key(&bytes, &["$out"]), Ok(false));
+        assert_eq!(contains_key(&bytes, &["$outer"]), Ok(true));
+    }
+
+    #[test]
+    fn contains_key_refuses_a_malformed_document() {
+        let mut bytes = Doc::new()
+            .with_doc("inner", &Doc::new().with_i32("a", 1))
+            .encode();
+        let cut = bytes.len() - 3;
+        bytes.truncate(cut);
+        assert_eq!(contains_key(&bytes, &["zz"]), Err(Malformed));
+        let mut unknown = Doc::new().with_i32("a", 1).encode();
+        let at = unknown.len() - 1;
+        unknown.splice(at..at, [0x99, b'x', 0]);
+        let total = (unknown.len() as i32).to_le_bytes();
+        unknown[..4].copy_from_slice(&total);
+        assert_eq!(contains_key(&unknown, &["zz"]), Err(Malformed));
     }
 }

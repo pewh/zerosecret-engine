@@ -316,6 +316,9 @@ jobs:
       - run: cargo test --locked -p zs-proto-mongo --test mongo_real -- --test-threads=1 --include-ignored --nocapture
         env:
           ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
+      - run: cargo test --locked -p zs-proto-mongo --test read_only_real -- --nocapture
+        env:
+          ZS_TEST_MONGO_CERTS: ${{ github.workspace }}/target/db-test-certs
       - run: cargo test --locked -p zs-proto-postgres --test read_only_real -- --nocapture
       - name: Redis real tests
         env:

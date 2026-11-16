@@ -1,5 +1,6 @@
 pub mod bson;
 pub mod primary;
+mod read_only;
 pub mod scram;
 pub mod topology;
 pub mod wire;
@@ -17,11 +18,13 @@ use zs_diag::{Component, DiagLog, Event, ServerText};
 
 use bson::Doc;
 use primary::{PrimaryState, must_close};
+pub use read_only::{READ_ONLY_REASON, READ_ONLY_REFUSED, check};
 use scram::Mechanism;
 use topology::{Discovery, Hello, Role};
 use wire::{OpMsg, OpQuery};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
+use zs_protocol::SessionAccess;
 pub use zs_protocol::{AuditRefusal, Materialize};
 
 pub const AUTHENTICATE_REFUSED_REASON: &str = "client authentication commands are refused";
@@ -257,6 +260,20 @@ impl Conn {
         self.emit(event);
     }
 
+    fn command_refused(&self, refusal: &read_only::Refusal) {
+        let mut event = self
+            .event("command_refused")
+            .warn()
+            .code("reason", refusal.reason);
+        if let Some(command) = &refusal.command {
+            event = event.token("command", command);
+        }
+        if let Some(seq) = (self.shared.audit_refusal)("query", READ_ONLY_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.emit(event);
+    }
+
     fn closed(&self, up: u64, down: u64, by: &'static str) {
         self.emit(
             self.event("conn_closed")
@@ -387,6 +404,7 @@ struct Session {
     max_message: usize,
     pinned: Option<String>,
     watch: zs_protocol::SessionWatch,
+    read_only: bool,
 }
 
 struct Found {
@@ -398,11 +416,16 @@ struct Found {
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
     let first = read_first(client, conn).await?;
-    let (password, watch) = match (conn.shared.materialize)() {
+    let (password, watch, read_only) = match (conn.shared.materialize)() {
         Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
+            let read_only = materialized.access() == SessionAccess::ReadOnly;
             let (credential, watch) = materialized.into_parts();
-            (Zeroizing::new(credential.expose().to_vec()), watch)
+            (
+                Zeroizing::new(credential.expose().to_vec()),
+                watch,
+                read_only,
+            )
         }
         Err(denied) => {
             conn.emit(
@@ -438,6 +461,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopp
         max_message: found.hello.max_message,
         pinned: found.pinned,
         watch,
+        read_only,
     })
 }
 
@@ -772,6 +796,7 @@ enum Ending {
     Client,
     Server,
     Refused(&'static str),
+    ReadOnly,
     AuthCommand(i32),
     StepDown(&'static str),
     Broken(&'static str),
@@ -783,7 +808,7 @@ impl Ending {
         match self {
             Ending::Client => "client",
             Ending::Server | Ending::Broken(_) => "upstream",
-            Ending::Refused(_) | Ending::AuthCommand(_) => "refused",
+            Ending::Refused(_) | Ending::ReadOnly | Ending::AuthCommand(_) => "refused",
             Ending::StepDown(_) => "stepdown",
             Ending::Revoked(_) => "revoked",
         }
@@ -796,6 +821,8 @@ struct Relay {
     down: AtomicU64,
     limit: usize,
     pinned: Option<String>,
+    read_only: bool,
+    client: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
 }
 
 impl Relay {
@@ -811,9 +838,28 @@ impl Relay {
             .map(|mut set| set.remove(&response_to))
             .unwrap_or(false)
     }
+
+    async fn reply(&self, frame: &[u8]) -> Result<(), Ending> {
+        let mut client = self.client.lock().await;
+        let sent = async {
+            client.write_all(frame).await?;
+            client.flush().await
+        }
+        .await;
+        if sent.is_err() {
+            return Err(Ending::Client);
+        }
+        self.down.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
-async fn client_to_upstream<R, W>(client: &mut R, upstream: &mut W, relay: &Relay) -> Ending
+async fn client_to_upstream<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    conn: &Conn,
+    relay: &Relay,
+) -> Ending
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -850,6 +896,21 @@ where
         }
         if wire::body_sections(&payload) != Ok(1) {
             return Ending::Refused("malformed");
+        }
+        if relay.read_only
+            && let Err(refusal) = read_only::screen(&payload)
+        {
+            conn.command_refused(&refusal);
+            let unanswered = wire::msg_flags(&payload).is_none_or(|f| f & wire::MORE_TO_COME != 0);
+            if refusal.reason == read_only::MALFORMED || unanswered {
+                return Ending::ReadOnly;
+            }
+            let refused =
+                OpMsg::new(READ_ONLY_REFUSED.doc()).encode(conn.request_id(), header.request_id);
+            if let Err(ending) = relay.reply(&refused).await {
+                return ending;
+            }
+            continue;
         }
         let frame = if topology::is_hello(command) {
             let Ok(mut msg) = OpMsg::parse(&payload) else {
@@ -898,15 +959,9 @@ where
     Ok(())
 }
 
-async fn upstream_to_client<R, W>(
-    upstream: &mut R,
-    client: &mut W,
-    conn: &Conn,
-    relay: &Relay,
-) -> Ending
+async fn upstream_to_client<R>(upstream: &mut R, conn: &Conn, relay: &Relay) -> Ending
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     loop {
         let header = match wire::read_header(upstream).await {
@@ -923,12 +978,14 @@ where
             return Ending::Broken("frame_size");
         }
         if !relay.take(header.response_to) {
+            let mut client = relay.client.lock().await;
             if client.write_all(&header.encode()).await.is_err() {
                 return Ending::Client;
             }
-            if let Err(ending) = copy_exact(upstream, client, header.body_len()).await {
+            if let Err(ending) = copy_exact(upstream, &mut *client, header.body_len()).await {
                 return ending;
             }
+            drop(client);
             relay
                 .down
                 .fetch_add(header.length as u64, Ordering::Relaxed);
@@ -951,7 +1008,7 @@ where
             topology::rewrite_reply(body, &conn.shared.listener_addr);
         }
         let frame = msg.encode(header.request_id, header.response_to);
-        if client.write_all(&frame).await.is_err() {
+        if relay.client.lock().await.write_all(&frame).await.is_err() {
             return Ending::Client;
         }
         relay.down.fetch_add(frame.len() as u64, Ordering::Relaxed);
@@ -980,24 +1037,27 @@ async fn watch_primary(conn: &Conn, pinned: Option<String>) -> &'static str {
 }
 
 async fn relay(client: TcpStream, session: Session, conn: &Conn) {
+    let (mut client_read, client_write) = client.into_split();
     let state = Relay {
         tracked: Mutex::new(HashSet::new()),
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
         limit: session.max_message,
         pinned: session.pinned,
+        read_only: session.read_only,
+        client: tokio::sync::Mutex::new(client_write),
     };
-    let (mut client_read, mut client_write) = client.into_split();
     let (mut upstream_read, mut upstream_write) = tokio::io::split(session.upstream);
     let ending = {
         let forward = async {
-            let ending = client_to_upstream(&mut client_read, &mut upstream_write, &state).await;
+            let ending =
+                client_to_upstream(&mut client_read, &mut upstream_write, conn, &state).await;
             if ending == Ending::Client {
                 let _ = upstream_write.shutdown().await;
             }
             ending
         };
-        let backward = upstream_to_client(&mut upstream_read, &mut client_write, conn, &state);
+        let backward = upstream_to_client(&mut upstream_read, conn, &state);
         let watch = watch_primary(conn, state.pinned.clone());
         tokio::pin!(forward);
         tokio::pin!(backward);
@@ -1027,13 +1087,13 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             let seq = (conn.shared.audit_refusal)("authenticate", AUTHENTICATE_REFUSED_REASON);
             conn.refused("auth_command", seq);
             let refusal = OpMsg::new(AUTH_BROKERED.doc()).encode(conn.request_id(), request_id);
-            let _ = client_write.write_all(&refusal).await;
+            let _ = state.client.lock().await.write_all(&refusal).await;
         }
         Ending::StepDown(trigger) => conn.emit(conn.event("stepdown").code("trigger", trigger)),
         Ending::Revoked(reason) => {
             conn.refused("revoked", (conn.shared.audit_refusal)("connect", reason));
         }
-        Ending::Client | Ending::Server => {}
+        Ending::Client | Ending::Server | Ending::ReadOnly => {}
     }
     conn.closed(
         state.up.load(Ordering::Relaxed),

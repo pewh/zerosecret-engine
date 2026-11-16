@@ -751,16 +751,27 @@ pub async fn listen_gated(
     local
 }
 
-pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
+pub fn granted_with(
+    password: &[u8],
+    access: zs_protocol::SessionAccess,
+) -> zs_protocol::Materialized {
     zs_protocol::Materialized::new(
         zs_credential::Credential::from_bytes(password.to_vec()).unwrap(),
-        zs_protocol::SessionAccess::ReadWrite,
+        access,
         Arc::new(|| Ok(())),
     )
 }
 
+pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
+    granted_with(password, zs_protocol::SessionAccess::ReadWrite)
+}
+
 pub fn materialize(password: &'static str) -> Materialize {
     Arc::new(move || Ok(granted(password.as_bytes())))
+}
+
+pub fn materialize_with(password: &'static str, access: zs_protocol::SessionAccess) -> Materialize {
+    Arc::new(move || Ok(granted_with(password.as_bytes(), access)))
 }
 
 pub fn denied() -> Materialize {
