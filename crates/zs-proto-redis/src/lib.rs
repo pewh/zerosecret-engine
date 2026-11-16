@@ -35,6 +35,8 @@ pub const CREDENTIAL_ECHO_REASON: &str = "credential echo";
 pub const USER_MISMATCH_REASON: &str = "auth user mismatch";
 pub const NON_RESP_REFUSED_REASON: &str = "non-resp command";
 pub const CLUSTER_REDIRECT_REASON: &str = "cluster redirect";
+pub const REFUSAL_BACKLOG_REASON: &str = "read-only refusal backlog";
+pub const REFUSAL_BACKLOG: usize = 16_384;
 
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 const READ_BUFFER: usize = 16 * 1024;
@@ -42,7 +44,6 @@ const AUTH_REPLY_LIMIT: usize = 4096;
 const REFUSAL_DRAIN: Duration = Duration::from_secs(2);
 const LINGER: Duration = Duration::from_secs(2);
 const LINGER_LIMIT: usize = 64 * 1024 * 1024;
-const REPLY_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy)]
 pub struct Reply {
@@ -250,10 +251,10 @@ impl Conn {
 
     fn command_refused(&self, refused: &read_only::Refused, reason: &'static str) {
         let mut event = self.event("command_refused").warn().code("reason", reason);
-        if let Some(command) = &refused.command {
+        if let Some(command) = refused.command {
             event = event.token("command", command);
         }
-        if let Some(subcommand) = &refused.subcommand {
+        if let Some(subcommand) = refused.subcommand {
             event = event.token("subcommand", subcommand);
         }
         if let Some(seq) = (self.shared.audit_refusal)("query", READ_ONLY_REASON) {
@@ -620,6 +621,10 @@ fn refused(reply: Option<Reply>, code: &'static str, reason: &'static str) -> En
     }
 }
 
+fn backlog() -> Ending {
+    refused(None, "refusal_backlog", REFUSAL_BACKLOG_REASON)
+}
+
 #[derive(Clone, Copy)]
 enum Slot {
     Pass,
@@ -627,66 +632,84 @@ enum Slot {
     Replace(Reply),
 }
 
+#[derive(Default)]
+struct Runs {
+    runs: VecDeque<(Slot, u64)>,
+    held: usize,
+}
+
 struct Slots {
-    queue: Mutex<VecDeque<Slot>>,
+    queue: Mutex<Runs>,
     open: AtomicU64,
     ready: Notify,
-    room: Notify,
 }
 
 impl Slots {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(Runs::default()),
             open: AtomicU64::new(0),
             ready: Notify::new(),
-            room: Notify::new(),
         }
     }
 
-    fn queue(&self) -> MutexGuard<'_, VecDeque<Slot>> {
+    fn queue(&self) -> MutexGuard<'_, Runs> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    async fn push(&self, slot: Slot) {
-        loop {
-            {
-                let mut queue = self.queue();
-                if queue.len() < REPLY_SLOTS {
-                    queue.push_back(slot);
-                    self.open.fetch_add(1, Ordering::AcqRel);
-                    break;
+    fn push(&self, slot: Slot) -> bool {
+        {
+            let mut guard = self.queue();
+            let queue = &mut *guard;
+            match (slot, queue.runs.back_mut()) {
+                (Slot::Pass, Some((Slot::Pass, run))) => *run += 1,
+                (Slot::Pass, _) => queue.runs.push_back((slot, 1)),
+                _ if queue.held >= REFUSAL_BACKLOG => return false,
+                _ => {
+                    queue.held += 1;
+                    queue.runs.push_back((slot, 1));
                 }
             }
-            self.room.notified().await;
+            self.open.fetch_add(1, Ordering::AcqRel);
         }
         self.ready.notify_one();
+        true
     }
 
     fn agents(&self, out: &mut Vec<u8>) -> u64 {
         let mut queue = self.queue();
         let mut taken = 0;
-        while let Some(Slot::Agent(reply)) = queue.front().copied() {
-            queue.pop_front();
+        while let Some((Slot::Agent(reply), _)) = queue.runs.front().copied() {
+            queue.runs.pop_front();
+            queue.held -= 1;
             out.extend_from_slice(&reply.frame());
             taken += 1;
-        }
-        if taken > 0 {
-            self.room.notify_one();
         }
         taken
     }
 
     fn reply(&self) -> Option<Slot> {
         self.queue()
+            .runs
             .front()
-            .copied()
+            .map(|(slot, _)| *slot)
             .filter(|slot| !matches!(slot, Slot::Agent(_)))
     }
 
     fn answered(&self) {
-        self.queue().pop_front();
-        self.room.notify_one();
+        let mut queue = self.queue();
+        let Some((slot, run)) = queue.runs.front_mut() else {
+            return;
+        };
+        if matches!(slot, Slot::Pass) && *run > 1 {
+            *run -= 1;
+            return;
+        }
+        let held = !matches!(slot, Slot::Pass);
+        queue.runs.pop_front();
+        if held {
+            queue.held -= 1;
+        }
     }
 
     fn settle(&self, written: u64) {
@@ -731,8 +754,10 @@ where
                 Verdict::Forward => {}
                 Verdict::Abort => slot = Slot::Replace(EXEC_ABORTED),
                 Verdict::Refuse => {
+                    if !slots.push(Slot::Agent(READ_ONLY_REFUSED)) {
+                        return backlog();
+                    }
                     conn.command_refused(&read_only::refused(&args), read_only::NOT_ALLOWED);
-                    slots.push(Slot::Agent(READ_ONLY_REFUSED)).await;
                     continue;
                 }
                 Verdict::Close => {
@@ -750,8 +775,10 @@ where
         ) {
             return refused(Some(USER_MISMATCH), "user_mismatch", USER_MISMATCH_REASON);
         }
-        if let Some(slots) = slots {
-            slots.push(slot).await;
+        if let Some(slots) = slots
+            && !slots.push(slot)
+        {
+            return backlog();
         }
         let frame = command.encode();
         let sent = async {

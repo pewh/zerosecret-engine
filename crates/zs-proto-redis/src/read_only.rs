@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use crate::Reply;
-use crate::read_only_commands::{COMMANDS, CONTAINERS, SUBCOMMANDS};
+use crate::read_only_commands::{COMMANDS, CONTAINERS, NAMES, SUBCOMMAND_NAMES, SUBCOMMANDS};
 
 pub const READ_ONLY_REASON: &str = "read-only";
 
@@ -19,9 +19,20 @@ pub(crate) const NOT_ALLOWED: &str = "command";
 const BY_RULE: [&str; 9] = [
     "auth", "discard", "exec", "hello", "multi", "ping", "quit", "reset", "select",
 ];
-const REFUSED_WHOLE: [&str; 8] = [
-    "acl", "config", "debug", "eval", "evalsha", "fcall", "module", "script",
+const REFUSED_WHOLE: [&str; 11] = [
+    "acl",
+    "config",
+    "debug",
+    "eval",
+    "eval_ro",
+    "evalsha",
+    "evalsha_ro",
+    "fcall",
+    "fcall_ro",
+    "module",
+    "script",
 ];
+const OTHER: &str = "other";
 const CLIENT_SUBCOMMANDS: [&str; 4] = ["getname", "id", "info", "setname"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +78,8 @@ impl MultiState {
 }
 
 pub(crate) struct Refused {
-    pub(crate) command: Option<String>,
-    pub(crate) subcommand: Option<String>,
+    pub(crate) command: Option<&'static str>,
+    pub(crate) subcommand: Option<&'static str>,
 }
 
 pub fn admit(args: &[&[u8]]) -> bool {
@@ -106,12 +117,20 @@ pub(crate) fn refused(args: &[&[u8]]) -> Refused {
             subcommand: None,
         };
     };
+    let subcommand = rest.first().filter(|_| is_container(name)).map(|sub| {
+        SUBCOMMAND_NAMES
+            .binary_search_by(|(container, known)| {
+                order(container, name).then_with(|| order(known, sub))
+            })
+            .map_or(OTHER, |at| SUBCOMMAND_NAMES[at].1)
+    });
     Refused {
-        command: Some(lowercase(name)),
-        subcommand: rest
-            .first()
-            .filter(|_| is_container(name))
-            .map(|sub| lowercase(sub)),
+        command: Some(
+            NAMES
+                .binary_search_by(|known| order(known, name))
+                .map_or(OTHER, |at| NAMES[at]),
+        ),
+        subcommand,
     }
 }
 
@@ -127,10 +146,6 @@ fn is_container(name: &[u8]) -> bool {
 
 fn order(entry: &str, arg: &[u8]) -> Ordering {
     entry.bytes().cmp(arg.iter().map(u8::to_ascii_lowercase))
-}
-
-fn lowercase(arg: &[u8]) -> String {
-    String::from_utf8_lossy(arg).to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -181,9 +196,6 @@ mod tests {
             "STRLEN k",
             "GEORADIUS_RO g 0 0 1 km",
             "BITFIELD_RO b GET u8 0",
-            "EVAL_RO return 0",
-            "evalsha_ro abc 0",
-            "Fcall_Ro f 0",
         ]);
     }
 
@@ -239,6 +251,12 @@ mod tests {
     #[test]
     fn some_commands_are_refused_with_every_subcommand() {
         assert_refused(&[
+            "EVAL_RO return 0",
+            "eval_ro return 0",
+            "EVALSHA_RO abc 0",
+            "evalsha_ro abc 0",
+            "FCALL_RO f 0",
+            "Fcall_Ro f 0",
             "CONFIG GET maxmemory",
             "config set x y",
             "CONFIG",
@@ -359,10 +377,18 @@ mod tests {
         assert!(COMMANDS.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(SUBCOMMANDS.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(CONTAINERS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(NAMES.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(SUBCOMMAND_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
         let names = COMMANDS
             .iter()
             .chain(CONTAINERS.iter())
-            .chain(SUBCOMMANDS.iter().flat_map(|(command, sub)| [command, sub]));
+            .chain(NAMES.iter())
+            .chain(SUBCOMMANDS.iter().flat_map(|(command, sub)| [command, sub]))
+            .chain(
+                SUBCOMMAND_NAMES
+                    .iter()
+                    .flat_map(|(command, sub)| [command, sub]),
+            );
         for name in names {
             assert_eq!(*name, name.to_ascii_lowercase());
             assert!(!name.contains('|'));
@@ -371,13 +397,28 @@ mod tests {
             assert!(CONTAINERS.contains(&container));
         }
         assert!(!COMMANDS.iter().any(|name| CONTAINERS.contains(name)));
+        for name in COMMANDS.iter().chain(CONTAINERS.iter()) {
+            assert!(NAMES.binary_search(name).is_ok(), "{name}");
+        }
+        for pair in SUBCOMMANDS {
+            assert!(SUBCOMMAND_NAMES.binary_search(&pair).is_ok(), "{pair:?}");
+        }
+        for (container, _) in SUBCOMMAND_NAMES {
+            assert!(CONTAINERS.contains(&container), "{container}");
+        }
     }
 
     #[test]
     fn the_production_table_is_pinned() {
         assert_eq!(
-            (COMMANDS.len(), SUBCOMMANDS.len(), CONTAINERS.len()),
-            (84, 8, 15)
+            (
+                COMMANDS.len(),
+                SUBCOMMANDS.len(),
+                CONTAINERS.len(),
+                NAMES.len(),
+                SUBCOMMAND_NAMES.len()
+            ),
+            (81, 8, 15, 250, 129)
         );
         let mut hash = Sha256::new();
         for name in COMMANDS {
@@ -390,8 +431,14 @@ mod tests {
             hash.update(sub);
             hash.update(b"\n");
         }
-        for name in CONTAINERS {
+        for name in CONTAINERS.iter().chain(NAMES.iter()) {
             hash.update(name);
+            hash.update(b"\n");
+        }
+        for (container, sub) in SUBCOMMAND_NAMES {
+            hash.update(container);
+            hash.update(b"|");
+            hash.update(sub);
             hash.update(b"\n");
         }
         let digest: String = hash
@@ -401,8 +448,23 @@ mod tests {
             .collect();
         assert_eq!(
             digest,
-            "693d513097f5c8e335e2c1726ede9971faa107143e4206b6914d8630fed51948"
+            "9f63b6078f43f2d84de7260d1b62d29895b237d1715a46058bd835bbc17604d6"
         );
+    }
+
+    #[test]
+    fn script_commands_are_not_in_the_table() {
+        for name in [
+            "eval",
+            "eval_ro",
+            "evalsha",
+            "evalsha_ro",
+            "fcall",
+            "fcall_ro",
+        ] {
+            assert!(COMMANDS.binary_search(&name).is_err(), "{name}");
+            assert!(NAMES.binary_search(&name).is_ok(), "{name}");
+        }
     }
 
     #[test]
@@ -699,24 +761,34 @@ mod tests {
 
     #[test]
     fn a_refusal_names_the_command_and_a_container_subcommand_only() {
-        let set = refused(&words("SET zs-key-marker zs-value-marker"));
-        assert_eq!(set.command.as_deref(), Some("set"));
-        assert_eq!(set.subcommand, None);
-        let kill = refused(&words("CLIENT Kill ID 7"));
-        assert_eq!(kill.command.as_deref(), Some("client"));
-        assert_eq!(kill.subcommand.as_deref(), Some("kill"));
-        let config = refused(&words("config SET maxmemory 1"));
-        assert_eq!(config.command.as_deref(), Some("config"));
-        assert_eq!(config.subcommand.as_deref(), Some("set"));
-        let module = refused(&words("JSON.SET zs-key-marker $ {}"));
-        assert_eq!(module.command.as_deref(), Some("json.set"));
-        assert_eq!(module.subcommand, None);
-        let bare = refused(&words("OBJECT"));
-        assert_eq!(bare.command.as_deref(), Some("object"));
-        assert_eq!(bare.subcommand, None);
-        let empty = refused(&[]);
-        assert_eq!(empty.command, None);
-        assert_eq!(empty.subcommand, None);
+        let named = |args: &[&[u8]]| {
+            let refused = refused(args);
+            [refused.command, refused.subcommand]
+                .into_iter()
+                .flatten()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (command, expected) in [
+            ("SET zs-key-marker zs-value-marker", "set"),
+            ("CLIENT Kill ID 7", "client kill"),
+            ("config SET maxmemory 1", "config set"),
+            ("EVAL_RO return 0", "eval_ro"),
+            ("OBJECT", "object"),
+            ("JSON.SET zs-key-marker $ {}", "other"),
+            ("zs-ro-command-marker x", "other"),
+            ("XINFO zs-ro-argument-marker", "xinfo other"),
+            ("OBJECT user:1234", "object other"),
+            ("CLIENT a/b", "client other"),
+            ("CONFIG k-1 x", "config other"),
+            ("XINFO stream|x", "xinfo other"),
+            ("XINFO consumers", "xinfo consumers"),
+            ("SET kill", "set"),
+        ] {
+            assert_eq!(named(&words(command)), expected, "{command}");
+        }
+        assert_eq!(named(&[]), "");
         assert!(READ_ONLY_REFUSED.frame() == b"-NOPERM read-only resource\r\n");
         assert!(
             EXEC_ABORTED.frame()

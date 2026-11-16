@@ -272,64 +272,81 @@ pub async fn start(script: Script) -> Fake {
     Fake { addr, seen }
 }
 
+enum Out {
+    Bytes(Vec<u8>),
+    Pause(Duration),
+}
+
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     script: Arc<Script>,
     seen: Arc<Mutex<Seen>>,
 ) -> std::io::Result<()> {
-    loop {
-        let Some(command) = resp::read_command(&mut stream).await.ok().flatten() else {
-            return Ok(());
-        };
-        let args: Vec<Vec<u8>> = command.args().iter().map(|arg| arg.to_vec()).collect();
-        let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
-        {
-            let mut seen = seen.lock().unwrap();
-            seen.frames.push(args.clone());
-            seen.names.push(name.clone());
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let (out, mut queued) = tokio::sync::mpsc::unbounded_channel();
+    let read = async move {
+        loop {
+            let Some(command) = resp::read_command(&mut reader).await.ok().flatten() else {
+                return;
+            };
+            let args: Vec<Vec<u8>> = command.args().iter().map(|arg| arg.to_vec()).collect();
+            let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+            {
+                let mut seen = seen.lock().unwrap();
+                seen.frames.push(args.clone());
+                seen.names.push(name.clone());
+            }
+            if script.silent {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                return;
+            }
+            if name == "AUTH" {
+                let _ = out.send(Out::Bytes(auth_reply(&script, &args, &seen)));
+                continue;
+            }
+            if name == "HELLO" {
+                let _ = out.send(Out::Bytes(hello_reply(&script, &args, &seen)));
+                continue;
+            }
+            let _ = out.send(Out::Pause(script.reply_delay));
+            if let Some(echo) = &script.echo {
+                queue_echo(&out, echo);
+                continue;
+            }
+            let reply = script
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| script.default_reply.clone());
+            let _ = out.send(Out::Bytes(reply));
         }
-        if script.silent {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            return Ok(());
+    };
+    let write = async move {
+        while let Some(next) = queued.recv().await {
+            match next {
+                Out::Pause(delay) => tokio::time::sleep(delay).await,
+                Out::Bytes(bytes) => {
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await?;
+                }
+            }
         }
-        if name == "AUTH" {
-            stream.write_all(&auth_reply(&script, &args, &seen)).await?;
-            stream.flush().await?;
-            continue;
-        }
-        if name == "HELLO" {
-            stream
-                .write_all(&hello_reply(&script, &args, &seen))
-                .await?;
-            stream.flush().await?;
-            continue;
-        }
-        tokio::time::sleep(script.reply_delay).await;
-        if let Some(echo) = &script.echo {
-            write_echo(&mut stream, echo).await?;
-            continue;
-        }
-        let reply = script
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| script.default_reply.clone());
-        stream.write_all(&reply).await?;
-        stream.flush().await?;
-    }
+        Ok(())
+    };
+    let ((), written) = tokio::join!(read, write);
+    written
 }
 
-async fn write_echo<S: AsyncWrite + Unpin>(stream: &mut S, echo: &Echo) -> std::io::Result<()> {
+fn queue_echo(out: &tokio::sync::mpsc::UnboundedSender<Out>, echo: &Echo) {
     if let Some(cut) = echo.split {
-        stream.write_all(&echo.reply[..cut]).await?;
-        stream.flush().await?;
-        tokio::time::sleep(echo.delay).await;
-        stream.write_all(&echo.reply[cut..]).await?;
+        let _ = out.send(Out::Bytes(echo.reply[..cut].to_vec()));
+        let _ = out.send(Out::Pause(echo.delay));
+        let _ = out.send(Out::Bytes(echo.reply[cut..].to_vec()));
     } else {
-        stream.write_all(&echo.reply).await?;
+        let _ = out.send(Out::Bytes(echo.reply.clone()));
     }
-    stream.flush().await
 }
 
 fn auth_reply(script: &Script, args: &[Vec<u8>], seen: &Mutex<Seen>) -> Vec<u8> {

@@ -123,7 +123,9 @@ async fn get_works_and_set_gets_noperm() {
         "positive control: a read works"
     );
     assert_eq!(
-        client.command(&[b"SET", key.as_bytes(), b"after"]).await,
+        client
+            .command(&[b"SET", key.as_bytes(), b"after", b"EX", b"300"])
+            .await,
         noperm()
     );
     assert_eq!(
@@ -140,7 +142,9 @@ async fn get_works_and_set_gets_noperm() {
 
     let (mut writer, recorded) = session(SessionAccess::ReadWrite).await;
     assert_eq!(
-        writer.command(&[b"SET", key.as_bytes(), b"after"]).await,
+        writer
+            .command(&[b"SET", key.as_bytes(), b"after", b"EX", b"300"])
+            .await,
         fake::OK,
         "negative control: the same SET succeeds read-write"
     );
@@ -154,61 +158,52 @@ async fn get_works_and_set_gets_noperm() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a password-protected Redis: set ZS_TEST_REDIS_ADDR and ZS_TEST_REDIS_PASSWORD"]
-async fn eval_refused_eval_ro_admitted() {
+async fn eval_and_eval_ro_are_refused() {
     let mut setup = setup().await;
     let key = key("eval");
     put(&mut setup, &key, "before").await;
     let read = b"return redis.call('GET', KEYS[1])";
-    let write = b"return redis.call('SET', KEYS[1], 'after')";
+    let write = b"return redis.call('SET', KEYS[1], 'after', 'EX', 300)";
+    let slowlog = b"return redis.call('SLOWLOG', 'LEN')";
+    let sha = b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
 
     let (mut client, recorded) = session(SessionAccess::ReadOnly).await;
     assert_eq!(
-        client
-            .command(&[b"EVAL_RO", read, b"1", key.as_bytes()])
-            .await,
+        client.command(&[b"GET", key.as_bytes()]).await,
         bulk("before"),
-        "positive control: EVAL_RO reads"
+        "positive control: a read works"
     );
-    assert_eq!(
-        client.command(&[b"EVAL", b"return 1", b"0"]).await,
-        noperm()
-    );
-    assert_eq!(
-        client
-            .command(&[b"EVAL", write, b"1", key.as_bytes()])
-            .await,
-        noperm()
-    );
-    assert_eq!(
-        client
-            .command(&[
-                b"EVALSHA",
-                b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db",
-                b"0"
-            ])
-            .await,
-        noperm()
-    );
-    assert_eq!(
-        client.command(&[b"FCALL", b"zs_ro_none", b"0"]).await,
-        noperm()
-    );
-    let refused = client
-        .command(&[b"EVAL_RO", write, b"1", key.as_bytes()])
-        .await;
-    assert!(
-        refused.starts_with(b"-ERR Write commands are not allowed from read-only scripts"),
-        "the server refuses a write inside EVAL_RO: {}",
-        text(&refused)
-    );
+    for refused in [
+        &[&b"EVAL"[..], b"return 1", b"0"][..],
+        &[&b"EVAL"[..], write, b"1", key.as_bytes()][..],
+        &[&b"EVALSHA"[..], sha, b"0"][..],
+        &[&b"FCALL"[..], b"zs_ro_none", b"0"][..],
+        &[&b"EVAL_RO"[..], read, b"1", key.as_bytes()][..],
+        &[&b"EVAL_RO"[..], slowlog, b"0"][..],
+        &[&b"eval_ro"[..], write, b"1", key.as_bytes()][..],
+        &[&b"EVALSHA_RO"[..], sha, b"0"][..],
+        &[&b"FCALL_RO"[..], b"zs_ro_none", b"0"][..],
+    ] {
+        assert_eq!(
+            client.command(refused).await,
+            noperm(),
+            "{}",
+            text(refused[0])
+        );
+    }
     assert_eq!(
         setup.command(&[b"GET", key.as_bytes()]).await,
         bulk("before"),
         "the key keeps its old value"
     );
-    assert_eq!(refusals(&recorded), vec![("query", READ_ONLY_REASON); 4]);
+    assert_eq!(refusals(&recorded), vec![("query", READ_ONLY_REASON); 9]);
 
-    let (mut writer, _) = session(SessionAccess::ReadWrite).await;
+    let (mut writer, recorded) = session(SessionAccess::ReadWrite).await;
+    assert_eq!(
+        writer.command(&[b"EVAL_RO", slowlog, b"0"]).await.first(),
+        Some(&b':'),
+        "negative control: EVAL_RO reaches the server read-write"
+    );
     assert_eq!(
         writer
             .command(&[b"EVAL", write, b"1", key.as_bytes()])
@@ -220,7 +215,87 @@ async fn eval_refused_eval_ro_admitted() {
         setup.command(&[b"GET", key.as_bytes()]).await,
         bulk("after")
     );
+    assert!(refusals(&recorded).is_empty());
     remove(&mut setup, &[&key]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a password-protected Redis: set ZS_TEST_REDIS_ADDR and ZS_TEST_REDIS_PASSWORD"]
+async fn write_forms_of_admitted_reads_are_refused_by_the_server() {
+    let mut setup = setup().await;
+    let key = key("forms");
+    let geo = key.replace("forms", "forms-geo");
+    let stored = key.replace("forms", "forms-stored");
+    put(&mut setup, &key, "before").await;
+    assert_eq!(
+        setup
+            .command(&words(&format!("GEOADD {geo} 13.36 38.11 p")))
+            .await,
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(
+        setup.command(&words(&format!("EXPIRE {geo} 300"))).await,
+        b":1\r\n".to_vec()
+    );
+
+    let (mut client, recorded) = session(SessionAccess::ReadOnly).await;
+    assert_eq!(
+        client
+            .command(&words(&format!("GEORADIUS_RO {geo} 13.36 38.11 10 km")))
+            .await,
+        b"*1\r\n$1\r\np\r\n".to_vec(),
+        "positive control: the read form works"
+    );
+    assert_eq!(
+        client
+            .command(&words(&format!("BITFIELD_RO {key} GET u8 0")))
+            .await
+            .first(),
+        Some(&b'*'),
+        "positive control: BITFIELD_RO GET works"
+    );
+    for (form, error) in [
+        (
+            format!("GEORADIUS_RO {geo} 13.36 38.11 10 km STORE {stored}"),
+            "-ERR syntax error",
+        ),
+        (
+            format!("GEORADIUS_RO {geo} 13.36 38.11 10 km STOREDIST {stored}"),
+            "-ERR syntax error",
+        ),
+        (
+            format!("GEORADIUSBYMEMBER_RO {geo} p 10 km STORE {stored}"),
+            "-ERR syntax error",
+        ),
+        (
+            format!("GEOSEARCH {geo} FROMMEMBER p BYRADIUS 10 km STORE {stored}"),
+            "-ERR syntax error",
+        ),
+        (
+            format!("BITFIELD_RO {key} SET u8 0 1"),
+            "-ERR BITFIELD_RO only supports the GET subcommand",
+        ),
+    ] {
+        let reply = client.command(&words(&form)).await;
+        assert!(
+            reply.starts_with(error.as_bytes()),
+            "{form}: {}",
+            text(&reply)
+        );
+    }
+    assert!(
+        refusals(&recorded).is_empty(),
+        "the server, not the agent, refused"
+    );
+    assert_eq!(
+        setup.command(&words(&format!("EXISTS {stored}"))).await,
+        b":0\r\n".to_vec()
+    );
+    assert_eq!(
+        setup.command(&[b"GET", key.as_bytes()]).await,
+        bulk("before")
+    );
+    remove(&mut setup, &[&key, &geo]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

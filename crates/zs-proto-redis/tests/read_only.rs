@@ -11,11 +11,12 @@ use zs_diag::DiagLog;
 use zs_proto_redis::resp::Command;
 use zs_proto_redis::{
     CREDENTIAL_ECHO_REASON, EXEC_ABORTED, NON_RESP, NON_RESP_REFUSED_REASON, READ_ONLY_REASON,
-    READ_ONLY_REFUSED,
+    READ_ONLY_REFUSED, REFUSAL_BACKLOG, REFUSAL_BACKLOG_REASON,
 };
 use zs_protocol::SessionAccess;
 
 const MARKER: &[u8] = b"zs-ro-argument-marker";
+const COMMAND_MARKER: &[u8] = b"zs-ro-command-marker";
 const PUSH: &[u8] = b">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nx\r\n";
 const ECHOED: &str = "-NOPERM read-only";
 
@@ -439,27 +440,52 @@ async fn a_refusal_is_audited_and_logged_with_the_command_name_only() {
     for command in [
         &[&b"SET"[..], MARKER, MARKER][..],
         &[&b"CLIENT"[..], b"Kill", b"ID", MARKER][..],
+        &[&b"CONFIG"[..], b"SET", MARKER, MARKER][..],
         &[&b"JSON.SET"[..], MARKER, b"$", MARKER][..],
+        &[&b"XINFO"[..], MARKER][..],
+        &[COMMAND_MARKER, MARKER][..],
     ] {
         assert_eq!(client.command(command).await, noperm());
     }
     assert_eq!(client.command(&[b"GET", b"k"]).await, fake::OK);
     assert!(!rig.fake.saw_bytes(MARKER));
-    assert_eq!(rig.refusals(), read_only_refusals(3));
+    assert_eq!(rig.refusals(), read_only_refusals(6));
 
     let (text, events) = rig.log().await;
     let refused: Vec<&serde_json::Value> = events
         .iter()
         .filter(|event| event["event"] == "command_refused")
         .collect();
-    assert_eq!(refused.len(), 3, "{text}");
+    assert_eq!(refused.len(), 6, "{text}");
     let commands: Vec<&serde_json::Value> = refused
         .iter()
         .map(|event| &event["fields"]["command"])
         .collect();
-    assert_eq!(commands, ["set", "client", "json.set"], "{text}");
-    assert_eq!(refused[1]["fields"]["subcommand"], "kill", "{text}");
-    assert!(refused[0]["fields"].get("subcommand").is_none(), "{text}");
+    assert_eq!(
+        commands,
+        ["set", "client", "config", "other", "xinfo", "other"],
+        "{text}"
+    );
+    let subcommands: Vec<Option<&serde_json::Value>> = refused
+        .iter()
+        .map(|event| event["fields"].get("subcommand"))
+        .collect();
+    assert_eq!(
+        subcommands,
+        [
+            None,
+            Some(&"kill".into()),
+            Some(&"set".into()),
+            None,
+            Some(&"other".into()),
+            None
+        ],
+        "{text}"
+    );
+    assert!(
+        !text.contains(std::str::from_utf8(COMMAND_MARKER).unwrap()),
+        "an unknown command name reached the diag log"
+    );
     assert!(
         refused.iter().all(|event| event["audit_seq"] == 7),
         "{text}"
@@ -497,4 +523,104 @@ async fn a_read_write_session_forwards_writes_unchanged() {
     expected.push(args(&[b"PING"]));
     assert_eq!(rig.fake.commands(), expected);
     assert!(rig.refusals().is_empty());
+}
+
+fn continues(stream: &[u8], pattern: &[u8], offset: usize) -> bool {
+    let mut at = offset % pattern.len();
+    let mut rest = stream;
+    while !rest.is_empty() {
+        let take = rest.len().min(pattern.len() - at);
+        if rest[..take] != pattern[at..at + take] {
+            return false;
+        }
+        rest = &rest[take..];
+        at = 0;
+    }
+    true
+}
+
+async fn send_everything_then_read(access: SessionAccess) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let reply = bulk(&"v".repeat(4096));
+    let rig = Rig::start(Script::new().with_default_reply(reply.clone()), access).await;
+    let total = 50_000;
+    let key = "k".repeat(64);
+    let write: Vec<u8> = (0..total)
+        .flat_map(|_| frame(&[b"GET", key.as_bytes()]))
+        .collect();
+    let mut client = rig.client().await;
+    let expected = total * reply.len();
+    let finished = tokio::time::timeout(Duration::from_secs(180), async {
+        client.stream.write_all(&write).await.unwrap();
+        let mut received = 0;
+        let mut buffer = vec![0u8; 256 * 1024];
+        while received < expected {
+            let read = client.stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the agent closed the session");
+            assert!(
+                continues(&buffer[..read], &reply, received),
+                "a reply left its position"
+            );
+            received += read;
+        }
+        received
+    })
+    .await;
+    assert_eq!(
+        finished.ok(),
+        Some(expected),
+        "the session stalled on a pipeline written in full before the first read"
+    );
+    assert_eq!(rig.fake.names().len(), 1 + total);
+    assert!(rig.refusals().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_pipeline_written_in_full_before_the_first_read_completes() {
+    send_everything_then_read(SessionAccess::ReadOnly).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_pipeline_written_in_full_completes_read_write_too() {
+    send_everything_then_read(SessionAccess::ReadWrite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_beyond_the_backlog_bound_close_the_session() {
+    let script = Script::new()
+        .with_reply_delay(Duration::from_secs(1))
+        .with_reply(bulk("a"));
+    let rig = Rig::start(script, SessionAccess::ReadOnly).await;
+    let mut client = rig.client().await;
+    let mut write = frame(&[b"GET", b"a"]);
+    for _ in 0..=REFUSAL_BACKLOG {
+        write.extend_from_slice(&frame(&[b"SET", b"k", MARKER]));
+    }
+    write.extend_from_slice(&frame(&[b"GET", b"c"]));
+    client.send(&write).await.unwrap();
+
+    let mut expected = bulk("a");
+    for _ in 0..REFUSAL_BACKLOG {
+        expected.extend_from_slice(&noperm());
+    }
+    let received = client.read_to_end().await;
+    assert!(
+        received == expected,
+        "received {} bytes, expected {}",
+        received.len(),
+        expected.len()
+    );
+    assert!(client.closed().await);
+    assert_eq!(rig.fake.commands(), vec![args(&[b"GET", b"a"])]);
+    let refusals = rig.refusals();
+    assert_eq!(refusals.len(), REFUSAL_BACKLOG + 1);
+    assert!(
+        refusals[..REFUSAL_BACKLOG]
+            .iter()
+            .all(|refusal| *refusal == ("query", READ_ONLY_REASON))
+    );
+    assert_eq!(
+        refusals[REFUSAL_BACKLOG],
+        ("connect", REFUSAL_BACKLOG_REASON)
+    );
 }
