@@ -343,3 +343,83 @@ fn protocol_case_and_near_misses_are_classified_by_one_allowlist() {
         assert_eq!(verdict_for(&out, name), verdict, "{line:?}");
     }
 }
+
+#[test]
+fn resources_prints_read_only_guardrail_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let signing = zs_grant::ControlSigningKey::generate("test-k1");
+    let verifying_hex: String = signing
+        .verifying_key_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let grant = |resource: &str, access: zs_policy::Access| {
+        let host = format!("{resource}.internal");
+        let connection = common::default_connection(&host, "postgres");
+        let version = match access {
+            zs_policy::Access::ReadOnly => zs_grant::GRANT_VERSION_ACCESS,
+            zs_policy::Access::ReadWrite => zs_grant::GRANT_VERSION,
+        };
+        serde_json::to_string(
+            &signing
+                .sign(zs_grant::Grant {
+                    subject: "alice".into(),
+                    workload: "default".into(),
+                    resource: resource.into(),
+                    host,
+                    protocol: "postgres".into(),
+                    source: zs_policy::CredentialSource::file(format!("vault:kv/{resource}")),
+                    operations: vec!["connect".into()],
+                    environment: "development".into(),
+                    expires_at_ms: u64::MAX,
+                    grant_id: format!("g-{resource}"),
+                    materialization: zs_policy::Materialization::Retrieve,
+                    upstream_host: connection.upstream_host,
+                    upstream_port: connection.upstream_port,
+                    upstream_tls: connection.upstream_tls,
+                    local_endpoint: connection.local_endpoint,
+                    access,
+                    version,
+                })
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    std::fs::write(
+        dir.path().join("zs-policy.json"),
+        format!(
+            r#"{{"bindings":[
+                {{"resource":"reporting-db","host":"reporting-db.internal","protocol":"postgres","upstream_host":"127.0.0.1","upstream_port":5432}},
+                {{"resource":"orders-db","host":"orders-db.internal","protocol":"postgres","upstream_host":"127.0.0.1","upstream_port":5432}}
+            ],
+            "signing_keys":[{{"key_id":"test-k1","verifying_key_hex":"{verifying_hex}"}}],
+            "grants":[{}, {}]}}"#,
+            grant("reporting-db", zs_policy::Access::ReadOnly),
+            grant("orders-db", zs_policy::Access::ReadWrite),
+        ),
+    )
+    .unwrap();
+
+    let (code, out) = zs(dir.path(), &["resources"]);
+
+    assert_eq!(code, 0, "{out}");
+    let row = |name: &str| -> Vec<&str> {
+        out.lines()
+            .find(|l| l.starts_with(&format!("{name}\t")))
+            .unwrap_or_else(|| panic!("no {name} line in:\n{out}"))
+            .split('\t')
+            .collect()
+    };
+    let read_only = row("reporting-db");
+    let read_write = row("orders-db");
+    assert_eq!(read_only.len(), 7, "{read_only:?}");
+    assert_eq!(read_only[5], "strict", "{read_only:?}");
+    assert_eq!(read_only[6], "read-only (guardrail)", "{read_only:?}");
+    assert_eq!(read_write.len(), 6, "{read_write:?}");
+    assert_eq!(read_write[5], "strict", "{read_write:?}");
+    assert_eq!(
+        out.matches("read-only (guardrail)").count(),
+        1,
+        "only the read-only row carries the label:\n{out}"
+    );
+}

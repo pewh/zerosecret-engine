@@ -540,24 +540,35 @@ fn resources(args: &Args) -> i32 {
     };
     let control_policy = run::control_policy(args);
     for binding in &file.bindings {
-        let mode = file
+        let cached = file
             .grants
             .iter()
-            .find(|g| g.grant.resource == binding.resource)
-            .map(|g| g.grant.materialization.clone());
+            .find(|g| g.grant.resource == binding.resource);
+        let mode = cached.map(|g| g.grant.materialization.clone());
         let materialization = match &mode {
             Some(zs_policy::Materialization::Retrieve) => "retrieve",
             Some(zs_policy::Materialization::Exchange) => "exchange",
             None => "unknown (no cached grant)",
         };
+        let read_only = cached.is_some_and(|g| g.grant.access == zs_policy::Access::ReadOnly)
+            || control_policy
+                .as_ref()
+                .and_then(|p| p.resources.iter().find(|r| r.name == binding.resource))
+                .is_some_and(|r| r.access == zs_policy::Access::ReadOnly);
+        let guardrail = if read_only {
+            "\tread-only (guardrail)"
+        } else {
+            ""
+        };
         stdout_line!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}{}",
             binding.resource,
             binding.host,
             binding.protocol,
             interception_layer(binding),
             materialization,
             strict_label(binding, mode.is_some()),
+            guardrail,
         );
         stdout_line!(
             "{}",
