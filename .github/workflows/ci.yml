@@ -333,6 +333,7 @@ jobs:
           set -euo pipefail
           docker compose --profile redis up -d --wait redis redis-open redis-tls
           cargo test --locked -p zs-proto-redis --test redis_real -- --test-threads=1 --include-ignored --nocapture
+          cargo test --locked -p zs-proto-redis --test read_only_real -- --test-threads=1 --include-ignored --nocapture
       - name: PostgreSQL real tests on a private Secret Service
         run: |
           dbus-run-session -- bash -c '

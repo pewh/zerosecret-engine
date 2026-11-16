@@ -1,20 +1,28 @@
 pub mod guard;
+mod read_only;
+mod read_only_commands;
 pub mod reply;
 pub mod resp;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event};
+use zs_protocol::SessionAccess;
 
 use guard::EchoGuard;
 use resp::{Command, Refusal};
 
+pub use read_only::{
+    EXEC_ABORTED, MultiState, READ_ONLY_REASON, READ_ONLY_REFUSED, Verdict, admit,
+};
 pub use zs_protocol::{AuditRefusal, Materialize};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
@@ -34,6 +42,7 @@ const AUTH_REPLY_LIMIT: usize = 4096;
 const REFUSAL_DRAIN: Duration = Duration::from_secs(2);
 const LINGER: Duration = Duration::from_secs(2);
 const LINGER_LIMIT: usize = 64 * 1024 * 1024;
+const REPLY_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy)]
 pub struct Reply {
@@ -239,6 +248,20 @@ impl Conn {
         self.emit(event);
     }
 
+    fn command_refused(&self, refused: &read_only::Refused, reason: &'static str) {
+        let mut event = self.event("command_refused").warn().code("reason", reason);
+        if let Some(command) = &refused.command {
+            event = event.token("command", command);
+        }
+        if let Some(subcommand) = &refused.subcommand {
+            event = event.token("subcommand", subcommand);
+        }
+        if let Some(seq) = (self.shared.audit_refusal)("query", READ_ONLY_REASON) {
+            event = event.audit_seq(seq);
+        }
+        self.emit(event);
+    }
+
     fn closed(&self, up: u64, down: u64, by: &'static str) {
         self.emit(
             self.event("conn_closed")
@@ -320,15 +343,22 @@ struct Session {
     credential: Zeroizing<Vec<u8>>,
     guard: EchoGuard,
     watch: zs_protocol::SessionWatch,
+    read_only: bool,
 }
 
 async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
     let materialize = conn.shared.materialize.clone();
-    let (credential, watch) = match tokio::task::spawn_blocking(move || materialize()).await {
+    let materialized = tokio::task::spawn_blocking(move || materialize()).await;
+    let (credential, watch, read_only) = match materialized {
         Ok(Ok(materialized)) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
+            let read_only = materialized.access() == SessionAccess::ReadOnly;
             let (credential, watch) = materialized.into_parts();
-            (Zeroizing::new(credential.expose().to_vec()), watch)
+            (
+                Zeroizing::new(credential.expose().to_vec()),
+                watch,
+                read_only,
+            )
         }
         Ok(Err(denied)) => {
             conn.emit(
@@ -410,6 +440,7 @@ async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopp
         credential,
         guard,
         watch,
+        read_only,
     })
 }
 
@@ -561,6 +592,7 @@ enum Ending {
         code: &'static str,
         reason: &'static str,
     },
+    ReadOnly,
     Echo,
     Redirect,
     Broken(&'static str),
@@ -572,7 +604,7 @@ impl Ending {
         match self {
             Ending::Client => "client",
             Ending::Server | Ending::Broken(_) => "upstream",
-            Ending::Refused { .. } => "refused",
+            Ending::Refused { .. } | Ending::ReadOnly => "refused",
             Ending::Echo => "echo",
             Ending::Redirect => "redirect",
             Ending::Revoked(_) => "revoked",
@@ -588,18 +620,99 @@ fn refused(reply: Option<Reply>, code: &'static str, reason: &'static str) -> En
     }
 }
 
+#[derive(Clone, Copy)]
+enum Slot {
+    Pass,
+    Agent(Reply),
+    Replace(Reply),
+}
+
+struct Slots {
+    queue: Mutex<VecDeque<Slot>>,
+    open: AtomicU64,
+    ready: Notify,
+    room: Notify,
+}
+
+impl Slots {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            open: AtomicU64::new(0),
+            ready: Notify::new(),
+            room: Notify::new(),
+        }
+    }
+
+    fn queue(&self) -> MutexGuard<'_, VecDeque<Slot>> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    async fn push(&self, slot: Slot) {
+        loop {
+            {
+                let mut queue = self.queue();
+                if queue.len() < REPLY_SLOTS {
+                    queue.push_back(slot);
+                    self.open.fetch_add(1, Ordering::AcqRel);
+                    break;
+                }
+            }
+            self.room.notified().await;
+        }
+        self.ready.notify_one();
+    }
+
+    fn agents(&self, out: &mut Vec<u8>) -> u64 {
+        let mut queue = self.queue();
+        let mut taken = 0;
+        while let Some(Slot::Agent(reply)) = queue.front().copied() {
+            queue.pop_front();
+            out.extend_from_slice(&reply.frame());
+            taken += 1;
+        }
+        if taken > 0 {
+            self.room.notify_one();
+        }
+        taken
+    }
+
+    fn reply(&self) -> Option<Slot> {
+        self.queue()
+            .front()
+            .copied()
+            .filter(|slot| !matches!(slot, Slot::Agent(_)))
+    }
+
+    fn answered(&self) {
+        self.queue().pop_front();
+        self.room.notify_one();
+    }
+
+    fn settle(&self, written: u64) {
+        self.open.fetch_sub(written, Ordering::AcqRel);
+    }
+
+    fn settled(&self) -> bool {
+        self.open.load(Ordering::Acquire) == 0
+    }
+}
+
 async fn client_to_upstream<R, W>(
     reader: &mut R,
     writer: &mut W,
-    auth: &Auth,
+    conn: &Conn,
     credential: &[u8],
     up: &AtomicU64,
     forwarded: &AtomicU64,
+    slots: Option<&Slots>,
 ) -> Ending
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let auth = &conn.shared.auth;
+    let mut multi = MultiState::new();
     loop {
         let mut command = match resp::read_command(reader).await {
             Ok(Some(command)) => command,
@@ -611,11 +724,34 @@ where
                 return refused(Some(NON_RESP), "non_resp", NON_RESP_REFUSED_REASON);
             }
         };
+        let mut slot = Slot::Pass;
+        if let Some(slots) = slots {
+            let args: Vec<&[u8]> = command.args().iter().map(|arg| arg.as_slice()).collect();
+            match multi.check(&args) {
+                Verdict::Forward => {}
+                Verdict::Abort => slot = Slot::Replace(EXEC_ABORTED),
+                Verdict::Refuse => {
+                    conn.command_refused(&read_only::refused(&args), read_only::NOT_ALLOWED);
+                    slots.push(Slot::Agent(READ_ONLY_REFUSED)).await;
+                    continue;
+                }
+                Verdict::Close => {
+                    conn.command_refused(&read_only::refused(&args), read_only::MALFORMED);
+                    return Ending::ReadOnly;
+                }
+            }
+            if matches!(slot, Slot::Replace(_)) {
+                command = Command::new(vec![b"DISCARD".to_vec()]);
+            }
+        }
         if matches!(
             command.rewrite_auth(auth.user(), auth.names_user(), credential),
             resp::Rewrite::UserMismatch
         ) {
             return refused(Some(USER_MISMATCH), "user_mismatch", USER_MISMATCH_REASON);
+        }
+        if let Some(slots) = slots {
+            slots.push(slot).await;
         }
         let frame = command.encode();
         let sent = async {
@@ -651,7 +787,8 @@ async fn upstream_to_client<R, W>(
     mut guard: EchoGuard,
     down: &AtomicU64,
     answered: &AtomicU64,
-    progress: &tokio::sync::Notify,
+    progress: &Notify,
+    slots: Option<&Slots>,
 ) -> Ending
 where
     R: AsyncRead + Unpin,
@@ -659,8 +796,33 @@ where
 {
     let mut framer = reply::Framer::new();
     let mut buffer = vec![0u8; READ_BUFFER];
+    let mut current = None;
     loop {
-        let read = match reader.read(&mut buffer).await {
+        let read = match slots {
+            None => reader.read(&mut buffer).await,
+            Some(slots) => {
+                if framer.at_boundary() {
+                    let mut out = Vec::new();
+                    let written = slots.agents(&mut out);
+                    if written > 0 {
+                        let Some(released) = guard.push(&out) else {
+                            return Ending::Echo;
+                        };
+                        if let Err(ending) = write_out(writer, &released, down).await {
+                            return ending;
+                        }
+                        slots.settle(written);
+                        progress.notify_one();
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    read = reader.read(&mut buffer) => read,
+                    _ = slots.ready.notified() => continue,
+                }
+            }
+        };
+        let read = match read {
             Ok(0) => break,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Ending::Broken(zs_diag::io_kind(&error)),
@@ -670,7 +832,21 @@ where
         let mut offset = 0;
         let mut redirected = false;
         let mut complete = 0u64;
+        let mut written = 0u64;
         while offset < read {
+            if let Some(slots) = slots
+                && framer.at_boundary()
+            {
+                written += slots.agents(&mut out);
+                current = None;
+                if !matches!(buffer[offset], b'>' | b'|') {
+                    let Some(slot) = slots.reply() else {
+                        return Ending::Broken("unsolicited_reply");
+                    };
+                    current = Some(slot);
+                }
+            }
+            let mark = out.len();
             match framer.push(&buffer[offset..read], &mut out) {
                 Ok((consumed, step)) => {
                     offset += consumed;
@@ -678,8 +854,20 @@ where
                         redirected = true;
                         break;
                     }
+                    if let Some(Slot::Replace(reply)) = current {
+                        out.truncate(mark);
+                        if framer.at_boundary() {
+                            out.extend_from_slice(&reply.frame());
+                        }
+                    }
                     if framer.at_boundary() {
                         complete += 1;
+                        if let Some(slots) = slots
+                            && current.take().is_some()
+                        {
+                            slots.answered();
+                            written += 1 + slots.agents(&mut out);
+                        }
                     }
                 }
                 Err(_) => return Ending::Broken("malformed"),
@@ -691,7 +879,10 @@ where
         if let Err(ending) = write_out(writer, &released, down).await {
             return ending;
         }
-        if complete > 0 {
+        if let Some(slots) = slots {
+            slots.settle(written);
+        }
+        if complete > 0 || written > 0 {
             answered.fetch_add(complete, Ordering::Release);
             progress.notify_one();
         }
@@ -699,8 +890,17 @@ where
             return Ending::Redirect;
         }
     }
+    let whole = framer.at_boundary();
     let mut out = Vec::new();
     let outcome = framer.finish(&mut out);
+    if matches!(current, Some(Slot::Replace(_))) {
+        out.clear();
+    }
+    if let Some(slots) = slots
+        && whole
+    {
+        slots.agents(&mut out);
+    }
     let Some(released) = guard.push(&out) else {
         return Ending::Echo;
     };
@@ -722,7 +922,12 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
     let down = AtomicU64::new(0);
     let forwarded = AtomicU64::new(0);
     let answered = AtomicU64::new(0);
-    let progress = tokio::sync::Notify::new();
+    let progress = Notify::new();
+    let slots = session.read_only.then(Slots::new);
+    let settled = || match &slots {
+        Some(slots) => slots.settled(),
+        None => answered.load(Ordering::Acquire) >= forwarded.load(Ordering::Acquire),
+    };
     let (client_read, mut client_write) = client.into_split();
     let mut client_read = tokio::io::BufReader::with_capacity(READ_BUFFER, client_read);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(session.upstream);
@@ -731,10 +936,11 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             let ending = client_to_upstream(
                 &mut client_read,
                 &mut upstream_write,
-                &conn.shared.auth,
+                conn,
                 &session.credential,
                 &up,
                 &forwarded,
+                slots.as_ref(),
             )
             .await;
             if matches!(ending, Ending::Client) {
@@ -749,6 +955,7 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             &down,
             &answered,
             &progress,
+            slots.as_ref(),
         );
         tokio::pin!(forward);
         tokio::pin!(backward);
@@ -759,11 +966,11 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
                     broken @ Ending::Broken(_) => broken,
                     _ => Ending::Client,
                 },
-                refusal @ Ending::Refused { .. } => {
+                refusal @ (Ending::Refused { .. } | Ending::ReadOnly) => {
                     let deadline = tokio::time::sleep(REFUSAL_DRAIN);
                     tokio::pin!(deadline);
                     loop {
-                        if answered.load(Ordering::Acquire) >= forwarded.load(Ordering::Acquire) {
+                        if settled() {
                             break refusal;
                         }
                         tokio::select! {
@@ -795,6 +1002,7 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             conn.refused(code, conn.audit(reason));
             answer_then_drain(&mut client_read, &mut client_write, reply).await;
         }
+        Ending::ReadOnly => answer_then_drain(&mut client_read, &mut client_write, None).await,
         Ending::Echo => conn.refused("credential_echo", conn.audit(CREDENTIAL_ECHO_REASON)),
         Ending::Redirect => {
             conn.refused("cluster_redirect", conn.audit(CLUSTER_REDIRECT_REASON));

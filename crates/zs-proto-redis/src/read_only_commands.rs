@@ -1,0 +1,116 @@
+// Generated from the `redis:7-alpine` image, Redis 7.4.12 (`redis-server --version`), with:
+//
+// COMPOSE_PROJECT_NAME=zerosecret docker compose --profile redis up -d --wait redis-open
+// docker exec zerosecret-redis-open-1 redis-cli --json COMMAND > command.json
+// RO='def ro: any(.[2][]; . == "readonly") and all(.[2][]; . != "write" and . != "admin") and all(.[6][]; . != "@dangerous");'
+// jq -r "$RO"' .[] | select(ro) | "    \"\(.[0])\","' command.json | LC_ALL=C sort
+// jq -r "$RO"' .[] | .[9][] | select(ro) | .[0] | split("|") | "    (\"\(.[0])\", \"\(.[1])\"),"' command.json | LC_ALL=C sort
+// jq -r '.[] | select(.[9] | length > 0) | "    \"\(.[0])\","' command.json | LC_ALL=C sort
+//
+// COMMANDS and SUBCOMMANDS hold every command and container subcommand with the `readonly` flag
+// and without the `write` flag, the `admin` flag and the `@dangerous` ACL category. CONTAINERS
+// holds every command that has subcommands. Regenerate all three together; the pin test in
+// `read_only.rs` changes with them.
+
+pub(crate) const COMMANDS: [&str; 84] = [
+    "bitcount",
+    "bitfield_ro",
+    "bitpos",
+    "dbsize",
+    "dump",
+    "eval_ro",
+    "evalsha_ro",
+    "exists",
+    "expiretime",
+    "fcall_ro",
+    "geodist",
+    "geohash",
+    "geopos",
+    "georadius_ro",
+    "georadiusbymember_ro",
+    "geosearch",
+    "get",
+    "getbit",
+    "getrange",
+    "hexists",
+    "hexpiretime",
+    "hget",
+    "hgetall",
+    "hkeys",
+    "hlen",
+    "hmget",
+    "hpexpiretime",
+    "hpttl",
+    "hrandfield",
+    "hscan",
+    "hstrlen",
+    "httl",
+    "hvals",
+    "lcs",
+    "lindex",
+    "llen",
+    "lolwut",
+    "lpos",
+    "lrange",
+    "mget",
+    "pexpiretime",
+    "pfcount",
+    "pttl",
+    "randomkey",
+    "scan",
+    "scard",
+    "sdiff",
+    "sinter",
+    "sintercard",
+    "sismember",
+    "smembers",
+    "smismember",
+    "srandmember",
+    "sscan",
+    "strlen",
+    "substr",
+    "sunion",
+    "touch",
+    "ttl",
+    "type",
+    "xlen",
+    "xpending",
+    "xrange",
+    "xread",
+    "xrevrange",
+    "zcard",
+    "zcount",
+    "zdiff",
+    "zinter",
+    "zintercard",
+    "zlexcount",
+    "zmscore",
+    "zrandmember",
+    "zrange",
+    "zrangebylex",
+    "zrangebyscore",
+    "zrank",
+    "zrevrange",
+    "zrevrangebylex",
+    "zrevrangebyscore",
+    "zrevrank",
+    "zscan",
+    "zscore",
+    "zunion",
+];
+
+pub(crate) const SUBCOMMANDS: [(&str, &str); 8] = [
+    ("memory", "usage"),
+    ("object", "encoding"),
+    ("object", "freq"),
+    ("object", "idletime"),
+    ("object", "refcount"),
+    ("xinfo", "consumers"),
+    ("xinfo", "groups"),
+    ("xinfo", "stream"),
+];
+
+pub(crate) const CONTAINERS: [&str; 15] = [
+    "acl", "client", "cluster", "command", "config", "function", "latency", "memory", "module",
+    "object", "pubsub", "script", "slowlog", "xgroup", "xinfo",
+];
