@@ -10,7 +10,7 @@ failed=0
 out=$(psql "$target" -X -A -t -c "SELECT count(*) FROM $table" 2>"$scratch/err")
 if [ "$out" = 1 ]; then echo "read: ok rows=$out"; else echo "read: FAIL out=$out err=$(cat "$scratch/err")"; failed=1; fi
 
-psql "$target" -X -A -t \
+psql "$target" -X -A -t -v VERBOSITY=verbose \
   -c "INSERT INTO $table VALUES (2)" \
   -c "SET default_transaction_read_only = off" \
   -c "INSERT INTO $table VALUES (3)" \
@@ -24,7 +24,7 @@ if [ "$ZS_CLIENT_ACCESS" = read_only ]; then
   for name in write switch-off write-after-switch-off; do
     line=$(sed -n "${step}p" "$scratch/errors")
     case "$line" in
-      *[Rr]ead[-_\ ]only*) echo "$name: refused $line" ;;
+      25006:*[Rr]ead[-_\ ]only*) echo "$name: refused $line" ;;
       *) echo "$name: FAIL err=$line"; failed=1 ;;
     esac
     step=$((step + 1))

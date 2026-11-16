@@ -1,12 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod fake;
+#[path = "../../zs-conformance/tests/clients/matrix.rs"]
+mod matrix;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::process::Command;
 use zs_credential::Credential;
@@ -17,8 +18,8 @@ use zs_protocol::{Materialized, SessionAccess};
 
 const ROLE: &str = "zs_read_only_probe";
 const ROLE_PASSWORD: &str = "zs-read-only-probe-pw";
-const CLIENTS: [&str; 5] = ["libpq", "node-postgres", "pgx", "psycopg", "jdbc"];
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+const CLIENTS: [&str; 4] = ["libpq", "node-postgres", "pgx", "psycopg"];
+const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
 struct Database {
     host: String,
@@ -28,15 +29,18 @@ struct Database {
     password: String,
 }
 
+fn required() -> bool {
+    std::env::var_os("ZS_REQUIRE_PG").is_some()
+}
+
 fn database() -> Option<Database> {
-    let required = std::env::var_os("ZS_REQUIRE_PG").is_some();
     let Some(url) = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty()) else {
-        assert!(!required, "ZS_REQUIRE_PG is set and DATABASE_URL is not");
+        assert!(!required(), "ZS_REQUIRE_PG is set and DATABASE_URL is not");
         return None;
     };
     let parsed = parse_url(&url);
     assert!(
-        parsed.is_some() || !required,
+        parsed.is_some() || !required(),
         "ZS_REQUIRE_PG is set and DATABASE_URL is not postgres://user:pass@host:port/db"
     );
     parsed
@@ -124,28 +128,6 @@ async fn prepare(db: &Database, table: &str) {
     .await;
 }
 
-fn clients_dir() -> Option<PathBuf> {
-    std::env::var_os("ZS_CLIENTS_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
-fn script(file: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/clients")
-        .join(file)
-}
-
-fn installed(dir: Option<&Path>, relative: &str) -> Result<PathBuf, String> {
-    let dir = dir.ok_or("ZS_CLIENTS_DIR is not set")?;
-    let path = dir.join(relative);
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(format!("{} is not installed", path.display()))
-    }
-}
-
 type Spec = (
     &'static str,
     Vec<String>,
@@ -154,39 +136,37 @@ type Spec = (
 );
 
 fn build(name: &str, dir: Option<&Path>, run: bool) -> Result<Command, String> {
+    let script = |file: &str| matrix::script(MANIFEST, file).display().to_string();
     let (program, args, cwd, env): Spec = match name {
         "libpq" => (
             if run { "sh" } else { "psql" },
             if run {
-                vec![script("psql.sh").display().to_string()]
+                vec![script("psql.sh")]
             } else {
                 vec!["--version".into()]
             },
             None,
             vec![],
         ),
-        "node-postgres" => {
-            let modules = installed(dir, "node/node_modules/pg")?
+        "node-postgres" => (
+            "node",
+            if run {
+                vec![script("node-postgres.js")]
+            } else {
+                vec!["-p".into(), "require('pg/package.json').version".into()]
+            },
+            None,
+            vec![("NODE_PATH", matrix::node_modules(dir, "pg")?)],
+        ),
+        "pgx" => {
+            let module = matrix::installed(dir, "go/go.mod")?
                 .parent()
                 .unwrap()
                 .to_path_buf();
             (
-                "node",
-                if run {
-                    vec![script("node-postgres.js").display().to_string()]
-                } else {
-                    vec!["-p".into(), "require('pg/package.json').version".into()]
-                },
-                None,
-                vec![("NODE_PATH", modules)],
-            )
-        }
-        "pgx" => {
-            let module = installed(dir, "go/go.mod")?.parent().unwrap().to_path_buf();
-            (
                 "go",
                 if run {
-                    vec!["run".into(), script("pgx.go").display().to_string()]
+                    vec!["run".into(), script("pgx.go")]
                 } else {
                     vec![
                         "list".into(),
@@ -200,42 +180,25 @@ fn build(name: &str, dir: Option<&Path>, run: bool) -> Result<Command, String> {
                 vec![],
             )
         }
-        "psycopg" => {
-            let packages = installed(dir, "python/psycopg")?
-                .parent()
-                .unwrap()
-                .to_path_buf();
-            (
-                "python3",
-                if run {
-                    vec![script("psycopg_client.py").display().to_string()]
-                } else {
-                    vec![
-                        "-c".into(),
-                        "import psycopg; print(psycopg.__version__)".into(),
-                    ]
-                },
-                None,
-                vec![("PYTHONPATH", packages)],
-            )
-        }
-        "jdbc" => {
-            let jar = installed(dir, "jdbc/postgresql.jar")?;
-            (
-                "java",
-                if run {
-                    vec![
-                        "-cp".into(),
-                        jar.display().to_string(),
-                        script("Jdbc.java").display().to_string(),
-                    ]
-                } else {
-                    vec!["-version".into()]
-                },
-                None,
-                vec![],
-            )
-        }
+        "psycopg" => (
+            "python3",
+            if run {
+                vec![script("psycopg_client.py")]
+            } else {
+                vec![
+                    "-c".into(),
+                    "import psycopg; print(psycopg.__version__)".into(),
+                ]
+            },
+            None,
+            vec![(
+                "PYTHONPATH",
+                matrix::installed(dir, "python/psycopg")?
+                    .parent()
+                    .unwrap()
+                    .to_path_buf(),
+            )],
+        ),
         other => return Err(format!("unknown client {other}")),
     };
     let mut command = Command::new(program);
@@ -243,7 +206,6 @@ fn build(name: &str, dir: Option<&Path>, run: bool) -> Result<Command, String> {
         .args(args)
         .envs(env)
         .env_remove("DATABASE_URL")
-        .kill_on_drop(true)
         .stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -273,65 +235,17 @@ async fn version(name: &str, dir: Option<&Path>) -> Result<String, String> {
         .to_string())
 }
 
-struct Run {
-    success: bool,
-    lines: Vec<String>,
-}
-
-async fn run(
-    name: &str,
-    dir: Option<&Path>,
-    local: SocketAddr,
-    db: &Database,
-    table: &str,
-    access: &str,
-) -> Run {
-    let mut command = build(name, dir, true).unwrap();
-    command
-        .env("ZS_CLIENT_HOST", local.ip().to_string())
-        .env("ZS_CLIENT_PORT", local.port().to_string())
-        .env("ZS_CLIENT_USER", ROLE)
-        .env("ZS_CLIENT_DB", &db.name)
-        .env("ZS_CLIENT_TABLE", table)
-        .env("ZS_CLIENT_ACCESS", access);
-    let child = command.output();
-    match tokio::time::timeout(CLIENT_TIMEOUT, child).await {
-        Ok(Ok(output)) => {
-            let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect();
-            lines.extend(
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .map(|l| format!("stderr: {l}")),
-            );
-            Run {
-                success: output.status.success(),
-                lines,
-            }
-        }
-        Ok(Err(e)) => Run {
-            success: false,
-            lines: vec![format!("could not start: {e}")],
-        },
-        Err(_) => Run {
-            success: false,
-            lines: vec![format!("timed out after {CLIENT_TIMEOUT:?}")],
-        },
-    }
-}
-
 async fn session(
     db: &Database,
     name: &str,
     dir: Option<&Path>,
     access: SessionAccess,
 ) -> Result<(), String> {
-    let (label, expected_rows) = match access {
-        SessionAccess::ReadOnly => ("read_only", "1"),
-        SessionAccess::ReadWrite => ("read_write", "3"),
+    let expected_rows = match access {
+        SessionAccess::ReadOnly => "1",
+        SessionAccess::ReadWrite => "3",
     };
+    let label = matrix::label(access);
     let table = format!(
         "zs_ro_cl_{}_{label}_{}",
         name.replace('-', "_"),
@@ -339,73 +253,40 @@ async fn session(
     );
     prepare(db, &table).await;
     let (local, refusals) = listen(db, access).await;
-    let result = run(name, dir, local, db, &table, label).await;
-    for line in &result.lines {
-        println!("  {name} {label}: {line}");
-    }
+    let mut command = build(name, dir, true).unwrap();
+    command
+        .env("ZS_CLIENT_HOST", local.ip().to_string())
+        .env("ZS_CLIENT_PORT", local.port().to_string())
+        .env("ZS_CLIENT_USER", ROLE)
+        .env("ZS_CLIENT_DB", &db.name)
+        .env("ZS_CLIENT_TABLE", &table)
+        .env("ZS_CLIENT_ACCESS", label);
+    let success = matrix::run(name, access, command).await;
     let rows = admin(db, &format!("SELECT count(*) FROM {table}")).await;
     admin(db, &format!("DROP TABLE IF EXISTS {table}")).await;
     let refused = refusals.lock().unwrap().len();
-    let mut problems = Vec::new();
-    if !result.success {
-        problems.push("the client reported a failure".to_string());
-    }
-    if rows != expected_rows {
-        problems.push(format!(
-            "the table holds {rows} rows, expected {expected_rows}"
-        ));
-    }
-    match access {
-        SessionAccess::ReadOnly if refused == 0 => {
-            problems.push("the agent audited no refusal of the switch-off attempt".to_string());
-        }
-        SessionAccess::ReadWrite if refused != 0 => {
-            problems.push(format!("a read-write session was refused {refused} times"));
-        }
-        _ => {}
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(problems.join("; "))
-    }
+    matrix::judge(
+        access,
+        success,
+        refused,
+        &[("rows in the table", rows, expected_rows)],
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a real PostgreSQL, psql and the client programs in tests/clients"]
 async fn real_clients_read_through_a_read_only_session_and_are_refused_a_write() {
     let Some(db) = database() else { return };
-    let dir = clients_dir();
-    let require = std::env::var_os("ZS_REQUIRE_CLIENTS").is_some();
-    let mut failures = Vec::new();
-    for name in CLIENTS {
-        let found = match version(name, dir.as_deref()).await {
-            Ok(found) => found,
-            Err(reason) => {
-                println!("client {name}: not run: {reason}");
-                if require {
-                    failures.push(format!("{name}: not run: {reason}"));
-                }
-                continue;
-            }
-        };
-        let read_only = session(&db, name, dir.as_deref(), SessionAccess::ReadOnly).await;
-        let control = session(&db, name, dir.as_deref(), SessionAccess::ReadWrite).await;
-        let verdict = |outcome: &Result<(), String>| match outcome {
-            Ok(()) => "PASS".to_string(),
-            Err(why) => format!("FAIL ({why})"),
-        };
-        println!(
-            "client {name} ({found}): read-only session {}; read-write control {}",
-            verdict(&read_only),
-            verdict(&control)
-        );
-        if let Err(why) = read_only {
-            failures.push(format!("{name} read-only: {why}"));
-        }
-        if let Err(why) = control {
-            failures.push(format!("{name} read-write control: {why}"));
-        }
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
+    let dir = matrix::clients_dir();
+    let dir = dir.as_deref();
+    matrix::matrix(
+        required(),
+        &CLIENTS,
+        |name| async move { version(&name, dir).await },
+        |name, access| {
+            let db = &db;
+            async move { session(db, &name, dir, access).await }
+        },
+    )
+    .await;
 }

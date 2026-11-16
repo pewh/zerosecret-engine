@@ -22,7 +22,7 @@ var (
 func writeStep(step string, err error) {
 	var pg *pgconn.PgError
 	switch {
-	case readOnly && errors.As(err, &pg) && mode.MatchString(pg.Message):
+	case readOnly && errors.As(err, &pg) && pg.Code == "25006" && mode.MatchString(pg.Message):
 		fmt.Printf("%s: refused %s %s\n", step, pg.Code, pg.Message)
 	case !readOnly && err == nil:
 		fmt.Printf("%s: ok\n", step)

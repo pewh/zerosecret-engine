@@ -19,7 +19,7 @@ def attempt(conn, sql):
 def write_step(step, outcome):
     global failed
     ok, _, code, message = outcome
-    if read_only and not ok and "read" in message.lower() and "only" in message.lower():
+    if read_only and not ok and code == "25006" and "read" in message.lower() and "only" in message.lower():
         print(f"{step}: refused {code} {message}")
     elif not read_only and ok:
         print(f"{step}: ok")

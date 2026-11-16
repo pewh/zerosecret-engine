@@ -43,7 +43,6 @@ async function main() {
     port: Number(env.ZS_CLIENT_PORT),
     maxRetriesPerRequest: 1,
     retryStrategy: () => null,
-    ...(env.ZS_CLIENT_OPTIONS ? JSON.parse(env.ZS_CLIENT_OPTIONS) : {}),
   });
   redis.on("error", (error) => errors.push(error.message));
 

@@ -15,7 +15,7 @@ async function attempt(client, sql) {
 }
 
 function writeStep(step, outcome) {
-  if (readOnly && !outcome.ok && /read[-_ ]only/i.test(outcome.message)) {
+  if (readOnly && !outcome.ok && outcome.code === "25006" && /read[-_ ]only/i.test(outcome.message)) {
     console.log(`${step}: refused ${outcome.code} ${outcome.message}`);
   } else if (!readOnly && outcome.ok) {
     console.log(`${step}: ok`);
