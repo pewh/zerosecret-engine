@@ -16,11 +16,10 @@ const WORDS: [&str; 11] = [
     "shutdown",
     "load_file",
 ];
-const FOLDED: [&str; 4] = [
+const FOLDED: [&str; 3] = [
     "transaction_read_only",
     "tx_read_only",
     "execute_prepared_stmt",
-    "load_file",
 ];
 const PERSIST: &str = "persist";
 const TOKENS: [&str; 2] = ["/*!", "/*m!"];
@@ -549,7 +548,6 @@ mod tests {
                 "execute_prepared_stmt",
             ),
             (b"SET SESSION tx_r\xc3\xa9ad_only = OFF", "tx_read_only"),
-            (b"SELECT LOAD_F\xc3\x8dLE('/etc/hostname')", "load_file"),
             (
                 b"SET SESSION \xef\xbd\x94ransaction_read_only = OFF",
                 "transaction_read_only",
@@ -598,11 +596,7 @@ mod tests {
         let mut replaced = all.clone();
         replaced.splice(first..=first, b"\xc3\xa9".iter().copied());
         let text = [b"SET SESSION ", &replaced[..], b" = OFF"].concat();
-        assert_eq!(
-            scan(&text),
-            Some("load_file"),
-            "not transaction_read_only; the remaining underscore sits between two runs of 4+ high bytes: {text:?}"
-        );
+        assert_eq!(scan(&text), None, "{text:?}");
         let both = all
             .iter()
             .flat_map(|byte| {
@@ -615,12 +609,18 @@ mod tests {
             .collect::<Vec<u8>>();
         let text = [b"SET SESSION ", &both[..], b" = OFF"].concat();
         assert_eq!(scan(&text), None, "{text:?}");
+        for text in [
+            "SELECT '\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}'",
+            "SELECT '\u{6771}\u{4eac}_\u{5927}\u{962a}'",
+        ] {
+            assert_eq!(found(text), None, "{text}");
+        }
         assert_eq!(
             found(
-                "SELECT '\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}'"
+                "SELECT '\u{438}\u{432}_\u{43c}\u{438}\u{440}\u{430}_\u{43c}\u{438}\u{440}\u{430}'"
             ),
-            Some("load_file"),
-            "documented cost: two non-Latin segments of 4+ bytes joined by an underscore"
+            Some("tx_read_only"),
+            "documented limit: three non-Latin segments with the shape of tx_read_only"
         );
 
         for candidate in [
@@ -639,7 +639,8 @@ mod tests {
     #[test]
     fn keywords_match_ascii_only_as_the_server_parses_them() {
         for text in [
-            &b"SET @@gl\xc3\xb6bal.net_retry_count = 11"[..],
+            &b"SELECT LOAD_F\xc3\x8dLE('/etc/hostname')"[..],
+            b"SET @@gl\xc3\xb6bal.net_retry_count = 11",
             b"SET GL\xc3\x96BAL net_retry_count = 11",
             b"SET @@p\xc3\xa9rsist.net_retry_count = 11",
             b"SET P\xc3\x89RSIST_ONLY x = 1",

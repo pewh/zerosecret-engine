@@ -141,6 +141,8 @@ async fn session_starts_read_only_and_insert_gets_1792() {
         "ok \u{1f44d}",
         "Jos\u{e9} M\u{fc}ller",
         "\u{6771}_\u{4eac}_\u{90fd}",
+        "\u{438}\u{43c}\u{44f}_\u{43f}\u{43e}\u{43b}\u{44c}\u{437}\u{43e}\u{432}\u{430}\u{442}\u{435}\u{43b}\u{44f}",
+        "\u{6771}\u{4eac}_\u{5927}\u{962a}",
     ];
     works(
         &mut admin,
