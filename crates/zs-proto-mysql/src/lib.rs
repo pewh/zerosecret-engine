@@ -17,9 +17,9 @@ use packet::{
     AuthSwitch, CACHING_SHA2_PASSWORD, CLEAR_PASSWORD, CLIENT_COMPRESS, CLIENT_QUERY_ATTRIBUTES,
     CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM, COM_CHANGE_USER, COM_QUIT, ERR_HEADER, Greeting,
     HANDSHAKE_LIMIT, HandshakeResponse, MAX_PAYLOAD, MORE_DATA_HEADER, NATIVE_PASSWORD, OK_HEADER,
-    REQUIRED_SERVER_CAPABILITIES, SCRAMBLE_LEN, SHA256_PASSWORD, STRIPPED_CAPABILITIES,
-    SWITCH_HEADER, ServerError, client_capabilities, err_packet, read_packet, ssl_request,
-    write_packet,
+    REQUIRED_SERVER_CAPABILITIES, SCRAMBLE_LEN, SERVER_STATUS_IN_TRANS, SHA256_PASSWORD,
+    STRIPPED_CAPABILITIES, SWITCH_HEADER, ServerError, client_capabilities, err_packet, ok_status,
+    read_packet, ssl_request, write_packet,
 };
 use read_only::{Kind, Refused};
 pub use read_only::{MAX_SCREENED_COMMAND, READ_ONLY_REASON, REFUSAL, SESSION_START, scan};
@@ -431,7 +431,11 @@ async fn start_read_only(upstream: &mut Box<dyn Io>, screen: Screen) -> bool {
     }
     read_packet(upstream, HANDSHAKE_LIMIT)
         .await
-        .is_ok_and(|reply| reply.seq == 1 && reply.payload.first() == Some(&OK_HEADER))
+        .is_ok_and(|reply| {
+            reply.seq == 1
+                && ok_status(&reply.payload)
+                    .is_some_and(|status| status & SERVER_STATUS_IN_TRANS == 0)
+        })
 }
 
 async fn materialize(

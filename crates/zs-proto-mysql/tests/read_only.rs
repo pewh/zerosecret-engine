@@ -154,10 +154,26 @@ async fn a_read_only_session_sets_the_mode_before_the_first_client_command() {
     assert!(rig.refusals().is_empty());
 }
 
+fn ok_with_status(status: u16) -> Vec<u8> {
+    let mut ok = vec![packet::OK_HEADER, 0, 0];
+    ok.extend_from_slice(&status.to_le_bytes());
+    ok.extend_from_slice(&[0, 0]);
+    ok.extend_from_slice(fake::OK_INFO);
+    ok
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_start_that_is_not_ok_denies_the_connection() {
     let positive = Rig::start(native(), SessionAccess::ReadOnly).await;
     positive.login(CLIENT_CAPS).await;
+
+    for status in [0x0002, 0x4002] {
+        let script = native().with_first_reply(ok_with_status(status));
+        let rig = Rig::start(script, SessionAccess::ReadOnly).await;
+        let mut session = rig.login(CLIENT_CAPS).await;
+        answered(&mut session, &com_query("SELECT 1")).await;
+        assert!(rig.refusals().is_empty(), "control: status {status:#06x}");
+    }
 
     let refused = packet::err_packet(1227, "42000", "Access denied; you need the privilege");
     for (reply, seq) in [
@@ -165,6 +181,9 @@ async fn a_session_start_that_is_not_ok_denies_the_connection() {
         (vec![0x01], 1),
         (vec![0xfe, 0, 0, 2, 0], 1),
         (packet::ok_packet(fake::OK_INFO), 2),
+        (ok_with_status(0x0003), 1),
+        (ok_with_status(0x0001), 1),
+        (vec![packet::OK_HEADER, 0, 0], 1),
     ] {
         let script = native().with_first_reply(reply).with_first_reply_seq(seq);
         let rig = Rig::start(script, SessionAccess::ReadOnly).await;

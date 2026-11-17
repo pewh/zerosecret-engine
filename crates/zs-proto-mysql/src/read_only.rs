@@ -430,6 +430,21 @@ mod tests {
     }
 
     #[test]
+    fn a_word_after_a_numeric_literal_is_not_matched_because_the_grammar_has_no_listed_word_there()
+    {
+        for text in [
+            "SELECT 1.5PREPARE",
+            "SELECT 1e1KILL",
+            "SELECT 1.5EXECUTE",
+            "SELECT 2E3SHUTDOWN",
+        ] {
+            assert_eq!(found(text), None, "{text}");
+        }
+        assert_eq!(found("SELECT 1.5 PREPARE"), Some("prepare"));
+        assert_eq!(found("SELECT 1e1 KILL"), Some("kill"));
+    }
+
+    #[test]
     fn persist_matches_as_a_prefix_and_never_after_an_identifier_byte() {
         for text in [
             "SET PERSIST x = 1",

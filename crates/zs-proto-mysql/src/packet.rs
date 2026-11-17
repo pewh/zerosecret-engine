@@ -45,6 +45,7 @@ pub const OK_HEADER: u8 = 0x00;
 pub const MORE_DATA_HEADER: u8 = 0x01;
 pub const SWITCH_HEADER: u8 = 0xfe;
 pub const ERR_HEADER: u8 = 0xff;
+pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 
 pub const MAX_PAYLOAD: usize = 0x00ff_ffff;
 pub const HANDSHAKE_LIMIT: usize = 1 << 20;
@@ -438,6 +439,16 @@ pub fn err_packet(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
     out.extend_from_slice(sqlstate.as_bytes());
     out.extend_from_slice(message.as_bytes());
     out
+}
+
+pub fn ok_status(payload: &[u8]) -> Option<u16> {
+    let mut r = Reader::new(payload);
+    if r.u8().ok()? != OK_HEADER {
+        return None;
+    }
+    r.lenenc_int().ok()?;
+    r.lenenc_int().ok()?;
+    r.u16().ok()
 }
 
 pub fn ok_packet(info: &[u8]) -> Vec<u8> {
