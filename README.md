@@ -107,6 +107,28 @@ cargo run --locked -p zs-conformance -- run --config crates/zs-conformance/confo
 
 The suite spec is [docs/specs/2026-10-26-conformance-suite.md](docs/specs/2026-10-26-conformance-suite.md).
 
+The read-only client matrix is a manual release gate; no CI job runs it. It runs real drivers
+through a read-only session. Put the clients in one directory and set `ZS_CLIENTS_DIR` to it:
+`node/node_modules/` with `pg`, `mysql2`, `mongodb` and `ioredis`; `go/go.mod` that requires
+`github.com/jackc/pgx/v5`; `python/` with `psycopg` installed into it (`pip install --target`).
+`psql`, `redis-cli`, `node`, `go` and `python3` must be on `PATH`. Start the servers above and
+also `mysql-plain` (port 3308). The shared harness is
+`crates/zs-conformance/tests/clients/matrix.rs`; the PostgreSQL client commands are in `build`
+in `crates/zs-proto-postgres/tests/read_only_clients.rs`. When a `ZS_REQUIRE_*` variable is
+set, a client that does not run fails the test.
+
+```bash
+export ZS_CLIENTS_DIR=/path/to/clients
+ZS_REQUIRE_PG=1 DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5434/zerosecret_test \
+  cargo test --locked -p zs-proto-postgres --test read_only_clients -- --include-ignored
+ZS_REQUIRE_MYSQL=1 ZS_TEST_MYSQL_PLAIN=127.0.0.1:3308 \
+  cargo test --locked -p zs-proto-mysql --test read_only_clients -- --include-ignored
+ZS_REQUIRE_MONGO=1 ZS_TEST_MONGO=127.0.0.1:27018 ZS_TEST_MONGO_CERTS=target/db-test-certs \
+  cargo test --locked -p zs-proto-mongo --test read_only_clients -- --include-ignored
+ZS_REQUIRE_REDIS=1 ZS_TEST_REDIS_ADDR=127.0.0.1:6380 ZS_TEST_REDIS_PASSWORD=zs-test-redis \
+  cargo test --locked -p zs-proto-redis --test read_only_clients -- --include-ignored
+```
+
 ## Licence and name
 
 Apache-2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). The name is covered by

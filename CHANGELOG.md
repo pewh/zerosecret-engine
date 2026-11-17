@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Security
+
 - A PostgreSQL, MySQL, MongoDB or Redis resource can be read-only (ADR-0063). A policy resource
   has `access: read_only`, and the control plane signs it into the grant, which is then version 2.
   A read-write grant has no `access` record and stays version 1, byte for byte. This is a
@@ -11,24 +13,50 @@
 - An agent from 0.6.1 or older refuses a read-only grant: its signature does not verify there.
   Update the agent before the control plane issues the first one.
 - PostgreSQL and MySQL: the agent opens the session in the database's read-only mode and refuses
-  the known ways to switch it off, with SQLSTATE `25006` (PostgreSQL) or error 1792 (MySQL).
-  A PostgreSQL server that does not report `default_transaction_read_only` at startup, such as
-  a transaction-mode pooler that drops the server's startup parameters, cannot be a read-only
-  resource: the agent closes the session. The agent also refuses a read-only session to a
-  MariaDB server. `SHOW default_transaction_read_only` is refused by name, as are
+  the known ways to switch it off. The agent also refuses a read-only session to a MariaDB
+  server. `SHOW default_transaction_read_only` is refused by name, as are
   `SET SESSION CHARACTERISTICS ... READ WRITE` and `SET SESSION TRANSACTION READ WRITE`.
+- PostgreSQL refusals: a refused `Query` fails with SQLSTATE `25006`. A refused `Parse` fails
+  with SQLSTATE `42883` on the function `zs_refused_read_only_resource()`. A `FunctionCall` is
+  always refused, so libpq large-object calls fail on a read-only resource.
+- MySQL refusals: a refused command fails with error 1792. A refused `COM_STMT_PREPARE` fails
+  with error 1295.
+- Start of a read-only session: when PostgreSQL does not confirm the read-only mode, or reports
+  a single-byte server encoding, the client gets SQLSTATE `08004`
+  `zs: the server cannot open a read-only session`. Client `options` that
+  the agent cannot read get SQLSTATE `28000`. A MySQL session that the agent cannot start
+  read-only gets error 1045.
 - MongoDB and Redis: the agent admits an allowlist of read commands and refuses the rest, with
   code 13 (`Unauthorized`) or `-NOPERM read-only resource`. MongoDB transactions
   (`commitTransaction`) and `OP_MSG` messages with a document sequence are refused. Redis
-  scripts (`EVAL`, `EVALSHA` and their `_RO` forms, `SCRIPT`, `FUNCTION`), `INFO` and
+  scripts (`EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`), `INFO` and
   `CLIENT SETINFO` are refused. ioredis skips its ready check, because `INFO` is refused, and
   prints a warning; it then works.
+- Open sessions close within 5 s when the access of their grant changes or the grant ends. A
+  connection pool then opens new sessions.
+- On a read-only PostgreSQL resource the agent sends one pipelined unit at a time: it holds
+  the next `Query` or extended-protocol unit until the server is ready again.
 - Tested against PostgreSQL 16, MySQL 8.4, MongoDB 8.0 and Redis 7.4: libpq, node-postgres,
   pgx, psycopg, mysql2, the MongoDB Node driver and ioredis read through a read-only session
   and are refused a write.
-- Audit: a refused command is a `deny` with reason `read-only`. A session that the agent closes
-  because the access of its grant changed has reason `access changed`, and one closed after a
-  revoke has `grant revoked`.
+- Audit, all `deny`: `read-only` for a refused command (operation `query`) and for a refused
+  session start (operation `connect`); `read-only escaped` when PostgreSQL leaves the read-only
+  mode, or at startup does not confirm it or reports a single-byte encoding; `access changed` when the access of the grant
+  changes; `grant revoked` when the grant is revoked or expires; `read-only refusal backlog`
+  when a Redis client has 16,384 refused commands that wait for their reply.
+- Limit, PostgreSQL: a read-only resource needs a multi-byte server encoding (`UTF8`, `EUC_JP`,
+  `EUC_CN`, `EUC_KR`, `EUC_TW`, `EUC_JIS_2004` or `MULE_INTERNAL`) and a server that reports
+  `default_transaction_read_only` at startup. PostgreSQL 13 and older, and poolers that drop
+  the server's startup parameters, cannot.
+- Limit, MySQL: a client that sends query attributes is refused. Connector/J 8.1 and later
+  sends them when OpenTelemetry is on the classpath; set `openTelemetry=DISABLED`.
+- Limit, PostgreSQL and MySQL: a read-only statement text over 64 MiB closes the session.
+- Limit, MySQL: binary commands outside the allowlist are refused. A non-Latin value with three
+  segments joined by `_` can be refused.
+- Limit, MongoDB: a `getMore` can complete a `$merge` or `$out` that a read-write session of
+  the same login opened with `batchSize: 0`. After a switch to read-only this is possible until
+  the server's cursor timeout.
+- Limit, Redis: `EVAL_RO`, `EVALSHA_RO` and `FCALL_RO` are refused.
 
 ## [0.6.1] - 2026-11-15
 

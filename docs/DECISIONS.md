@@ -24,13 +24,13 @@ session has one operation: `connect`.
   vector `crates/zs-grant/vectors/grant-access.json` fixes these bytes for every
   implementation.
 - **Fail closed.** The agent accepts only version 1 with `read_write` and version 2 with
-  `read_only`. An agent that does not know the field (v0.6.0 and older) builds the payload
+  `read_only`. An agent that does not know the field (v0.6.1 and older) builds the payload
   without it, the signature does not verify, and the agent refuses the grant.
 - **Enforcement.** The agent opens PostgreSQL and MySQL sessions in the database's own
   read-only mode and refuses the known ways to switch that mode off. On MongoDB and Redis it
   admits only an allowlist of read commands and refuses all others.
-- **Commands, not data.** The agent checks commands. It never checks the data that a command
-  returns or stores.
+- **Commands, not data.** The agent checks commands. It never reads result rows or
+  documents; the scan of statement text also sees the literals and comments in it.
 
 **Consequence.** A read-only grant cannot be used by an agent that cannot enforce it. A new
 release of the agent is needed before the control plane issues the first read-only grant.
