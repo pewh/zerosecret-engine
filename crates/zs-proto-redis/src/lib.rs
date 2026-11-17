@@ -1036,7 +1036,9 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
             answer_then_drain(&mut client_read, &mut client_write, Some(CLUSTER_REDIRECT)).await;
         }
         Ending::Broken(kind) => conn.upstream_failed("relay", kind),
-        Ending::Revoked(reason) => conn.refused("revoked", conn.audit(reason)),
+        Ending::Revoked(reason) => {
+            conn.refused(zs_protocol::session_end_code(reason), conn.audit(reason))
+        }
         Ending::Client | Ending::Server => {}
     }
     conn.closed(

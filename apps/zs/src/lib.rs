@@ -1192,6 +1192,12 @@ impl AgentHandler {
             .map_err(|e| e.to_string())?;
         connection::grant_matches(signed, binding)
             .map_err(|mismatch| format!("{resource}: {}", mismatch.deny_reason()))?;
+        if verified.grant().access == zs_policy::Access::ReadOnly && !binding.is_l3() {
+            return Err(zs_grant::GrantError::OperationNotGranted {
+                operation: operation.to_string(),
+            }
+            .to_string());
+        }
         Ok((verified, minted))
     }
 
@@ -1553,6 +1559,18 @@ mod renewal_lineage_tests {
     }
 
     fn grant(key: &ControlSigningKey, grant_id: &str) -> SignedGrant {
+        grant_with(key, grant_id, zs_policy::Access::ReadWrite)
+    }
+
+    fn grant_with(
+        key: &ControlSigningKey,
+        grant_id: &str,
+        access: zs_policy::Access,
+    ) -> SignedGrant {
+        let version = match access {
+            zs_policy::Access::ReadWrite => zs_grant::GRANT_VERSION,
+            zs_policy::Access::ReadOnly => zs_grant::GRANT_VERSION_ACCESS,
+        };
         let connection = zs_policy::Connection::default()
             .resolve("api.stripe.com", "https")
             .unwrap();
@@ -1572,8 +1590,8 @@ mod renewal_lineage_tests {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
-            access: zs_policy::Access::ReadWrite,
-            version: zs_grant::GRANT_VERSION,
+            access,
+            version,
         })
         .unwrap()
     }
@@ -1606,6 +1624,42 @@ mod renewal_lineage_tests {
             Flow::Deny { reason } => reason,
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_read_only_grant_for_an_https_binding_is_refused() {
+        let key = ControlSigningKey::generate("control-k1");
+        let handler = handler(&key);
+        assert!(
+            matches!(
+                handler.classify(&Destination::new("api.stripe.com".to_string(), 443)),
+                Flow::Intercept { .. }
+            ),
+            "negative control: a v1 grant for the same binding passes"
+        );
+
+        handler.renew_grant(grant_with(&key, "g-1", zs_policy::Access::ReadOnly));
+        let refused = "grant does not permit the requested operation";
+        let reason = denial(&handler);
+        assert!(reason.ends_with(refused), "{reason}");
+        match handler.materialize("api.stripe.com", "GET") {
+            Ok(_) => panic!("a credential for a read-only grant on an HTTPS binding"),
+            Err(denied) => assert!(denied.reason.ends_with(refused), "{}", denied.reason),
+        }
+        match handler.authorize_message("api.stripe.com", "GET") {
+            Ok(()) => panic!("a read-only grant on an HTTPS binding authorized a request"),
+            Err(denied) => assert!(denied.reason.ends_with(refused), "{}", denied.reason),
+        }
+
+        handler.renew_grant(grant(&key, "g-2"));
+        assert!(
+            matches!(
+                handler.classify(&Destination::new("api.stripe.com".to_string(), 443)),
+                Flow::Intercept { .. }
+            ),
+            "a v1 renewal makes the binding usable again"
+        );
+        assert!(handler.authorize_message("api.stripe.com", "GET").is_ok());
     }
 
     #[test]

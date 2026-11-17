@@ -1555,7 +1555,7 @@ impl Trace {
         let mut event = self
             .event("client_refused")
             .warn()
-            .code("reason", "revoked");
+            .code("reason", zs_protocol::session_end_code(reason));
         if let Some(seq) = (self.audit_refusal)("connect", reason) {
             event = event.audit_seq(seq);
         }

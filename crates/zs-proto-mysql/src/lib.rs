@@ -1063,7 +1063,7 @@ async fn relay(
         let mut event = conn
             .event("client_refused")
             .warn()
-            .code("reason", "revoked");
+            .code("reason", zs_protocol::session_end_code(reason));
         if let Some(seq) = (conn.shared.audit_refusal)("connect", reason) {
             event = event.audit_seq(seq);
         }

@@ -43,6 +43,16 @@ impl DenyKind {
 }
 
 pub const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+pub const GRANT_REVOKED_REASON: &str = "grant revoked";
+pub const ACCESS_CHANGED_REASON: &str = "access changed";
+
+pub fn session_end_code(reason: &str) -> &'static str {
+    if reason == ACCESS_CHANGED_REASON {
+        "access_changed"
+    } else {
+        "revoked"
+    }
+}
 
 pub type SessionCheck = std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>;
 
@@ -397,6 +407,13 @@ mod tests {
         assert_eq!(InterceptedProtocol::Mysql.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Mongo.layer(), Layer::L3);
         assert_eq!(InterceptedProtocol::Redis.layer(), Layer::L3);
+    }
+
+    #[test]
+    fn the_diag_code_of_a_session_end_tells_an_access_change_from_a_grant_end() {
+        assert_eq!(session_end_code(ACCESS_CHANGED_REASON), "access_changed");
+        assert_eq!(session_end_code(GRANT_REVOKED_REASON), "revoked");
+        assert_eq!(session_end_code("access unknown"), "revoked");
     }
 
     #[cfg(feature = "session")]

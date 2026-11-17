@@ -275,12 +275,19 @@ async fn refused_commands_never_reach_the_upstream_and_the_session_stays_usable(
     let (log, events) = rig.log().await;
     let refusals = fake::in_conn(&events, "command_refused", 1);
     assert_eq!(refusals.len(), names.len() + 1, "{log}");
-    for (event, name) in refusals.iter().zip(names.iter().chain(["insert"].iter())) {
-        assert_eq!(event["fields"]["command"], *name, "{log}");
+    for event in &refusals {
+        assert_eq!(
+            event["fields"]["command"], "other",
+            "a name outside the allowlist is logged as other: {log}"
+        );
         assert_eq!(event["fields"]["reason"], "command", "{log}");
         assert_eq!(event["audit_seq"], 7, "{log}");
         assert_eq!(event["level"], "warn", "{log}");
     }
+    assert!(
+        !log.contains("zsMadeUpCommand"),
+        "a client-chosen name reached the log"
+    );
     assert!(!log.contains(MARKER), "a command argument reached the log");
     assert!(!log.contains(fake::PASSWORD));
 }
@@ -456,7 +463,7 @@ async fn more_to_come_write_closes_the_session_without_reply() {
     let (log, events) = rig.log().await;
     let refusals = fake::in_conn(&events, "command_refused", 2);
     assert_eq!(refusals.len(), 1, "{log}");
-    assert_eq!(refusals[0]["fields"]["command"], "insert", "{log}");
+    assert_eq!(refusals[0]["fields"]["command"], "other", "{log}");
     assert_eq!(refusals[0]["fields"]["reason"], "command", "{log}");
     assert!(!log.contains(MARKER));
 
@@ -598,6 +605,82 @@ async fn an_unparseable_message_closes_the_session_and_is_never_forwarded() {
         assert_eq!(closed.len(), 1, "{log}");
         assert_eq!(closed[0]["fields"]["reason"], "malformed", "{log}");
     }
+}
+
+fn find_with_a_non_utf8_key() -> Vec<u8> {
+    let mut doc = command("find").encode();
+    let at = doc.len() - 1;
+    doc.splice(at..at, [0x10, 0xff, 0xfe, 0, 7, 0, 0, 0]);
+    let total = (doc.len() as i32).to_le_bytes();
+    doc[..4].copy_from_slice(&total);
+    let mut payload = 0u32.to_le_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(&doc);
+    wire::frame(wire::OP_MSG, 9, 0, &payload)
+}
+
+fn explain_of_a_string() -> Vec<u8> {
+    let body = Doc::new()
+        .with_str("explain", "find")
+        .with_str("$db", "appdb");
+    OpMsg::new(body).encode(9, 0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_the_screen_cannot_read_closes_the_session_with_a_read_only_audit() {
+    let rig = Rig::start(SessionAccess::ReadOnly).await;
+    let mut positive = rig.login().await;
+    usable(&mut positive).await;
+
+    let cases = [
+        ("non-UTF-8 key", find_with_a_non_utf8_key(), None),
+        (
+            "explain of a string",
+            explain_of_a_string(),
+            Some("explain"),
+        ),
+    ];
+    for (name, bytes, _) in &cases {
+        let mut client = rig.login().await;
+        let before = rig.frames();
+        client.send(bytes).await.unwrap();
+        silent_close(&mut client).await;
+        assert_eq!(rig.frames(), before, "{name} reached the upstream");
+    }
+    assert_eq!(
+        rig.refusals(),
+        vec![("query", READ_ONLY_REASON); 2],
+        "each close is audited as a read-only refusal"
+    );
+    let (log, events) = rig.log().await;
+    for (conn, (name, _, command)) in (2..).zip(&cases) {
+        let refused = fake::in_conn(&events, "command_refused", conn);
+        assert_eq!(refused.len(), 1, "{name}: {log}");
+        assert_eq!(refused[0]["fields"]["reason"], "malformed", "{name}: {log}");
+        match command {
+            Some(command) => assert_eq!(refused[0]["fields"]["command"], *command, "{log}"),
+            None => assert!(
+                refused[0]["fields"].get("command").is_none(),
+                "{name}: {log}"
+            ),
+        }
+        assert!(
+            fake::in_conn(&events, "client_refused", conn).is_empty(),
+            "{name}: closed by the screen, not by the framing checks: {log}"
+        );
+    }
+
+    let writer = Rig::start(SessionAccess::ReadWrite).await;
+    for (name, bytes, _) in &cases {
+        let mut client = writer.login().await;
+        let before = writer.frames();
+        client.send(bytes).await.unwrap();
+        assert!(
+            fake::eventually(|| writer.frames() == before + 1).await,
+            "negative control: a read-write session forwards {name}"
+        );
+    }
+    assert!(writer.refusals().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

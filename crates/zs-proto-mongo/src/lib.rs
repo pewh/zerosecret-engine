@@ -265,8 +265,8 @@ impl Conn {
             .event("command_refused")
             .warn()
             .code("reason", refusal.reason);
-        if let Some(command) = &refusal.command {
-            event = event.token("command", command);
+        if let Some(command) = refusal.command {
+            event = event.code("command", command);
         }
         if let Some(seq) = (self.shared.audit_refusal)("query", READ_ONLY_REASON) {
             event = event.audit_seq(seq);
@@ -1091,7 +1091,10 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
         }
         Ending::StepDown(trigger) => conn.emit(conn.event("stepdown").code("trigger", trigger)),
         Ending::Revoked(reason) => {
-            conn.refused("revoked", (conn.shared.audit_refusal)("connect", reason));
+            conn.refused(
+                zs_protocol::session_end_code(reason),
+                (conn.shared.audit_refusal)("connect", reason),
+            );
         }
         Ending::Client | Ending::Server | Ending::ReadOnly => {}
     }

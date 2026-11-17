@@ -9,6 +9,7 @@ use zs_audit::Journal;
 use zs_diag::{Component, DiagLog, Event};
 use zs_identity::{Subject, WorkloadLabel};
 use zs_mitm::{LocalCa, ProxyServer, RunToken};
+use zs_protocol::{ACCESS_CHANGED_REASON, GRANT_REVOKED_REASON};
 
 struct UnconfiguredExchange;
 
@@ -242,9 +243,6 @@ impl L3Audit {
 }
 
 type L3Materialize = zs_protocol::Materialize;
-
-const GRANT_REVOKED_REASON: &str = "grant revoked";
-const ACCESS_CHANGED_REASON: &str = "access changed";
 
 fn l3_materialize(audit: L3Audit) -> L3Materialize {
     std::sync::Arc::new(move || {
@@ -1735,6 +1733,36 @@ mod tests {
     use super::*;
 
     mod access_change;
+
+    #[test]
+    fn the_read_only_audit_reasons_of_the_four_relays_are_the_pinned_strings() {
+        let reasons = [
+            ("postgres refused", zs_proto_postgres::READ_ONLY_REASON),
+            ("mysql refused", zs_proto_mysql::READ_ONLY_REASON),
+            ("mongo refused", zs_proto_mongo::READ_ONLY_REASON),
+            ("redis refused", zs_proto_redis::READ_ONLY_REASON),
+            (
+                "postgres escaped",
+                zs_proto_postgres::READ_ONLY_ESCAPED_REASON,
+            ),
+            ("redis backlog", zs_proto_redis::REFUSAL_BACKLOG_REASON),
+            ("access changed", ACCESS_CHANGED_REASON),
+            ("grant revoked", GRANT_REVOKED_REASON),
+        ];
+        assert_eq!(
+            reasons,
+            [
+                ("postgres refused", "read-only"),
+                ("mysql refused", "read-only"),
+                ("mongo refused", "read-only"),
+                ("redis refused", "read-only"),
+                ("postgres escaped", "read-only escaped"),
+                ("redis backlog", "read-only refusal backlog"),
+                ("access changed", "access changed"),
+                ("grant revoked", "grant revoked"),
+            ]
+        );
+    }
 
     fn rebinds_within(addr: std::net::SocketAddr, limit: std::time::Duration) -> bool {
         let start = std::time::Instant::now();

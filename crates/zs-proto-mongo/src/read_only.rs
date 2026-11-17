@@ -37,8 +37,16 @@ const ALLOWED: [&str; 17] = [
 ];
 
 pub(crate) struct Refusal {
-    pub(crate) command: Option<String>,
+    pub(crate) command: Option<&'static str>,
     pub(crate) reason: &'static str,
+}
+
+fn logged_name(name: &str) -> &'static str {
+    ALLOWED
+        .iter()
+        .find(|allowed| **allowed == name)
+        .copied()
+        .unwrap_or("other")
 }
 
 pub fn check(body: &Doc) -> Result<(), &'static str> {
@@ -78,7 +86,7 @@ pub(crate) fn screen(payload: &[u8]) -> Result<(), Refusal> {
     let message = OpMsg::parse(payload).map_err(|_| unparsed())?;
     let body = message.body().ok_or_else(unparsed)?;
     let refuse = |reason| Refusal {
-        command: body.first_key().map(str::to_string),
+        command: body.first_key().map(logged_name),
         reason,
     };
     if message
@@ -97,7 +105,7 @@ mod tests {
     use super::*;
     use crate::wire::{self, Section};
 
-    const ALLOWED: [&str; 17] = [
+    const PINNED: [&str; 17] = [
         "find",
         "getMore",
         "killCursors",
@@ -190,8 +198,17 @@ mod tests {
     }
 
     #[test]
+    fn the_production_allowlist_is_exactly_seventeen_names() {
+        let mut production = super::ALLOWED.to_vec();
+        production.sort_unstable();
+        let mut pinned = PINNED.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(production, pinned);
+    }
+
+    #[test]
     fn every_allowlisted_name_passes() {
-        for name in ALLOWED {
+        for name in super::ALLOWED {
             let body = match name {
                 "explain" => explain(&command("find")),
                 other => command(other),
@@ -456,15 +473,18 @@ mod tests {
     fn a_message_with_a_document_sequence_is_refused_with_its_command_name() {
         let plain = payload(vec![Section::Body(command("find"))]);
         assert!(screen(&plain).is_ok(), "positive control");
-        for body in [command("find"), command("insert"), command("aggregate")] {
-            let name = body.first_key().unwrap().to_string();
+        for (body, logged) in [
+            (command("find"), "find"),
+            (command("insert"), "other"),
+            (command("aggregate"), "aggregate"),
+        ] {
             let with_sequence = payload(vec![
                 Section::Body(body),
                 sequence("documents", &[Doc::new().with_i32("n", 1)]),
             ]);
             let refusal = screen(&with_sequence).err().unwrap();
-            assert_eq!(refusal.reason, "document_sequence", "{name}");
-            assert_eq!(refusal.command.as_deref(), Some(name.as_str()));
+            assert_eq!(refusal.reason, "document_sequence", "{logged}");
+            assert_eq!(refusal.command, Some(logged));
         }
     }
 
@@ -488,8 +508,15 @@ mod tests {
     fn a_refusal_names_the_command_and_not_its_arguments() {
         let body = command("insert").with_str("marker", "zs-argument-marker");
         let refusal = screen(&payload(vec![Section::Body(body)])).err().unwrap();
-        assert_eq!(refusal.command.as_deref(), Some("insert"));
+        assert_eq!(refusal.command, Some("other"));
         assert_eq!(refusal.reason, "command");
+        let explained = Doc::new()
+            .with_doc("explain", &command("insert"))
+            .with_str("$db", "appdb");
+        let refusal = screen(&payload(vec![Section::Body(explained)]))
+            .err()
+            .unwrap();
+        assert_eq!(refusal.command, Some("explain"));
         assert!(!READ_ONLY_REFUSED.message.contains("insert"));
         let reply = READ_ONLY_REFUSED.doc();
         assert_eq!(reply.int("code"), Some(13));

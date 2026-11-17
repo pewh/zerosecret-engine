@@ -131,7 +131,7 @@ impl Rig {
             audit_subject: "alice".into(),
             audit_workload: "default".into(),
             runtime,
-            diag: DiagLog::disabled(),
+            diag: DiagLog::open_with_cap(&home.path().join("diag.jsonl"), "t-1", 1 << 20).unwrap(),
         };
         let services = prepared
             .runtime
@@ -219,6 +219,25 @@ impl Rig {
             "{records}"
         );
         assert_eq!(self.denied(None), access_changed, "{records}");
+        std::thread::sleep(Duration::from_millis(300));
+        self.prepared.diag.close();
+        let log = std::fs::read_to_string(self.home.path().join("diag.jsonl")).unwrap();
+        let reasons: Vec<String> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "client_refused")
+            .map(|event| {
+                event["fields"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["access_changed".to_string(); access_changed],
+            "the diag log names an access change, not a revocation: {log}"
+        );
     }
 }
 
