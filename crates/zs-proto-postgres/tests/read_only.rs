@@ -24,6 +24,8 @@ const READ_ONLY_REFUSED: (&str, &str) = (
     "28000",
     "connection options not accepted on a read-only resource",
 );
+const CANNOT_OPEN_READ_ONLY: (&str, &str) =
+    ("08004", "zs: the server cannot open a read-only session");
 
 struct Session {
     local: SocketAddr,
@@ -311,7 +313,8 @@ async fn an_unknown_message_ends_a_read_only_session() {
 type Frames = Arc<Mutex<Vec<Vec<u8>>>>;
 type Status = &'static [(&'static str, &'static str)];
 
-const SUPERUSER_LOGIN: [(&str, &str); 2] = [
+const SUPERUSER_LOGIN: [(&str, &str); 3] = [
+    ("server_encoding", "UTF8"),
     ("default_transaction_read_only", "on"),
     ("is_superuser", "on"),
 ];
@@ -783,7 +786,8 @@ async fn a_session_that_becomes_superuser_scans_with_the_superuser_words_from_th
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_that_reports_read_write_at_login_fails_closed() {
-    const READ_WRITE_LOGIN: [(&str, &str); 2] = [
+    const READ_WRITE_LOGIN: [(&str, &str); 3] = [
+        ("server_encoding", "UTF8"),
         ("default_transaction_read_only", "off"),
         ("is_superuser", "off"),
     ];
@@ -797,8 +801,8 @@ async fn an_upstream_that_reports_read_write_at_login_fails_closed() {
     let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
     assert_eq!(
         pipelined_login(session.local).await,
-        Vec::<u8>::new(),
-        "the session closes with nothing injected"
+        fake::error_frame(CANNOT_OPEN_READ_ONLY),
+        "the session closes with the fixed error and nothing else"
     );
     assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -815,7 +819,8 @@ async fn pipelined_login(local: SocketAddr) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_that_never_reports_the_mode_fails_closed() {
-    const UNREPORTED_LOGIN: [(&str, &str); 1] = [("is_superuser", "off")];
+    const UNREPORTED_LOGIN: [(&str, &str); 2] =
+        [("server_encoding", "UTF8"), ("is_superuser", "off")];
     let reported = emulated(&fake::READ_ONLY_LOGIN, false).await;
     let control = listen_as(reported.addr.port(), SessionAccess::ReadOnly).await;
     let mut allowed = fake::login(control.local)
@@ -842,8 +847,8 @@ async fn an_upstream_that_never_reports_the_mode_fails_closed() {
     let session = listen_as(unreported.addr.port(), SessionAccess::ReadOnly).await;
     assert_eq!(
         pipelined_login(session.local).await,
-        Vec::<u8>::new(),
-        "the session closes with nothing injected and no server startup message"
+        fake::error_frame(CANNOT_OPEN_READ_ONLY),
+        "the session closes with the fixed error and no server startup message"
     );
     assert_eq!(session.refusals(), vec![("connect", "read-only escaped")]);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -857,6 +862,69 @@ async fn an_upstream_that_never_reports_the_mode_fails_closed() {
         fake::named(&events, "client_refused")[0]["fields"]["reason"],
         "read_only_escaped"
     );
+}
+
+fn encoded_login(encoding: Option<&'static str>) -> Status {
+    let mut status: Vec<(&'static str, &'static str)> = encoding
+        .map(|encoding| ("server_encoding", encoding))
+        .into_iter()
+        .collect();
+    status.extend([
+        ("default_transaction_read_only", "on"),
+        ("is_superuser", "off"),
+    ]);
+    Box::leak(status.into_boxed_slice())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_session_opens_only_on_a_multi_byte_server_encoding() {
+    for encoding in ["UTF8", "EUC_JP"] {
+        let upstream = emulated(encoded_login(Some(encoding)), false).await;
+        let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+        let mut client = fake::login(session.local)
+            .await
+            .unwrap_or_else(|_| panic!("a {encoding} server opens a read-only session"));
+        assert_eq!(fake::query(&mut client, "SELECT 'first'").await, "SELECT 1");
+        assert_eq!(upstream.frames(), vec![query("SELECT 'first'")]);
+        assert!(session.refusals().is_empty(), "{encoding}");
+    }
+
+    let latin5 = emulated(encoded_login(Some("LATIN5")), false).await;
+    let read_write = listen_as(latin5.addr.port(), SessionAccess::ReadWrite).await;
+    let mut unaffected = fake::login(read_write.local)
+        .await
+        .expect("negative control: a read-write session on LATIN5 opens");
+    assert_eq!(
+        fake::query(&mut unaffected, "SELECT 'rw'").await,
+        "SELECT 1"
+    );
+    assert!(read_write.refusals().is_empty());
+
+    for encoding in [Some("LATIN5"), Some("SQL_ASCII"), Some("WIN1254"), None] {
+        let upstream = emulated(encoded_login(encoding), false).await;
+        let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+        assert_eq!(
+            pipelined_login(session.local).await,
+            fake::error_frame(CANNOT_OPEN_READ_ONLY),
+            "{encoding:?}: the session closes with the fixed error and nothing else"
+        );
+        assert_eq!(
+            session.refusals(),
+            vec![("connect", "read-only escaped")],
+            "{encoding:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            upstream.frames().is_empty(),
+            "{encoding:?}: the pipelined first Query never reached the upstream"
+        );
+        let events = session.events().await;
+        assert_eq!(
+            fake::named(&events, "client_refused")[0]["fields"]["reason"],
+            "read_only_escaped",
+            "{encoding:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1162,6 +1230,87 @@ async fn a_backend_message_larger_than_the_buffer_reaches_the_client_intact() {
         .unwrap();
     assert_eq!(received, reply);
     assert_eq!(fake::query(&mut client, "SELECT big").await, "SELECT 1");
+}
+
+const SCREEN_CAP: usize = 64 << 20;
+
+async fn whole_frames_upstream() -> Emulated {
+    let frames: Frames = Arc::new(Mutex::new(Vec::new()));
+    let record = frames.clone();
+    let addr = fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            fake::accept_login(&mut tcp, &fake::READ_ONLY_LOGIN).await?;
+            loop {
+                let mut header = [0u8; 5];
+                tcp.read_exact(&mut header).await?;
+                let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut message = header.to_vec();
+                message.resize(1 + length, 0);
+                tcp.read_exact(&mut message[5..]).await?;
+                record.lock().unwrap().push(message);
+                if header[0] == b'Q' {
+                    tcp.write_all(&[complete("SELECT 1"), ready()].concat())
+                        .await?;
+                }
+            }
+        }
+    })
+    .await;
+    Emulated { addr, frames }
+}
+
+fn oversized_header() -> Vec<u8> {
+    let mut header = vec![b'Q'];
+    header.extend_from_slice(&((SCREEN_CAP + 5) as u32).to_be_bytes());
+    header
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_text_is_screened_and_one_above_64_mib_closes_a_read_only_session() {
+    let padding = "a".repeat(2 << 20);
+    let long = format!("SELECT '{padding}'");
+    let long_escape = format!("SELECT '{padding}'; {ESCAPE}");
+
+    let control = whole_frames_upstream().await;
+    let read_write = listen_as(control.addr.port(), SessionAccess::ReadWrite).await;
+    let mut unaffected = fake::login(read_write.local).await.unwrap();
+    let mut over = oversized_header();
+    over.extend(std::iter::repeat_n(b' ', SCREEN_CAP));
+    over.push(0);
+    send_all(&mut unaffected, &[over.clone()]).await;
+    assert_eq!(
+        reply(&mut unaffected).await,
+        [complete("SELECT 1"), ready()].concat()
+    );
+    assert!(
+        fake::eventually(|| control.frames() == vec![over.clone()]).await,
+        "negative control: a read-write session forwards a Query above 64 MiB"
+    );
+    assert!(read_write.refusals().is_empty());
+
+    let upstream = whole_frames_upstream().await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local).await.unwrap();
+    assert_eq!(fake::query(&mut client, &long).await, "SELECT 1");
+    fake::query(&mut client, &long_escape).await;
+    assert_eq!(
+        upstream.frames(),
+        vec![query(&long), query(QUERY_REFUSAL)],
+        "a text above 1 MiB is forwarded whole, or replaced when it holds a listed word"
+    );
+    assert_eq!(session.refusals(), vec![("query", "read-only")]);
+
+    let mut oversized = oversized_header();
+    oversized.extend_from_slice(b"SELECT 1");
+    send_all(&mut client, &[oversized]).await;
+    assert_eq!(closed(&mut client).await, Vec::<u8>::new());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        upstream.frames().len(),
+        2,
+        "no byte of the oversized Query was forwarded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

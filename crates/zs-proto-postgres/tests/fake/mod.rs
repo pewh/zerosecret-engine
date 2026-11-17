@@ -155,7 +155,8 @@ pub fn parameter_status(name: &str, value: &str) -> Vec<u8> {
     frame(b'S', &body)
 }
 
-pub const READ_ONLY_LOGIN: [(&str, &str); 2] = [
+pub const READ_ONLY_LOGIN: [(&str, &str); 3] = [
+    ("server_encoding", "UTF8"),
     ("default_transaction_read_only", "on"),
     ("is_superuser", "off"),
 ];
@@ -273,6 +274,7 @@ async fn serve(mut tcp: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> st
     seen.lock().unwrap().authenticated = true;
     write_tagged(&mut stream, b'R', &0u32.to_be_bytes()).await?;
     write_tagged(&mut stream, b'S', b"server_version\x0016.4\0").await?;
+    write_tagged(&mut stream, b'S', b"server_encoding\0UTF8\0").await?;
     let read_only = packet
         .windows(32)
         .any(|window| window == b"default_transaction_read_only=on");

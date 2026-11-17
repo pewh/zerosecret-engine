@@ -2178,6 +2178,8 @@ where
             }
             None => {
                 trace.escaped();
+                let (code, reason) = READ_ONLY_UNAVAILABLE;
+                let _ = client.write_all(&error_frame(code, reason)).await;
                 return Ok(());
             }
         },
@@ -2222,6 +2224,8 @@ const READ_ONLY_REFUSED: (&str, &str) = (
     "28000",
     "connection options not accepted on a read-only resource",
 );
+const READ_ONLY_UNAVAILABLE: (&str, &str) =
+    ("08004", "zs: the server cannot open a read-only session");
 
 async fn refuse(
     client: &mut TcpStream,
@@ -2612,7 +2616,19 @@ async fn screened<R: AsyncRead + Unpin>(
     if message.len() as u64 != 5 + body {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
-    match read_only::refusal(tag, &message[5..], superuser) {
+    let found = if message.len() > read_only::INLINE_SCAN_LIMIT {
+        let (owned, found) = tokio::task::spawn_blocking(move || {
+            let found = read_only::refusal(tag, &message[5..], superuser);
+            (message, found)
+        })
+        .await
+        .map_err(|_| invalid("postgres scan failed"))?;
+        message = owned;
+        found
+    } else {
+        read_only::refusal(tag, &message[5..], superuser)
+    };
+    match found {
         Ok(None) => Ok(message),
         Ok(Some((word, replacement))) => {
             trace.refuse_statement(word);

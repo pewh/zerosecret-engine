@@ -11,12 +11,23 @@ pub const READ_ONLY_ESCAPED_REASON: &str = "read-only escaped";
 
 pub(crate) const SCREENED: &[u8] = b"QPF";
 pub(crate) const STREAMED: &[u8] = b"BCcdDEfHpSX";
-pub(crate) const MAX_SCREENED_MESSAGE: u32 = 0x3fff_ffff;
+pub(crate) const MAX_SCREENED_MESSAGE: u32 = 64 << 20;
+pub(crate) const INLINE_SCAN_LIMIT: usize = 1 << 20;
 pub(crate) const MAX_PARAMETER_STATUS: u32 = 16 * 1024;
 
 const MODE_SETTING: &[u8] = b"default_transaction_read_only";
 const SUPERUSER_SETTING: &[u8] = b"is_superuser";
-const SUPERUSER_WORDS: [&str; 9] = [
+const ENCODING_SETTING: &[u8] = b"server_encoding";
+const MULTI_BYTE_ENCODINGS: [&[u8]; 7] = [
+    b"UTF8",
+    b"EUC_JP",
+    b"EUC_CN",
+    b"EUC_KR",
+    b"EUC_TW",
+    b"EUC_JIS_2004",
+    b"MULE_INTERNAL",
+];
+const SUPERUSER_WORDS: [&str; 10] = [
     "program",
     "pg_reload_conf",
     "pg_terminate_backend",
@@ -26,13 +37,18 @@ const SUPERUSER_WORDS: [&str; 9] = [
     "pg_read_file",
     "pg_read_binary_file",
     "pg_ls_dir",
+    "session_authorization",
 ];
-const SUPERUSER_PHRASES: [(&[&str], &str); 5] = [
+const QUOTED_ROLE: &str = "\"role\"";
+const SUPERUSER_PHRASES: [(&[&str], &str); 8] = [
     (&["alter", "system"], "alter system"),
     (&["session", "authorization"], "session authorization"),
     (&["set", "role"], "set role"),
+    (&["set", QUOTED_ROLE], "set role"),
     (&["set", "session", "role"], "set session role"),
+    (&["set", "session", QUOTED_ROLE], "set session role"),
     (&["set", "local", "role"], "set local role"),
+    (&["set", "local", QUOTED_ROLE], "set local role"),
 ];
 
 const FUNCTION_CALL: &str = "function_call";
@@ -226,6 +242,11 @@ fn word_at(text: &[u8], at: usize, word: &str) -> bool {
             .is_none_or(|next| !identifier(*next))
 }
 
+fn quoted_at(text: &[u8], at: usize) -> bool {
+    text.get(at..at + QUOTED_ROLE.len())
+        .is_some_and(|found| found.eq_ignore_ascii_case(QUOTED_ROLE.as_bytes()))
+}
+
 fn comment_end(text: &[u8], mut at: usize) -> usize {
     let mut depth = 0usize;
     while at < text.len() {
@@ -290,6 +311,7 @@ fn phrase_at(text: &[u8], at: usize, words: &[&str], budget: &mut usize) -> bool
     for word in rest {
         match skip_blank(text, end, budget) {
             None => return true,
+            Some(next) if *word == QUOTED_ROLE && quoted_at(text, next) => end = next + word.len(),
             Some(next) if word_at(text, next, word) => end = next + word.len(),
             Some(_) => return false,
         }
@@ -366,12 +388,14 @@ pub(crate) enum Status {
     Other,
 }
 
-pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
+fn setting(body: &[u8]) -> Option<(&[u8], &[u8])> {
     let (name, rest) = until_nul(body).ok()?;
     let (value, rest) = until_nul(rest).ok()?;
-    if !rest.is_empty() {
-        return None;
-    }
+    rest.is_empty().then_some((name, value))
+}
+
+pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
+    let (name, value) = setting(body)?;
     Some(match name {
         MODE_SETTING if value == b"on" => Status::ReadOnly,
         MODE_SETTING => Status::Escaped,
@@ -381,12 +405,15 @@ pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
 }
 
 pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
-    let (mut superuser, mut reported) = (false, false);
+    let (mut superuser, mut reported, mut multi_byte) = (false, false, false);
     let mut rest = tail;
     while let [tag, a, b, c, d, after @ ..] = rest {
         let size = (u32::from_be_bytes([*a, *b, *c, *d]) as usize).checked_sub(4)?;
         let body = after.get(..size)?;
         if *tag == b'S' {
+            if let (ENCODING_SETTING, value) = setting(body)? {
+                multi_byte = MULTI_BYTE_ENCODINGS.contains(&value);
+            }
             match parameter_status(body)? {
                 Status::Escaped => return None,
                 Status::ReadOnly => reported = true,
@@ -396,7 +423,7 @@ pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
         }
         rest = &after[size..];
     }
-    (rest.is_empty() && reported).then_some(superuser)
+    (rest.is_empty() && reported && multi_byte).then_some(superuser)
 }
 
 #[derive(Default)]
@@ -511,6 +538,12 @@ impl Units {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screening_holds_at_most_64_mib_and_scans_inline_up_to_1_mib() {
+        assert_eq!(MAX_SCREENED_MESSAGE, 64 * 1024 * 1024);
+        assert_eq!(INLINE_SCAN_LIMIT, 1024 * 1024);
+    }
 
     fn startup(parameters: &[(&str, &[u8])]) -> Vec<u8> {
         let mut body = 196_608u32.to_be_bytes().to_vec();
@@ -677,7 +710,7 @@ mod tests {
         }
     }
 
-    const SUPERUSER_WORDS: [&str; 9] = [
+    const SUPERUSER_WORDS: [&str; 10] = [
         "program",
         "pg_reload_conf",
         "pg_terminate_backend",
@@ -687,7 +720,60 @@ mod tests {
         "pg_read_file",
         "pg_read_binary_file",
         "pg_ls_dir",
+        "session_authorization",
     ];
+
+    #[test]
+    fn the_production_superuser_words_are_the_listed_words() {
+        assert_eq!(super::SUPERUSER_WORDS, SUPERUSER_WORDS);
+    }
+
+    #[test]
+    fn the_parameter_spellings_of_set_role_and_session_authorization_match() {
+        for (text, word) in [
+            (
+                "SET session_authorization = 'other'",
+                "session_authorization",
+            ),
+            (
+                "set SESSION_AUTHORIZATION to other",
+                "session_authorization",
+            ),
+            (
+                "SET \"session_authorization\" = 'other'",
+                "session_authorization",
+            ),
+            ("SHOW session_authorization", "session_authorization"),
+            ("SET \"role\" = 'other'", "set role"),
+            ("set \"ROLE\" to other", "set role"),
+            ("SET \"Role\" = other", "set role"),
+            ("SET\"role\" = other", "set role"),
+            ("set/**/\"role\" = other", "set role"),
+            ("set -- c\n\"role\" = other", "set role"),
+            ("select 1; SET \"rOlE\" = other", "set role"),
+            ("SET SESSION \"role\" = other", "set session role"),
+            ("set session/* x */\"ROLE\" to other", "set session role"),
+            ("SET LOCAL \"role\" = other", "set local role"),
+            ("set\tlocal\n\"Role\" to other", "set local role"),
+        ] {
+            assert_eq!(scan(text.as_bytes(), true), Some(word), "{text:?}");
+            assert_eq!(scan(text.as_bytes(), false), None, "{text:?}");
+        }
+        for text in [
+            "select role from t",
+            "SET \"roles\" = x",
+            "SET \"my_role\" = x",
+            "SET \"role_x\" = x",
+            "SET x\"role\" = y",
+            "RESET \"role\"",
+            "SET SESSION x \"role\" = y",
+            "set\"rol\" = x",
+            "select session_authorizations",
+            "select x_session_authorization",
+        ] {
+            assert_eq!(scan(text.as_bytes(), true), None, "{text:?}");
+        }
+    }
 
     #[test]
     fn every_superuser_word_matches_only_in_a_superuser_session() {
@@ -768,9 +854,11 @@ mod tests {
                 );
                 assert_eq!(scan(text.as_bytes(), false), None, "{text:?}");
             }
+            let joined = format!("{first}_{second}");
+            let parameter = (joined == "session_authorization").then_some(joined.as_str());
+            assert_eq!(scan(joined.as_bytes(), true), parameter, "{joined:?}");
             for text in [
                 format!("{first}{second}"),
-                format!("{first}_{second}"),
                 format!("{first}, {second}"),
                 format!("x{first} {second}"),
                 format!("{first} {second}x"),
@@ -895,6 +983,7 @@ mod tests {
         let key = frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]);
         let tail = [
             frame_status("server_version", "16.4"),
+            frame_status("server_encoding", "UTF8"),
             frame_status("default_transaction_read_only", "on"),
             frame_status("is_superuser", "off"),
             key.clone(),
@@ -925,6 +1014,56 @@ mod tests {
         truncated.pop();
         assert_eq!(startup_superuser(&truncated), None);
         assert_eq!(startup_superuser(&[b'S', 0, 0, 0, 3]), None);
+    }
+
+    #[test]
+    fn startup_tail_fails_closed_on_a_single_byte_server_encoding() {
+        let frame_status = |name: &str, value: &str| frame(b'S', &status(name, value));
+        let tail = |encoding: Option<&str>| {
+            [
+                encoding
+                    .map(|encoding| frame_status("server_encoding", encoding))
+                    .unwrap_or_default(),
+                frame_status("default_transaction_read_only", "on"),
+                frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]),
+            ]
+            .concat()
+        };
+        for encoding in [
+            "UTF8",
+            "EUC_JP",
+            "EUC_CN",
+            "EUC_KR",
+            "EUC_TW",
+            "EUC_JIS_2004",
+            "MULE_INTERNAL",
+        ] {
+            assert_eq!(
+                startup_superuser(&tail(Some(encoding))),
+                Some(false),
+                "{encoding}"
+            );
+        }
+        for encoding in [
+            "LATIN1",
+            "LATIN5",
+            "SQL_ASCII",
+            "WIN1254",
+            "utf8",
+            "UTF-8",
+            "",
+            "SJIS",
+            "GB18030",
+        ] {
+            assert_eq!(startup_superuser(&tail(Some(encoding))), None, "{encoding}");
+        }
+        assert_eq!(startup_superuser(&tail(None)), None, "no encoding reported");
+        let replaced = [
+            frame_status("server_encoding", "UTF8"),
+            tail(Some("LATIN5")),
+        ]
+        .concat();
+        assert_eq!(startup_superuser(&replaced), None, "the last report counts");
     }
 
     const HELD: std::time::Duration = std::time::Duration::from_millis(200);
