@@ -592,6 +592,8 @@ mod tests {
             "wait",
         ] {
             assert!(COMMANDS.binary_search(&name).is_err(), "{name}");
+            assert!(!admit(&[name.as_bytes()]), "{name}");
+            assert!(!admit(&[name.as_bytes(), b"k", b"v"]), "{name}");
         }
         for (container, sub) in [
             ("config", "set"),
@@ -632,7 +634,38 @@ mod tests {
                 SUBCOMMANDS.binary_search(&(container, sub)).is_err(),
                 "{container} {sub}"
             );
+            assert!(
+                !admit(&[container.as_bytes(), sub.as_bytes()]),
+                "{container} {sub}"
+            );
         }
+    }
+
+    #[test]
+    fn the_rule_lists_are_pinned() {
+        assert_eq!(
+            BY_RULE,
+            [
+                "auth", "discard", "exec", "hello", "multi", "ping", "quit", "reset", "select"
+            ]
+        );
+        assert_eq!(
+            REFUSED_WHOLE,
+            [
+                "acl",
+                "config",
+                "debug",
+                "eval",
+                "eval_ro",
+                "evalsha",
+                "evalsha_ro",
+                "fcall",
+                "fcall_ro",
+                "module",
+                "script",
+            ]
+        );
+        assert_eq!(CLIENT_SUBCOMMANDS, ["getname", "id", "info", "setname"]);
     }
 
     fn run(state: &mut MultiState, commands: &[&str]) -> Vec<Verdict> {

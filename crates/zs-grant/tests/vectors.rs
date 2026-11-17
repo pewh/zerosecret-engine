@@ -43,7 +43,9 @@ fn grant_refusal(context: &Value, input: &Value) -> Value {
         .remove("field")
         .map(|value| value.as_str().unwrap().to_string());
     let value = object.remove("value");
-    let mut grant: Grant = serde_json::from_value(Value::Object(object)).unwrap();
+    let Ok(mut grant) = serde_json::from_value::<Grant>(Value::Object(object)) else {
+        return json!({"accepted": false});
+    };
     if let (Some(field), Some(value)) = (field, value) {
         overwrite(&mut grant, &field, value);
     }

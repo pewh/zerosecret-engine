@@ -1252,7 +1252,27 @@ mod tests {
     }
 
     #[test]
-    fn the_v0_6_0_payload_of_a_read_only_grant_fails_the_signature() {
+    fn an_unknown_access_value_is_refused() {
+        let value = serde_json::to_value(read_only_grant()).unwrap();
+        assert!(
+            serde_json::from_value::<Grant>(value.clone()).is_ok(),
+            "positive control: the read-only grant parses"
+        );
+        for unknown in ["write_only", "READ_ONLY", "read-only", "", "none"] {
+            let mut changed = value.clone();
+            changed["access"] = serde_json::json!(unknown);
+            assert!(
+                serde_json::from_value::<Grant>(changed).is_err(),
+                "{unknown:?}"
+            );
+        }
+        let mut numeric = value;
+        numeric["access"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Grant>(numeric).is_err());
+    }
+
+    #[test]
+    fn the_v0_6_1_payload_of_a_read_only_grant_fails_the_signature() {
         let case = access_vector_case();
         let grant: Grant = serde_json::from_value(case["input"].clone()).unwrap();
         assert_eq!(grant.access, zs_policy::Access::ReadOnly);
@@ -1279,10 +1299,10 @@ mod tests {
         assert!(key.verify(&previous, &signature).is_err());
 
         let previous_release = AgentVerifier::new(vec![("k1".into(), key)]);
-        let mut as_seen_by_v0_6_0 = grant;
-        as_seen_by_v0_6_0.access = zs_policy::Access::ReadWrite;
+        let mut as_seen_by_v0_6_1 = grant;
+        as_seen_by_v0_6_1.access = zs_policy::Access::ReadWrite;
         let signed = SignedGrant {
-            grant: as_seen_by_v0_6_0,
+            grant: as_seen_by_v0_6_1,
             signature: signature_b64.to_string(),
             signing_key_id: "k1".into(),
         };
