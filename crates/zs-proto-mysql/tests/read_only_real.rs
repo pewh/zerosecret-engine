@@ -596,3 +596,46 @@ async fn escapes_spelled_with_accented_letters_are_refused() {
     assert_eq!(rows(&mut admin, db).await, empty);
     drop_database(&mut admin, db).await;
 }
+
+const ADMIN_STATEMENTS: [&str; 13] = [
+    "RESET BINARY LOGS AND GTIDS",
+    "PURGE BINARY LOGS BEFORE '2000-01-01 00:00:00'",
+    "FLUSH LOGS",
+    "FLUSH TABLES WITH READ LOCK",
+    "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1'",
+    "STOP REPLICA",
+    "START REPLICA",
+    "CHANGE MASTER TO MASTER_HOST = '127.0.0.1'",
+    "CLONE LOCAL DATA DIRECTORY = '/tmp/zs-ro-clone'",
+    "ALTER INSTANCE ROTATE INNODB MASTER KEY",
+    "START TRANSACTION READ /*change*/ WRITE",
+    "SET TRANSACTION READ#change\nWRITE",
+    "RESTART",
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replication_log_flush_and_restart_statements_are_refused_for_root() {
+    let Some(server) = plain() else { return };
+    let db = "zs_ro_admin";
+    let mut admin = fresh_database(&server, db).await;
+
+    let mut control = read_write(&server).await;
+    works(&mut control, "SET SESSION transaction_read_only = ON").await;
+    insert_is_read_only(&mut control, db, "control setup").await;
+    for statement in [
+        "FLUSH LOGS",
+        "PURGE BINARY LOGS BEFORE '2000-01-01 00:00:00'",
+    ] {
+        works(&mut control, statement).await;
+    }
+
+    let mut session = read_only(&server).await;
+    for statement in ADMIN_STATEMENTS {
+        let answer = session.query(statement).await.unwrap();
+        assert!(is_refusal(&answer), "{statement}: {:?}", error(&answer));
+        insert_is_read_only(&mut session, db, statement).await;
+    }
+    works(&mut session, "SELECT 1").await;
+    works(&mut admin, "SELECT 1").await;
+    drop_database(&mut admin, db).await;
+}

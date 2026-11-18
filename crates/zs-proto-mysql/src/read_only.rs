@@ -4,7 +4,7 @@ pub const SESSION_START: &str = "SET SESSION transaction_read_only = ON";
 pub const MAX_SCREENED_COMMAND: usize = 64 << 20;
 pub(crate) const INLINE_SCAN_LIMIT: usize = 1 << 20;
 
-const WORDS: [&str; 11] = [
+const WORDS: [&str; 20] = [
     "transaction_read_only",
     "tx_read_only",
     "prepare",
@@ -16,6 +16,15 @@ const WORDS: [&str; 11] = [
     "kill",
     "shutdown",
     "load_file",
+    "restart",
+    "purge",
+    "flush",
+    "reset",
+    "replica",
+    "replication",
+    "group_replication",
+    "slave",
+    "clone",
 ];
 const FOLDED: [&str; 3] = [
     "transaction_read_only",
@@ -25,6 +34,15 @@ const FOLDED: [&str; 3] = [
 const PERSIST: &str = "persist";
 const TOKENS: [&str; 2] = ["/*!", "/*m!"];
 const READ_WRITE: &str = "read write";
+const CHANGE_MASTER: &str = "change master";
+const ALTER_INSTANCE: &str = "alter instance";
+/// Two-word phrases, each with its own state: a word of one phrase in the gap of another must
+/// not reset it (`READ /*change*/ WRITE`).
+const PHRASES: [(&str, &str, &str); 3] = [
+    ("read", "write", READ_WRITE),
+    ("change", "master", CHANGE_MASTER),
+    ("alter", "instance", ALTER_INSTANCE),
+];
 const QUERY_ATTRIBUTES: &str = "query_attributes";
 const EMPTY_ATTRIBUTES: [u8; 2] = [0x00, 0x01];
 
@@ -261,8 +279,8 @@ fn between_step(states: u8, byte: u8) -> u8 {
 }
 
 fn ascii_match(text: &[u8]) -> Option<&'static str> {
-    let mut between = 0u8;
-    let mut after_read = None;
+    let mut between = [0u8; PHRASES.len()];
+    let mut starts: [Option<usize>; PHRASES.len()] = [None; PHRASES.len()];
     for (at, &byte) in text.iter().enumerate() {
         if let Some(token) = TOKENS.iter().find(|token| {
             text.get(at..at + token.len())
@@ -270,11 +288,13 @@ fn ascii_match(text: &[u8]) -> Option<&'static str> {
         }) {
             return Some(token);
         }
-        if after_read == Some(at) {
-            between |= BETWEEN;
-        }
-        if between & BETWEEN != 0 && word_at(text, at, "write") {
-            return Some(READ_WRITE);
+        for (phrase, (_, second, name)) in PHRASES.iter().enumerate() {
+            if starts[phrase] == Some(at) {
+                between[phrase] |= BETWEEN;
+            }
+            if between[phrase] & BETWEEN != 0 && word_at(text, at, second) {
+                return Some(name);
+            }
         }
         if byte.is_ascii_alphabetic() && (at == 0 || !identifier(text[at - 1])) {
             if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
@@ -283,11 +303,15 @@ fn ascii_match(text: &[u8]) -> Option<&'static str> {
             if prefix_at(text, at, PERSIST) {
                 return Some(PERSIST);
             }
-            if word_at(text, at, "read") {
-                after_read = Some(at + 4);
+            for (phrase, (first, _, _)) in PHRASES.iter().enumerate() {
+                if word_at(text, at, first) {
+                    starts[phrase] = Some(at + first.len());
+                }
             }
         }
-        between = between_step(between, byte);
+        for state in &mut between {
+            *state = between_step(*state, byte);
+        }
     }
     None
 }
@@ -346,7 +370,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    const WORDS: [&str; 11] = [
+    const WORDS: [&str; 20] = [
         "transaction_read_only",
         "tx_read_only",
         "prepare",
@@ -358,7 +382,81 @@ mod tests {
         "kill",
         "shutdown",
         "load_file",
+        "restart",
+        "purge",
+        "flush",
+        "reset",
+        "replica",
+        "replication",
+        "group_replication",
+        "slave",
+        "clone",
     ];
+
+    #[test]
+    fn the_production_words_are_the_listed_words() {
+        assert_eq!(super::WORDS, WORDS);
+    }
+
+    #[test]
+    fn every_replication_log_flush_and_restart_statement_is_matched() {
+        for (text, word) in [
+            ("RESET BINARY LOGS AND GTIDS", "reset"),
+            ("RESET MASTER", "reset"),
+            ("RESET REPLICA ALL", "reset"),
+            ("PURGE BINARY LOGS TO 'binlog.000002'", "purge"),
+            ("FLUSH TABLES WITH READ LOCK", "flush"),
+            ("FLUSH LOGS", "flush"),
+            ("RESTART", "restart"),
+            (
+                "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'x'",
+                "replication",
+            ),
+            (
+                "CHANGE REPLICATION FILTER REPLICATE_DO_DB = (d)",
+                "replication",
+            ),
+            ("STOP REPLICA", "replica"),
+            ("START REPLICA IO_THREAD", "replica"),
+            ("STOP SLAVE", "slave"),
+            ("START GROUP_REPLICATION", "group_replication"),
+            ("CHANGE MASTER TO MASTER_HOST = 'x'", "change master"),
+            ("change/**/master to master_host = 'x'", "change master"),
+            ("CHANGE -- c\nMASTER TO MASTER_HOST = 'x'", "change master"),
+            ("CHANGE #c\n MASTER TO MASTER_HOST = 'x'", "change master"),
+            ("START TRANSACTION READ /*change*/ WRITE", "read write"),
+            ("SET TRANSACTION READ#change\nWRITE", "read write"),
+            ("START TRANSACTION READ -- change\nWRITE", "read write"),
+            ("START TRANSACTION READ /*alter*/ WRITE", "read write"),
+            (
+                "CHANGE /*read*/ MASTER TO MASTER_HOST = 'x'",
+                "change master",
+            ),
+            (
+                "CHANGE #alter\n MASTER TO MASTER_HOST = 'x'",
+                "change master",
+            ),
+            ("ALTER INSTANCE ROTATE INNODB MASTER KEY", "alter instance"),
+            ("alter /*read*/ instance reload tls", "alter instance"),
+            ("CLONE LOCAL DATA DIRECTORY = '/tmp/zs'", "clone"),
+        ] {
+            assert_eq!(found(text), Some(word), "{text:?}");
+        }
+        for text in [
+            "SELECT master FROM branches",
+            "SELECT * FROM refs WHERE name = 'master'",
+            "SELECT change_count, master_id FROM t",
+            "SELECT reset_at, flushed, purged_at, replicas FROM t",
+            "SELECT changed FROM t WHERE x = 'master'",
+            "SELECT 'change' AS c, 'x master' AS m",
+            "CHANGE x MASTER",
+            "SELECT instance, altered FROM t",
+            "ALTER TABLE t ADD COLUMN instance INT",
+            "SELECT clones FROM t",
+        ] {
+            assert_eq!(found(text), None, "{text:?}");
+        }
+    }
 
     fn found(text: &str) -> Option<&'static str> {
         scan(text.as_bytes())
@@ -452,10 +550,11 @@ mod tests {
             "set persist_only x = 1",
             "SET @@persist.x = 1",
             "SELECT persists",
-            "RESET PERSIST x",
+            "SET SESSION x = 1, PERSIST y = 2",
         ] {
             assert_eq!(found(text), Some("persist"), "{text}");
         }
+        assert_eq!(found("RESET PERSIST x"), Some("reset"), "reset comes first");
         for text in ["SELECT is_persisted", "SELECT xpersist", "SELECT $persist"] {
             assert_eq!(found(text), None, "{text}");
         }
