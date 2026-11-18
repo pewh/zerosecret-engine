@@ -39,6 +39,22 @@ release of the agent is needed before the control plane issues the first read-on
 can connect without the agent and is not limited by it. A database account that has only read
 privileges is the control that stops writes. The agent makes the safe path the easy path.
 
+**Amended 2026-11-18 (owner decisions after the whole-branch review).**
+- PostgreSQL: `COPY ... TO PROGRAM`, `COPY ... FROM PROGRAM` and `COPY ... TO '<server file>'`
+  are refused in every read-only session, not only for a superuser. A login with
+  `pg_execute_server_program` or `pg_write_server_files` can run them in read-only mode. For
+  the same reason `lo_export` and the adminpack file functions are refused in every session.
+- MySQL: replication, binary log, flush, clone, instance and restart statements are refused in
+  every read-only session. The server runs them in read-only mode for a root-class login.
+- MongoDB: `getMore` and `killCursors` need a cursor that a read-only session of the same
+  resource opened. The agent keeps one set per resource, because a driver pool continues a
+  cursor on any of its connections. So a write prepared in a read-write session cannot finish
+  after a switch.
+- PostgreSQL 13 and older can be read-only resources. They do not report the mode, so the agent
+  asks `SHOW default_transaction_read_only` once at login, and only a `server_version` in the
+  PostgreSQL form passes. They do not report a later change either, so the agent has no
+  backstop on them; the scan is the only check in the session.
+
 **Reverse it if** the agent must stop checking commands. Then `access` leaves the grant, and
 a later version of the grant says so.
 

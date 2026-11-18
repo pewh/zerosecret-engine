@@ -36,7 +36,7 @@
   connection pool then opens new sessions.
 - On a read-only PostgreSQL resource the agent sends one pipelined unit at a time: it holds
   the next `Query` or extended-protocol unit until the server is ready again.
-- Tested against PostgreSQL 16, MySQL 8.4, MongoDB 8.0 and Redis 7.4: libpq, node-postgres,
+- Tested against PostgreSQL 16 and 13, MySQL 8.4, MongoDB 8.0 and Redis 7.4: libpq, node-postgres,
   pgx, psycopg, mysql2, the MongoDB Node driver and ioredis read through a read-only session
   and are refused a write.
 - Audit, all `deny`: `read-only` for a refused command (operation `query`) and for a refused
@@ -44,18 +44,44 @@
   mode, or at startup does not confirm it or reports a single-byte encoding; `access changed` when the access of the grant
   changes; `grant revoked` when the grant is revoked or expires; `read-only refusal backlog`
   when a Redis client has 16,384 refused commands that wait for their reply.
+- PostgreSQL, every read-only session: `COPY ... TO PROGRAM`, `COPY ... FROM PROGRAM` and
+  `COPY ... TO '<server file>'` are refused, also for a login that is not a superuser
+  (`pg_execute_server_program`, `pg_write_server_files`). `COPY ... TO STDOUT` works, and so
+  does a table named `program`. A statement that names `copy` and later has `program` or `to`
+  before a string literal is refused, so `COPY (SELECT ... SIMILAR TO 'x') TO STDOUT` is
+  refused too. `lo_export`, `pg_file_write`, `pg_file_rename` and `pg_file_unlink` (server
+  files) and `crosstab` with every `crosstab*` name, `connectby` and `xpath_table` (they run
+  SQL text) are refused in every read-only session.
+- PostgreSQL 13 and older: the server does not report `default_transaction_read_only`, so
+  the agent sends `SHOW default_transaction_read_only` once after login and opens the session
+  only when the answer is `on`. The client never sees this query. A server whose
+  `server_version` is not in the PostgreSQL form (YugabyteDB), or that reports `crdb_version`
+  (CockroachDB), cannot be a read-only resource.
+- MySQL, every read-only session: the words `restart`, `purge`, `flush`, `reset`, `replica`,
+  `replication`, `group_replication`, `slave` and `clone` and the phrases `change master` and
+  `alter instance` are refused, so a root-class login cannot run replication, binary log,
+  flush, clone, instance or restart statements. `SHOW REPLICA STATUS` is refused too, and so is
+  a string literal that is one of these words, such as `'reset'`.
+- MongoDB: a read-only session admits `getMore` and `killCursors` only for a cursor that a
+  read-only session of the same resource opened (`find`, `aggregate`, `listCollections`,
+  `listIndexes`), on any of its connections. A cursor opened in a read-write session, such as
+  a `$merge` prepared with `batchSize: 0`, is refused with code 13. The agent forgets a cursor
+  when it is exhausted or killed, after 30 min without use, or as the oldest of 65,536.
+- MongoDB, every session: a client message that reuses the request id of a message whose
+  reply is still awaited closes the session, so one reply cannot be read as the other.
 - Limit, PostgreSQL: a read-only resource needs a multi-byte server encoding (`UTF8`, `EUC_JP`,
-  `EUC_CN`, `EUC_KR`, `EUC_TW`, `EUC_JIS_2004` or `MULE_INTERNAL`) and a server that reports
-  `default_transaction_read_only` at startup. PostgreSQL 13 and older, and poolers that drop
-  the server's startup parameters, cannot.
+  `EUC_CN`, `EUC_KR`, `EUC_TW`, `EUC_JIS_2004` or `MULE_INTERNAL`). Poolers that drop the
+  server's startup parameters cannot be read-only resources.
+- Limit, PostgreSQL 13 and older: the server does not report a later change of the mode, so
+  the agent has no backstop there. A switch-off that the scan cannot see, for example inside
+  an existing function that calls `set_config`, is not detected.
 - Limit, MySQL: a client that sends query attributes is refused. Connector/J 8.1 and later
   sends them when OpenTelemetry is on the classpath; set `openTelemetry=DISABLED`.
 - Limit, PostgreSQL and MySQL: a read-only statement text over 64 MiB closes the session.
 - Limit, MySQL: binary commands outside the allowlist are refused. A non-Latin value with three
   segments joined by `_` can be refused.
-- Limit, MongoDB: a `getMore` can complete a `$merge` or `$out` that a read-write session of
-  the same login opened with `batchSize: 0`. After a switch to read-only this is possible until
-  the server's cursor timeout.
+- Limit, MongoDB: a read cursor that a session opened before a switch to read-only cannot be
+  continued after it; the driver gets code 13 and runs the query again.
 - Limit, Redis: `EVAL_RO`, `EVALSHA_RO` and `FCALL_RO` are refused.
 
 ## [0.6.1] - 2026-11-15
