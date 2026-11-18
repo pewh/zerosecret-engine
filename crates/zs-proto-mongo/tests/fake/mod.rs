@@ -529,6 +529,9 @@ fn sasl_reply(
         .with_f64("ok", 1.0)
 }
 
+/// The cursor id of a `find` with `batchSize: 1`; every other `find` exhausts its cursor.
+pub const OPEN_CURSOR: i64 = 7;
+
 fn command_reply(name: &str, request: &Doc) -> Doc {
     match name {
         "find" => {
@@ -543,7 +546,14 @@ fn command_reply(name: &str, request: &Doc) -> Doc {
             };
             let cursor = Doc::new()
                 .with_array("firstBatch", &Doc::new().with_doc("0", &item))
-                .with_i64("id", 0)
+                .with_i64(
+                    "id",
+                    if request.int("batchSize") == Some(1) {
+                        OPEN_CURSOR
+                    } else {
+                        0
+                    },
+                )
                 .with_str("ns", "appdb.orders");
             Doc::new().with_doc("cursor", &cursor).with_f64("ok", 1.0)
         }

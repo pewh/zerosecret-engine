@@ -721,3 +721,80 @@ async fn more_to_come_write_closes_the_session_without_reply() {
     );
     setup.finish(&[]).await;
 }
+
+async fn connected(local: SocketAddr) -> Client {
+    let mut client = Client::connect(local).await;
+    let hello = client.legacy_handshake().await.unwrap();
+    assert!(hello.truthy("ok"), "positive control: the login works");
+    client
+}
+
+fn get_more(collection: &str, cursor: i64) -> Doc {
+    command("getMore", collection)
+        .with_i64("getMore", cursor)
+        .with_str("collection", collection)
+        .with_i32("batchSize", 10)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_opened_read_write_cannot_finish_in_a_read_only_session() {
+    let Some(real) = real() else { return };
+    let (source, target) = ("zs_ro_cursor_merge_source", "zs_ro_cursor_merge_target");
+    let mut setup = real.setup().await;
+    setup.reset(source, &numbered()).await;
+    setup.reset(target, &[]).await;
+    let merge = command("aggregate", source)
+        .with_array(
+            "pipeline",
+            &array_of(&[stage("$merge", &Doc::new().with_str("into", target))]),
+        )
+        .with_doc("cursor", &Doc::new().with_i32("batchSize", 0));
+    let prepared = setup.run(merge).await;
+    ok(&prepared);
+    let cursor = prepared.doc("cursor").unwrap().int("id").unwrap();
+    assert_ne!(cursor, 0, "the server kept the $merge cursor open");
+    assert_eq!(
+        setup.count(target, &Doc::new()).await,
+        0,
+        "batchSize 0 wrote nothing yet"
+    );
+
+    let local = real.listen(SessionAccess::ReadOnly).await;
+    let mut session = connected(local).await;
+    refused(&session.command(get_more(source, cursor)).await.unwrap());
+    let kill =
+        command("killCursors", source).with_array("cursors", &Doc::new().with_i64("0", cursor));
+    refused(&session.command(kill).await.unwrap());
+    assert_eq!(
+        setup.count(target, &Doc::new()).await,
+        0,
+        "nothing merged through the read-only session"
+    );
+
+    let finished = setup.run(get_more(source, cursor)).await;
+    ok(&finished);
+    assert_eq!(
+        setup.count(target, &Doc::new()).await,
+        COLLECTION_COUNT,
+        "negative control: the cursor was live and a read-write getMore runs the write"
+    );
+
+    let opened = session
+        .command(find(source, &Doc::new()).with_i32("batchSize", 2))
+        .await
+        .unwrap();
+    ok(&opened);
+    let read_cursor = opened.doc("cursor").unwrap().int("id").unwrap();
+    assert_ne!(read_cursor, 0);
+    let mut pooled = connected(local).await;
+    let more = pooled.command(get_more(source, read_cursor)).await.unwrap();
+    ok(&more);
+    assert_eq!(
+        batch(&more, "nextBatch").len(),
+        3,
+        "positive control: another connection of the pool continues a read cursor"
+    );
+    assert_eq!(more.doc("cursor").unwrap().int("id"), Some(0));
+    refused(&pooled.command(get_more(source, read_cursor)).await.unwrap());
+    setup.finish(&[]).await;
+}

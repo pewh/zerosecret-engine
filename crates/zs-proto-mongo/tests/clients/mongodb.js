@@ -44,6 +44,11 @@ async function main() {
 
   readStep("read", await attempt(found), 1);
   readStep("read-count", await attempt(() => collection.countDocuments({})), 1);
+  const batched = async () => (await collection.find({}, { batchSize: 1 }).toArray()).length;
+  readStep("read-batched", await attempt(batched), 1);
+  const parallel = async () =>
+    (await Promise.all([batched(), batched(), batched(), batched()])).reduce((a, b) => a + b, 0);
+  readStep("read-batched-parallel", await attempt(parallel), 4);
   writeStep("insert", await attempt(() => collection.insertOne({ _id: 2 })));
   writeStep("update", await attempt(() => collection.updateOne({ _id: 1 }, { $set: { touched: true } })));
   writeStep("insert-again", await attempt(() => collection.insertOne({ _id: 3 })));

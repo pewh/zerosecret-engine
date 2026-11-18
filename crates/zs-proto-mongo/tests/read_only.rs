@@ -165,11 +165,11 @@ async fn silent_close(client: &mut Client) {
 
 fn allowed_commands() -> Vec<Doc> {
     vec![
-        fake::find(),
-        command("getMore").with_i64("getMore", 7),
+        fake::find().with_i32("batchSize", 1),
+        command("getMore").with_i64("getMore", fake::OPEN_CURSOR),
         Doc::new()
             .with_str("killCursors", "orders")
-            .with_array("cursors", &Doc::new().with_i64("0", 7))
+            .with_array("cursors", &Doc::new().with_i64("0", fake::OPEN_CURSOR))
             .with_str("$db", "appdb"),
         command("count"),
         command("distinct").with_str("key", "n"),
@@ -213,6 +213,45 @@ async fn allowlisted_commands_are_forwarded_byte_for_byte_and_answered() {
         fake::in_conn(&events, "command_refused", 1).is_empty(),
         "{log}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_more_and_kill_cursors_need_a_cursor_that_a_read_only_session_opened() {
+    let rig = Rig::start(SessionAccess::ReadOnly).await;
+    let mut first = rig.login().await;
+    let get_more = || command("getMore").with_i64("getMore", fake::OPEN_CURSOR);
+    let kill = || {
+        command("killCursors").with_array("cursors", &Doc::new().with_i64("0", fake::OPEN_CURSOR))
+    };
+    refused(&mut first, OpMsg::new(get_more())).await;
+    refused(&mut first, OpMsg::new(kill())).await;
+    assert_eq!(
+        rig.commands(),
+        Vec::<String>::new(),
+        "neither reached the upstream"
+    );
+
+    let (_, opened) = answered(
+        &mut first,
+        OpMsg::new(fake::find().with_i32("batchSize", 1)),
+    )
+    .await;
+    assert!(opened.truthy("ok"));
+    let mut second = rig.login().await;
+    let (_, more) = answered(&mut second, OpMsg::new(get_more())).await;
+    assert!(
+        more.truthy("ok"),
+        "another connection of the pool continues the cursor"
+    );
+    let (_, killed) = answered(&mut second, OpMsg::new(kill())).await;
+    assert!(killed.truthy("ok"));
+    refused(&mut second, OpMsg::new(get_more())).await;
+    assert_eq!(rig.commands(), vec!["find", "getMore", "killCursors"]);
+    assert_eq!(rig.refusals(), vec![("query", "read-only"); 3]);
+
+    let other = Rig::start(SessionAccess::ReadOnly).await;
+    let mut elsewhere = other.login().await;
+    refused(&mut elsewhere, OpMsg::new(get_more())).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -703,5 +742,30 @@ async fn an_auth_command_still_ends_a_read_only_session_as_an_auth_refusal() {
     assert_eq!(
         rig.refusals(),
         vec![("authenticate", zs_proto_mongo::AUTHENTICATE_REFUSED_REASON)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_id_that_is_still_awaited_closes_the_session() {
+    let rig = Rig::start(SessionAccess::ReadOnly).await;
+    let mut client = rig.login().await;
+    let id = client.next_id();
+    let mut frames = OpMsg::new(fake::find().with_i32("batchSize", 1)).encode(id, 0);
+    frames.extend(OpMsg::new(command("count")).encode(id, 0));
+    client.send(&frames).await.unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.stream.read_to_end(&mut rest))
+        .await
+        .expect("the session closed")
+        .ok();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let commands = rig.commands();
+    assert!(
+        commands.iter().all(|name| name == "find"),
+        "only the first message may reach the upstream: {commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|name| name == "count"),
+        "the second message with the same id never reached the upstream: {commands:?}"
     );
 }

@@ -181,6 +181,26 @@ pub fn contains_key(bytes: &[u8], names: &[&str]) -> Result<bool, Malformed> {
     Ok(false)
 }
 
+/// The kind and value of the first top-level element named `name`, without copying the document.
+pub fn top_level<'a>(bytes: &'a [u8], name: &str) -> Result<Option<(u8, &'a [u8])>, Malformed> {
+    let end = document_frame(bytes, 0, bytes.len())? - 1;
+    let mut cursor = 4;
+    while cursor < end {
+        let kind = *bytes.get(cursor).ok_or(Malformed)?;
+        let name_end = cstring_end(bytes, cursor + 1)?;
+        let value_at = name_end + 1;
+        let len = value_len(kind, bytes, value_at)?;
+        if value_at + len > end {
+            return Err(Malformed);
+        }
+        if &bytes[cursor + 1..name_end] == name.as_bytes() {
+            return Ok(Some((kind, &bytes[value_at..value_at + len])));
+        }
+        cursor = value_at + len;
+    }
+    Ok(None)
+}
+
 pub fn str_value(text: &str) -> Vec<u8> {
     let mut value = ((text.len() + 1) as i32).to_le_bytes().to_vec();
     value.extend_from_slice(text.as_bytes());

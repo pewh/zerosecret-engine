@@ -5,7 +5,7 @@ pub mod scram;
 pub mod topology;
 pub mod wire;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -135,6 +135,7 @@ struct Shared {
     listener_addr: String,
     primary: PrimaryState,
     budget: Duration,
+    cursors: Arc<read_only::Cursors>,
 }
 
 impl MongoListener {
@@ -168,6 +169,7 @@ impl MongoListener {
                 listener_addr,
                 primary: PrimaryState::new(),
                 budget: HANDSHAKE_BUDGET,
+                cursors: Arc::default(),
             },
         })
     }
@@ -817,6 +819,7 @@ impl Ending {
 
 struct Relay {
     tracked: Mutex<HashSet<i32>>,
+    expected: Mutex<HashMap<i32, read_only::Expect>>,
     up: AtomicU64,
     down: AtomicU64,
     limit: usize,
@@ -830,6 +833,33 @@ impl Relay {
         if let Ok(mut set) = self.tracked.lock() {
             set.insert(request_id);
         }
+    }
+
+    fn expect(&self, request_id: i32, expect: read_only::Expect) {
+        if let Ok(mut map) = self.expected.lock() {
+            map.insert(request_id, expect);
+        }
+    }
+
+    fn expected(&self, response_to: i32) -> Option<read_only::Expect> {
+        self.expected
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&response_to))
+    }
+
+    /// Whether a reply to `request_id` is still awaited. A client that reuses such an id would
+    /// let one reply be read as the other (a cursor reply as a `hello`, or the reverse).
+    fn pending(&self, request_id: i32) -> bool {
+        self.tracked
+            .lock()
+            .map(|set| set.contains(&request_id))
+            .unwrap_or(true)
+            || self
+                .expected
+                .lock()
+                .map(|map| map.contains_key(&request_id))
+                .unwrap_or(true)
     }
 
     fn take(&self, response_to: i32) -> bool {
@@ -880,6 +910,9 @@ where
         let Ok(payload) = wire::read_payload(client, &header).await else {
             return Ending::Client;
         };
+        if relay.pending(header.request_id) {
+            return Ending::Refused("request_id");
+        }
         if wire::msg_flags(&payload).is_some_and(|f| f & wire::CHECKSUM_PRESENT != 0) {
             return Ending::Refused("checksum");
         }
@@ -897,20 +930,24 @@ where
         if wire::body_sections(&payload) != Ok(1) {
             return Ending::Refused("malformed");
         }
-        if relay.read_only
-            && let Err(refusal) = read_only::screen(&payload)
-        {
-            conn.command_refused(&refusal);
-            let unanswered = wire::msg_flags(&payload).is_none_or(|f| f & wire::MORE_TO_COME != 0);
-            if refusal.reason == read_only::MALFORMED || unanswered {
-                return Ending::ReadOnly;
+        let unanswered = wire::msg_flags(&payload).is_none_or(|f| f & wire::MORE_TO_COME != 0);
+        if relay.read_only {
+            match read_only::screen(&payload, &conn.shared.cursors, Instant::now()) {
+                Ok(Some(expect)) if !unanswered => relay.expect(header.request_id, expect),
+                Ok(_) => {}
+                Err(refusal) => {
+                    conn.command_refused(&refusal);
+                    if refusal.reason == read_only::MALFORMED || unanswered {
+                        return Ending::ReadOnly;
+                    }
+                    let refused = OpMsg::new(READ_ONLY_REFUSED.doc())
+                        .encode(conn.request_id(), header.request_id);
+                    if let Err(ending) = relay.reply(&refused).await {
+                        return ending;
+                    }
+                    continue;
+                }
             }
-            let refused =
-                OpMsg::new(READ_ONLY_REFUSED.doc()).encode(conn.request_id(), header.request_id);
-            if let Err(ending) = relay.reply(&refused).await {
-                return ending;
-            }
-            continue;
         }
         let frame = if topology::is_hello(command) {
             let Ok(mut msg) = OpMsg::parse(&payload) else {
@@ -977,7 +1014,37 @@ where
         if !header.length_ok(relay.limit) {
             return Ending::Broken("frame_size");
         }
-        if !relay.take(header.response_to) {
+        let hello = relay.take(header.response_to);
+        if hello {
+            relay.expected(header.response_to);
+        }
+        if !hello
+            && relay.read_only
+            && let Some(expect) = relay.expected(header.response_to)
+        {
+            let payload = match wire::read_payload(upstream, &header).await {
+                Ok(payload) => payload,
+                Err(error) => return Ending::Broken(zs_diag::io_kind(&error)),
+            };
+            if wire::msg_flags(&payload).is_some_and(|f| f & wire::MORE_TO_COME != 0) {
+                relay.expect(header.request_id, expect);
+            }
+            conn.shared
+                .cursors
+                .replied(&expect, &payload, Instant::now());
+            let mut client = relay.client.lock().await;
+            if client.write_all(&header.encode()).await.is_err()
+                || client.write_all(&payload).await.is_err()
+            {
+                return Ending::Client;
+            }
+            drop(client);
+            relay
+                .down
+                .fetch_add(header.length as u64, Ordering::Relaxed);
+            continue;
+        }
+        if !hello {
             let mut client = relay.client.lock().await;
             if client.write_all(&header.encode()).await.is_err() {
                 return Ending::Client;
@@ -1040,6 +1107,7 @@ async fn relay(client: TcpStream, session: Session, conn: &Conn) {
     let (mut client_read, client_write) = client.into_split();
     let state = Relay {
         tracked: Mutex::new(HashSet::new()),
+        expected: Mutex::new(HashMap::new()),
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
         limit: session.max_message,
