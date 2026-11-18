@@ -2169,20 +2169,22 @@ where
 
     let gate = match access {
         SessionAccess::ReadWrite => None,
-        SessionAccess::ReadOnly => match read_only::startup_superuser(&startup_tail) {
-            Some(superuser) => {
-                if superuser {
-                    trace.superuser();
+        SessionAccess::ReadOnly => {
+            match read_only_superuser(&mut upstream, &startup_tail, deadline).await {
+                Some(superuser) => {
+                    if superuser {
+                        trace.superuser();
+                    }
+                    Some(Arc::new(Gate::new(superuser)))
                 }
-                Some(Arc::new(Gate::new(superuser)))
+                None => {
+                    trace.escaped();
+                    let (code, reason) = READ_ONLY_UNAVAILABLE;
+                    let _ = client.write_all(&error_frame(code, reason)).await;
+                    return Ok(());
+                }
             }
-            None => {
-                trace.escaped();
-                let (code, reason) = READ_ONLY_UNAVAILABLE;
-                let _ = client.write_all(&error_frame(code, reason)).await;
-                return Ok(());
-            }
-        },
+        }
     };
 
     client
@@ -2386,6 +2388,42 @@ async fn authenticate_upstream<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 const MAX_FORWARDED_STARTUP: usize = 1_000_000;
+const MAX_CONFIRMATION: usize = 64 * 1024;
+
+/// Whether a read-only session may start, and whether its login is a superuser. A server
+/// older than 14 does not report the mode, so the agent asks it once, before the client
+/// sees `ReadyForQuery`; the answer never reaches the client.
+async fn read_only_superuser<S: AsyncRead + AsyncWrite + Unpin>(
+    upstream: &mut S,
+    startup_tail: &[u8],
+    deadline: tokio::time::Instant,
+) -> Option<bool> {
+    let superuser = match read_only::startup_check(startup_tail) {
+        read_only::Start::Confirmed { superuser } => return Some(superuser),
+        read_only::Start::Refused => return None,
+        read_only::Start::Unreported { superuser } => superuser,
+    };
+    let confirmed = tokio::time::timeout_at(deadline, async {
+        let mut query = read_only::CONFIRM_QUERY.as_bytes().to_vec();
+        query.push(0);
+        send(upstream, &read_only::frame(b'Q', &query)).await.ok()?;
+        let mut answer = Vec::new();
+        loop {
+            let (tag, body) = read_tagged(upstream).await.ok()?;
+            answer.push(tag);
+            answer.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            answer.extend_from_slice(&body);
+            if answer.len() > MAX_CONFIRMATION {
+                return None;
+            }
+            if tag == b'Z' {
+                return (read_only::confirmation(&answer) == Some(answer.len())).then_some(());
+            }
+        }
+    })
+    .await;
+    matches!(confirmed, Ok(Some(()))).then_some(superuser)
+}
 
 fn error_message(body: &[u8]) -> String {
     body.split(|b| *b == 0)

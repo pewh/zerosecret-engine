@@ -18,6 +18,9 @@ pub(crate) const MAX_PARAMETER_STATUS: u32 = 16 * 1024;
 const MODE_SETTING: &[u8] = b"default_transaction_read_only";
 const SUPERUSER_SETTING: &[u8] = b"is_superuser";
 const ENCODING_SETTING: &[u8] = b"server_encoding";
+const VERSION_SETTING: &[u8] = b"server_version";
+/// CockroachDB reports this; it speaks the protocol but is not PostgreSQL.
+const FOREIGN_SETTING: &[u8] = b"crdb_version";
 const MULTI_BYTE_ENCODINGS: [&[u8]; 7] = [
     b"UTF8",
     b"EUC_JP",
@@ -27,13 +30,12 @@ const MULTI_BYTE_ENCODINGS: [&[u8]; 7] = [
     b"EUC_JIS_2004",
     b"MULE_INTERNAL",
 ];
-const SUPERUSER_WORDS: [&str; 10] = [
+const SUPERUSER_WORDS: [&str; 9] = [
     "program",
     "pg_reload_conf",
     "pg_terminate_backend",
     "pg_cancel_backend",
     "lo_import",
-    "lo_export",
     "pg_read_file",
     "pg_read_binary_file",
     "pg_ls_dir",
@@ -56,7 +58,10 @@ const AGENT_OPTION: &[u8] = b"-c default_transaction_read_only=on";
 const SETTINGS: [&[u8]; 2] = [b"default_transaction_read_only", b"transaction_read_only"];
 const ARGUMENT_OPTIONS: &[u8] = b"BCcDdfhkNprStvW-";
 const FLAG_OPTIONS: &[u8] = b"bEeFijlnOPsT";
-const WORDS: [&str; 8] = [
+/// Refused in every read-only session: the mode switches, functions that run SQL text
+/// (`query_to_xml*`, `ts_*`, `crosstab`, `connectby`, `xpath_table`), and functions that write
+/// server files and can be granted to a login that is not a superuser.
+const WORDS: [&str; 14] = [
     "set_config",
     "default_transaction_read_only",
     "transaction_read_only",
@@ -65,8 +70,20 @@ const WORDS: [&str; 8] = [
     "query_to_xml_and_xmlschema",
     "ts_stat",
     "ts_rewrite",
+    "connectby",
+    "xpath_table",
+    "lo_export",
+    "pg_file_write",
+    "pg_file_rename",
+    "pg_file_unlink",
 ];
+const COPY: &str = "copy";
+const PROGRAM: &str = "program";
+const COPY_PROGRAM: &str = "copy program";
+const COPY_TO_FILE: &str = "copy to file";
 const DBLINK: &str = "dblink";
+/// A prefix, like `dblink`: tablefunc installs `crosstab2`, `crosstab3` and `crosstab4` too.
+const CROSSTAB: &str = "crosstab";
 const READ_WRITE: &str = "read write";
 const DO: &str = "do";
 const UNICODE_ESCAPE: &str = "u&";
@@ -319,8 +336,23 @@ fn phrase_at(text: &[u8], at: usize, words: &[&str], budget: &mut usize) -> bool
     true
 }
 
+fn string_start(text: &[u8], at: usize) -> bool {
+    match text.get(at) {
+        Some(b'\'' | b'$') => true,
+        Some(b'e' | b'E') => text.get(at + 1) == Some(&b'\''),
+        _ => false,
+    }
+}
+
+/// Whether a string literal follows `end`, after blanks and comments (fails closed when the
+/// scan budget runs out). `COPY` takes a file name or a command only as a string literal.
+fn literal_follows(text: &[u8], end: usize, budget: &mut usize) -> bool {
+    skip_blank(text, end, budget).is_none_or(|next| string_start(text, next))
+}
+
 pub fn scan(text: &[u8], superuser: bool) -> Option<&'static str> {
     let mut budget = 4 * text.len() + 1024;
+    let mut copy = false;
     for at in 0..text.len() {
         if superuser && let Some(found) = superuser_match(text, at, &mut budget) {
             return Some(found);
@@ -328,8 +360,18 @@ pub fn scan(text: &[u8], superuser: bool) -> Option<&'static str> {
         if let Some(word) = WORDS.iter().find(|word| word_at(text, at, word)) {
             return Some(word);
         }
-        if prefix_at(text, at, DBLINK) {
-            return Some(DBLINK);
+        copy |= word_at(text, at, COPY);
+        if copy && word_at(text, at, PROGRAM) && literal_follows(text, at + 7, &mut budget) {
+            return Some(COPY_PROGRAM);
+        }
+        if copy && word_at(text, at, "to") && literal_follows(text, at + 2, &mut budget) {
+            return Some(COPY_TO_FILE);
+        }
+        if let Some(prefix) = [DBLINK, CROSSTAB]
+            .into_iter()
+            .find(|prefix| prefix_at(text, at, prefix))
+        {
+            return Some(prefix);
         }
         if text[at].eq_ignore_ascii_case(&b'u') && text.get(at + 1) == Some(&b'&') {
             return Some(UNICODE_ESCAPE);
@@ -344,7 +386,7 @@ pub fn scan(text: &[u8], superuser: bool) -> Option<&'static str> {
     None
 }
 
-fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut message = vec![tag];
     message.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     message.extend_from_slice(body);
@@ -404,26 +446,129 @@ pub(crate) fn parameter_status(body: &[u8]) -> Option<Status> {
     })
 }
 
-pub(crate) fn startup_superuser(tail: &[u8]) -> Option<bool> {
-    let (mut superuser, mut reported, mut multi_byte) = (false, false, false);
+/// How a read-only session may start, read from the server's startup reports.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// The server reported `default_transaction_read_only = on`.
+    Confirmed {
+        superuser: bool,
+    },
+    /// A server older than 14 does not report the mode; the agent asks with
+    /// [`CONFIRM_QUERY`] before the client gets `ReadyForQuery`.
+    Unreported {
+        superuser: bool,
+    },
+    Refused,
+}
+
+/// The first major version that reports `default_transaction_read_only`.
+const REPORTING_VERSION: u32 = 14;
+
+/// The major version of a plain PostgreSQL `server_version`: `13.16`, `9.6.24`, `13beta1`,
+/// `12.20 (Debian ...)`. Anything else (`13.0.0` of CockroachDB, `11.2-YB-...` of YugabyteDB)
+/// is not PostgreSQL, and the agent does not open a read-only session to it.
+fn major_version(value: &[u8]) -> Option<u32> {
+    let value = value.split(|byte| *byte == b' ').next()?;
+    let digits = value
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let major: u32 = std::str::from_utf8(value.get(..digits)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    if digits > 3 {
+        return None;
+    }
+    let mut rest = &value[digits..];
+    let mut components = 1;
+    while let [b'.', after @ ..] = rest {
+        let count = after
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if count == 0 {
+            return None;
+        }
+        components += 1;
+        rest = &after[count..];
+    }
+    if components > if major < 10 { 3 } else { 2 } {
+        return None;
+    }
+    let pre_release = |tag: &[u8]| {
+        rest.strip_prefix(tag)
+            .is_some_and(|number| number.iter().all(u8::is_ascii_digit))
+    };
+    (rest.is_empty() || [&b"beta"[..], b"rc", b"devel"].into_iter().any(pre_release))
+        .then_some(major)
+}
+
+fn read_startup(tail: &[u8]) -> Option<(bool, Option<bool>, bool, Option<u32>)> {
+    let (mut superuser, mut mode, mut multi_byte, mut version) = (false, None, false, None);
     let mut rest = tail;
     while let [tag, a, b, c, d, after @ ..] = rest {
         let size = (u32::from_be_bytes([*a, *b, *c, *d]) as usize).checked_sub(4)?;
         let body = after.get(..size)?;
         if *tag == b'S' {
-            if let (ENCODING_SETTING, value) = setting(body)? {
-                multi_byte = MULTI_BYTE_ENCODINGS.contains(&value);
+            match setting(body)? {
+                (ENCODING_SETTING, value) => multi_byte = MULTI_BYTE_ENCODINGS.contains(&value),
+                (VERSION_SETTING, value) => version = major_version(value),
+                (FOREIGN_SETTING, _) => return None,
+                _ => {}
             }
             match parameter_status(body)? {
-                Status::Escaped => return None,
-                Status::ReadOnly => reported = true,
+                Status::Escaped => mode = Some(false),
+                Status::ReadOnly => mode = mode.or(Some(true)),
                 Status::Superuser => superuser = true,
                 Status::Other => {}
             }
         }
         rest = &after[size..];
     }
-    (rest.is_empty() && reported && multi_byte).then_some(superuser)
+    rest.is_empty()
+        .then_some((superuser, mode, multi_byte, version))
+}
+
+pub(crate) fn startup_check(tail: &[u8]) -> Start {
+    match read_startup(tail) {
+        Some((superuser, Some(true), true, _)) => Start::Confirmed { superuser },
+        Some((superuser, None, true, Some(version))) if version < REPORTING_VERSION => {
+            Start::Unreported { superuser }
+        }
+        _ => Start::Refused,
+    }
+}
+
+/// The query that confirms the mode on a server older than 14.
+pub(crate) const CONFIRM_QUERY: &str = "SHOW default_transaction_read_only";
+
+/// Reads the server's answer to [`CONFIRM_QUERY`]. `None`: refuse the session;
+/// `Some(0)`: more bytes are needed; `Some(n)`: the answer is the first `n` bytes and
+/// confirms the mode. Exactly one row with the value `on`, then an idle `ReadyForQuery`.
+pub(crate) fn confirmation(answer: &[u8]) -> Option<usize> {
+    let (mut rows, mut confirmed) = (0, false);
+    let mut at = 0;
+    loop {
+        let Some(header) = answer.get(at..at + 5) else {
+            return Some(0);
+        };
+        let size = (u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize)
+            .checked_sub(4)?;
+        let Some(body) = answer.get(at + 5..at + 5 + size) else {
+            return Some(0);
+        };
+        at += 5 + size;
+        match header[0] {
+            b'T' | b'C' | b'N' => {}
+            b'D' => {
+                rows += 1;
+                confirmed = body == [&1u16.to_be_bytes()[..], &2u32.to_be_bytes(), b"on"].concat();
+            }
+            b'Z' if body == b"I" && rows == 1 && confirmed => return Some(at),
+            _ => return None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -653,7 +798,18 @@ mod tests {
             "query_to_xml_and_xmlschema",
             "ts_stat",
             "ts_rewrite",
+            "connectby",
+            "xpath_table",
+            "lo_export",
+            "pg_file_write",
+            "pg_file_rename",
+            "pg_file_unlink",
         ];
+        assert_eq!(
+            super::WORDS,
+            words,
+            "the production words are the listed words"
+        );
         for word in words {
             let upper = word.to_ascii_uppercase();
             for text in [
@@ -679,6 +835,25 @@ mod tests {
             ] {
                 assert_eq!(scan(text.as_bytes(), false), None, "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn crosstab_matches_as_a_prefix_of_every_crosstab_function() {
+        for text in [
+            "select * from crosstab('select 1') as t(a int)",
+            "SELECT * FROM crosstab2('select set' || '_config(''x'', ''off'', false), ''a''::text, ''b''::text')",
+            "select * from crosstab3('q')",
+            "select * from CROSSTAB4('q')",
+            "select * from public.crosstab_hash('q', 'r')",
+            "select \"crosstab2\"('q')",
+        ] {
+            for superuser in [false, true] {
+                assert_eq!(scan(text.as_bytes(), superuser), Some(CROSSTAB), "{text}");
+            }
+        }
+        for text in ["select my_crosstab from t", "select xcrosstab2 from t"] {
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
         }
     }
 
@@ -710,13 +885,12 @@ mod tests {
         }
     }
 
-    const SUPERUSER_WORDS: [&str; 10] = [
+    const SUPERUSER_WORDS: [&str; 9] = [
         "program",
         "pg_reload_conf",
         "pg_terminate_backend",
         "pg_cancel_backend",
         "lo_import",
-        "lo_export",
         "pg_read_file",
         "pg_read_binary_file",
         "pg_ls_dir",
@@ -808,22 +982,72 @@ mod tests {
     }
 
     #[test]
-    fn copy_to_program_is_matched_only_in_a_superuser_session() {
+    fn copy_with_a_program_is_matched_in_every_session() {
         for text in [
             "COPY t TO PROGRAM 'true'",
             "copy (select 1) to program 'true'",
             "COPY t FROM PROGRAM 'cat /etc/hostname'",
             "copy t to\tprogram\n'true'",
+            "copy t to/**/program 'true'",
+            "copy t to -- c\nprogram 'true'",
+            "COPY t TO PROGRAM E'true'",
+            "COPY t TO PROGRAM $$true$$",
+            "SET ROLE admin; COPY t TO PROGRAM 'true'",
+            "COPY t FROM PROGRAM /* c */ 'true'",
         ] {
-            assert_eq!(scan(text.as_bytes(), true), Some("program"), "{text}");
-            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
+            assert_eq!(scan(text.as_bytes(), false), Some("copy program"), "{text}");
+            assert!(scan(text.as_bytes(), true).is_some(), "{text}");
         }
         for text in [
             "select program_id from t",
             "select programs from t",
             "select my_program from t",
+            "select to_program from t",
+            "select a from t where b similar to 'x%'",
+            "SELECT * FROM program WHERE id = 1",
+            "SELECT * FROM program.courses",
+            "SET search_path TO program",
+            "select 'moved to program X'",
+            "COPY (SELECT * FROM program WHERE id = 1) TO STDOUT",
+            "copy program to stdout",
         ] {
-            assert_eq!(scan(text.as_bytes(), true), None, "{text}");
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn copy_to_a_server_file_is_matched_in_every_session() {
+        for text in [
+            "COPY t TO '/tmp/out.csv'",
+            "copy (select 1) to '/tmp/out'",
+            "COPY t TO E'/tmp/out'",
+            "copy t to e'/tmp/out'",
+            "COPY t TO $$/tmp/out$$",
+            "COPY t TO $f$/tmp/out$f$",
+            "copy t to/**/'/tmp/out'",
+            "copy t to -- c\n'/tmp/out'",
+            "COPY BINARY t TO '/tmp/out'",
+            "select 1; COPY t TO '/tmp/out'",
+            "COPY (SELECT ';') TO '/tmp/out'",
+        ] {
+            for superuser in [false, true] {
+                assert_eq!(
+                    scan(text.as_bytes(), superuser),
+                    Some("copy to file"),
+                    "{text}"
+                );
+            }
+        }
+        for text in [
+            "COPY t TO STDOUT",
+            "copy (select 1) to stdout with (format csv)",
+            "COPY t TO STDOUT; select 'x'",
+            "select a from t where b similar to 'x%'",
+            "select 'copy' from t",
+            "select copy_count from t where x similar to 'y'",
+            "select a from t where a::text similar to 'y'",
+        ] {
+            assert_eq!(scan(text.as_bytes(), false), None, "{text}");
         }
     }
 
@@ -989,10 +1213,13 @@ mod tests {
             key.clone(),
         ]
         .concat();
-        assert_eq!(startup_superuser(&tail), Some(false));
+        assert_eq!(startup_check(&tail), Start::Confirmed { superuser: false });
         let superuser = [tail.clone(), frame_status("is_superuser", "on")].concat();
-        assert_eq!(startup_superuser(&superuser), Some(true));
-        assert_eq!(startup_superuser(&[]), None, "no report of the mode");
+        assert_eq!(
+            startup_check(&superuser),
+            Start::Confirmed { superuser: true }
+        );
+        assert_eq!(startup_check(&[]), Start::Refused, "no report of the mode");
         let unreported = [
             frame_status("server_version", "16.4"),
             frame_status("is_superuser", "on"),
@@ -1000,8 +1227,8 @@ mod tests {
         ]
         .concat();
         assert_eq!(
-            startup_superuser(&unreported),
-            None,
+            startup_check(&unreported),
+            Start::Refused,
             "no report of the mode"
         );
         let escaped = [
@@ -1009,11 +1236,11 @@ mod tests {
             key.clone(),
         ]
         .concat();
-        assert_eq!(startup_superuser(&escaped), None);
+        assert_eq!(startup_check(&escaped), Start::Refused);
         let mut truncated = tail.clone();
         truncated.pop();
-        assert_eq!(startup_superuser(&truncated), None);
-        assert_eq!(startup_superuser(&[b'S', 0, 0, 0, 3]), None);
+        assert_eq!(startup_check(&truncated), Start::Refused);
+        assert_eq!(startup_check(&[b'S', 0, 0, 0, 3]), Start::Refused);
     }
 
     #[test]
@@ -1039,8 +1266,8 @@ mod tests {
             "MULE_INTERNAL",
         ] {
             assert_eq!(
-                startup_superuser(&tail(Some(encoding))),
-                Some(false),
+                startup_check(&tail(Some(encoding))),
+                Start::Confirmed { superuser: false },
                 "{encoding}"
             );
         }
@@ -1055,15 +1282,151 @@ mod tests {
             "SJIS",
             "GB18030",
         ] {
-            assert_eq!(startup_superuser(&tail(Some(encoding))), None, "{encoding}");
+            assert_eq!(
+                startup_check(&tail(Some(encoding))),
+                Start::Refused,
+                "{encoding}"
+            );
         }
-        assert_eq!(startup_superuser(&tail(None)), None, "no encoding reported");
+        assert_eq!(
+            startup_check(&tail(None)),
+            Start::Refused,
+            "no encoding reported"
+        );
         let replaced = [
             frame_status("server_encoding", "UTF8"),
             tail(Some("LATIN5")),
         ]
         .concat();
-        assert_eq!(startup_superuser(&replaced), None, "the last report counts");
+        assert_eq!(
+            startup_check(&replaced),
+            Start::Refused,
+            "the last report counts"
+        );
+    }
+
+    #[test]
+    fn a_server_older_than_14_is_confirmed_by_a_query() {
+        let frame_status = |name: &str, value: &str| frame(b'S', &status(name, value));
+        let key = frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]);
+        let tail = |version: &str, encoding: &str, superuser: &str| {
+            [
+                frame_status("server_version", version),
+                frame_status("server_encoding", encoding),
+                frame_status("is_superuser", superuser),
+                key.clone(),
+            ]
+            .concat()
+        };
+        for version in [
+            "13.16",
+            "13beta1",
+            "12.20 (Debian 12.20-1)",
+            "9.6.24",
+            "10.23",
+        ] {
+            assert_eq!(
+                startup_check(&tail(version, "UTF8", "off")),
+                Start::Unreported { superuser: false },
+                "{version}"
+            );
+        }
+        assert_eq!(
+            startup_check(&tail("13.16", "UTF8", "on")),
+            Start::Unreported { superuser: true }
+        );
+        for version in [
+            "14.0",
+            "16.4",
+            "17beta2",
+            "",
+            "x13",
+            "13x",
+            " 13.1",
+            "13.0.0",
+            "11.2-YB-2.18.0.0-b0",
+            "12.1.2.3",
+            "13.4-custom",
+        ] {
+            assert_eq!(
+                startup_check(&tail(version, "UTF8", "off")),
+                Start::Refused,
+                "{version:?}"
+            );
+        }
+        assert_eq!(
+            startup_check(&tail("13.16", "LATIN5", "off")),
+            Start::Refused,
+            "a single-byte encoding fails closed on every version"
+        );
+        let off = [
+            tail("13.16", "UTF8", "off"),
+            frame_status("default_transaction_read_only", "off"),
+        ]
+        .concat();
+        assert_eq!(startup_check(&off), Start::Refused, "a reported off wins");
+        let on = [
+            tail("13.16", "UTF8", "off"),
+            frame_status("default_transaction_read_only", "on"),
+        ]
+        .concat();
+        assert_eq!(startup_check(&on), Start::Confirmed { superuser: false });
+        let cockroach = [
+            tail("13.16", "UTF8", "off"),
+            frame_status("crdb_version", "CockroachDB CCL v23.1.0"),
+        ]
+        .concat();
+        assert_eq!(startup_check(&cockroach), Start::Refused, "not PostgreSQL");
+        let no_version = [frame_status("server_encoding", "UTF8"), key.clone()].concat();
+        assert_eq!(startup_check(&no_version), Start::Refused);
+    }
+
+    #[test]
+    fn the_confirmation_answer_must_be_exactly_on() {
+        let row = |value: &[u8]| {
+            let mut body = 1u16.to_be_bytes().to_vec();
+            body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            body.extend_from_slice(value);
+            frame(b'D', &body)
+        };
+        let description = frame(b'T', b"\0\x01default_transaction_read_only\0rest");
+        let complete = frame(b'C', b"SHOW\0");
+        let ready = frame(b'Z', b"I");
+        let notice = frame(b'N', b"SNOTICE\0Mx\0\0");
+        let answer = |parts: &[&[u8]]| parts.concat();
+        let good = answer(&[&description, &row(b"on"), &complete, &ready]);
+        assert_eq!(confirmation(&good), Some(good.len()));
+        let noticed = answer(&[&notice, &description, &row(b"on"), &complete, &ready]);
+        assert_eq!(confirmation(&noticed), Some(noticed.len()));
+        for bad in [
+            answer(&[&description, &row(b"off"), &complete, &ready]),
+            answer(&[&description, &row(b"On"), &complete, &ready]),
+            answer(&[&description, &complete, &ready]),
+            answer(&[&description, &row(b"on"), &row(b"on"), &complete, &ready]),
+            answer(&[&frame(b'E', b"SERROR\0C42501\0Mx\0\0"), &ready]),
+            answer(&[&description, &row(b"on"), &complete, &frame(b'Z', b"T")]),
+            answer(&[
+                &description,
+                &row(b"on"),
+                &frame(b'S', b"a\0b\0"),
+                &complete,
+                &ready,
+            ]),
+        ] {
+            assert_eq!(confirmation(&bad), None, "{bad:?}");
+        }
+        let unfinished = answer(&[&description, &row(b"on"), &complete]);
+        assert_eq!(confirmation(&unfinished), Some(0), "needs more bytes");
+        let mut truncated = good.clone();
+        truncated.pop();
+        assert_eq!(confirmation(&truncated), Some(0), "needs more bytes");
+        let mut null = 1u16.to_be_bytes().to_vec();
+        null.extend_from_slice(&(-1i32).to_be_bytes());
+        let null_row = frame(b'D', &null);
+        assert_eq!(
+            confirmation(&answer(&[&description, &null_row, &complete, &ready])),
+            None
+        );
     }
 
     const HELD: std::time::Duration = std::time::Duration::from_millis(200);

@@ -393,12 +393,36 @@ fn results(text: &str) -> Vec<u8> {
 struct Emulator {
     statement: String,
     copy: Option<bool>,
+    show: Option<&'static str>,
+}
+
+const CONFIRM: &str = "SHOW default_transaction_read_only";
+
+fn shown(value: Option<&str>) -> Vec<u8> {
+    let Some(value) = value else {
+        return [fake::error_frame(("42501", "permission denied")), ready()].concat();
+    };
+    let mut description = 1u16.to_be_bytes().to_vec();
+    description.extend_from_slice(b"default_transaction_read_only\0");
+    description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255]);
+    description.extend_from_slice(&[0, 0]);
+    let mut row = 1u16.to_be_bytes().to_vec();
+    row.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    row.extend_from_slice(value.as_bytes());
+    [
+        fake::frame(b'T', &description),
+        fake::frame(b'D', &row),
+        complete("SHOW"),
+        ready(),
+    ]
+    .concat()
 }
 
 impl Emulator {
     fn answer(&mut self, tag: u8, body: &[u8]) -> Vec<u8> {
         let text = String::from_utf8_lossy(body).into_owned();
         match tag {
+            b'Q' if text.contains(CONFIRM) => shown(self.show),
             b'Q' if text.contains("STDIN") => {
                 self.copy = Some(false);
                 copy_in()
@@ -448,6 +472,10 @@ async fn write_bytewise(tcp: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()
 }
 
 async fn emulated(status: Status, bytewise: bool) -> Emulated {
+    emulated_showing(status, bytewise, None).await
+}
+
+async fn emulated_showing(status: Status, bytewise: bool, show: Option<&'static str>) -> Emulated {
     let frames: Frames = Arc::new(Mutex::new(Vec::new()));
     let record = frames.clone();
     let addr = fake::start_with(move |mut tcp| {
@@ -455,7 +483,10 @@ async fn emulated(status: Status, bytewise: bool) -> Emulated {
         async move {
             tcp.set_nodelay(true)?;
             fake::accept_login(&mut tcp, status).await?;
-            let mut emulator = Emulator::default();
+            let mut emulator = Emulator {
+                show,
+                ..Emulator::default()
+            };
             loop {
                 let (tag, body) = fake::read_tagged(&mut tcp).await?;
                 record.lock().unwrap().push(fake::frame(tag, &body));
@@ -694,7 +725,7 @@ async fn a_parameter_status_off_closes_the_session_before_the_next_unit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_superuser_login_scans_with_the_superuser_words() {
     let statements = [
-        "COPY t TO PROGRAM 'true'",
+        "SELECT pg_reload_conf()",
         "ALTER SYSTEM SET work_mem = '64MB'",
         "SELECT pg_terminate_backend(7)",
         "SET ROLE other",
@@ -742,7 +773,7 @@ async fn a_superuser_login_scans_with_the_superuser_words() {
     assert_eq!(
         words,
         [
-            "program",
+            "pg_reload_conf",
             "alter system",
             "pg_terminate_backend",
             "set role",
@@ -861,6 +892,94 @@ async fn an_upstream_that_never_reports_the_mode_fails_closed() {
     assert_eq!(
         fake::named(&events, "client_refused")[0]["fields"]["reason"],
         "read_only_escaped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_older_than_14_is_asked_for_the_mode_before_the_client_is_ready() {
+    const OLD_LOGIN: [(&str, &str); 3] = [
+        ("server_version", "13.16"),
+        ("server_encoding", "UTF8"),
+        ("is_superuser", "off"),
+    ];
+    let upstream = emulated_showing(&OLD_LOGIN, false, Some("on")).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    let mut client = fake::login(session.local)
+        .await
+        .expect("a 13.x server that answers on opens a read-only session");
+    assert_eq!(fake::query(&mut client, "SELECT 'first'").await, "SELECT 1");
+    assert_eq!(
+        upstream.frames(),
+        vec![query(CONFIRM), query("SELECT 'first'")],
+        "the agent asks once, before the client's first query"
+    );
+    assert!(session.refusals().is_empty());
+    for statement in [
+        ESCAPE,
+        "COPY t TO PROGRAM 'true'",
+        "COPY t TO '/tmp/zs-out'",
+    ] {
+        fake::query(&mut client, statement).await;
+    }
+    assert_eq!(
+        upstream.frames()[2..],
+        [
+            query(QUERY_REFUSAL),
+            query(QUERY_REFUSAL),
+            query(QUERY_REFUSAL)
+        ],
+        "the scan still refuses on a 13.x server, in a non-superuser session"
+    );
+    assert_eq!(session.refusals(), vec![("query", "read-only"); 3]);
+
+    let read_write_upstream = emulated_showing(&OLD_LOGIN, false, Some("off")).await;
+    let read_write = listen_as(read_write_upstream.addr.port(), SessionAccess::ReadWrite).await;
+    let mut unaffected = fake::login(read_write.local)
+        .await
+        .expect("negative control: a read-write session does not ask");
+    assert_eq!(
+        fake::query(&mut unaffected, "SELECT 'rw'").await,
+        "SELECT 1"
+    );
+    assert_eq!(read_write_upstream.frames(), vec![query("SELECT 'rw'")]);
+
+    for show in [Some("off"), Some("On"), None] {
+        let upstream = emulated_showing(&OLD_LOGIN, false, show).await;
+        let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+        assert_eq!(
+            pipelined_login(session.local).await,
+            fake::error_frame(CANNOT_OPEN_READ_ONLY),
+            "{show:?}: the session closes with the fixed error and nothing else"
+        );
+        assert_eq!(
+            session.refusals(),
+            vec![("connect", "read-only escaped")],
+            "{show:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            upstream.frames(),
+            vec![query(CONFIRM)],
+            "{show:?}: the pipelined first Query never reached the upstream"
+        );
+    }
+
+    const NEW_UNREPORTED: [(&str, &str); 3] = [
+        ("server_version", "14.13"),
+        ("server_encoding", "UTF8"),
+        ("is_superuser", "off"),
+    ];
+    let upstream = emulated_showing(&NEW_UNREPORTED, false, Some("on")).await;
+    let session = listen_as(upstream.addr.port(), SessionAccess::ReadOnly).await;
+    assert_eq!(
+        pipelined_login(session.local).await,
+        fake::error_frame(CANNOT_OPEN_READ_ONLY),
+        "a 14+ server that does not report the mode fails closed"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        upstream.frames().is_empty(),
+        "no query is sent to a 14+ server"
     );
 }
 

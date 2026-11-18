@@ -732,6 +732,20 @@ async fn hidden_switch_off_closes_session_before_next_unit() {
         return;
     };
     let mut setup = admin(&fixture.db).await;
+    let version: u32 = setup
+        .simple("SHOW server_version_num")
+        .await
+        .value()
+        .and_then(|value| value.parse().ok())
+        .expect("server_version_num");
+    if version < 140_000 {
+        // Documented limit (CHANGELOG, ADR-0063): PostgreSQL 13 and older do not report a
+        // later change of the mode, so the agent has no backstop on them.
+        eprintln!("skipped: the backstop needs PostgreSQL 14 or newer, server is {version}");
+        setup.close().await;
+        fixture.remove().await;
+        return;
+    }
     let created = setup
         .simple(&format!(
             "CREATE OR REPLACE FUNCTION zs_ro_flip() RETURNS text LANGUAGE sql SECURITY DEFINER \
@@ -980,5 +994,123 @@ async fn superuser_session_refuses_copy_to_program_and_alter_system() {
         "a non-superuser session is not refused for a column named program: {column:?}"
     );
     plain.close().await;
+    fixture.remove().await;
+}
+
+const COPIER: &str = "zs_read_only_copier";
+const COPIER_PASSWORD: &str = "zs-read-only-copier-pw";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_to_a_program_or_a_server_file_is_refused_for_a_privileged_login() {
+    let Some(fixture) = Fixture::new("zs_ro_copy_out").await else {
+        return;
+    };
+    let db = &fixture.db;
+    let mut setup = admin(db).await;
+    let granted = setup
+        .simple(&format!(
+            "DO $$ BEGIN
+               IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{COPIER}') THEN
+                 CREATE ROLE {COPIER} LOGIN NOSUPERUSER PASSWORD '{COPIER_PASSWORD}';
+               END IF;
+             END $$; \
+             GRANT pg_execute_server_program, pg_write_server_files TO {COPIER}; \
+             GRANT SELECT ON {table} TO {COPIER}",
+            table = fixture.table
+        ))
+        .await;
+    assert!(granted.ok(), "could not prepare {COPIER}: {granted:?}");
+    let statements = [
+        format!("COPY {} TO PROGRAM 'cat > /dev/null'", fixture.table),
+        format!("COPY (SELECT id FROM {}) TO '/dev/null'", fixture.table),
+        format!("COPY {} TO E'/dev/null'", fixture.table),
+    ];
+
+    let (local, _) = listen(db, COPIER_PASSWORD, SessionAccess::ReadWrite).await;
+    let mut control = Client::open(local, COPIER, db, &[]).await;
+    assert!(
+        control
+            .simple("SET default_transaction_read_only = on")
+            .await
+            .ok()
+    );
+    assert_eq!(control.simple(MODE).await.value(), Some("on"));
+    for statement in &statements {
+        let copied = control.simple(statement).await;
+        assert!(
+            copied.ok(),
+            "negative control: the server's own read-only mode lets the login run {statement}: {copied:?}"
+        );
+    }
+    control.close().await;
+
+    let (local, refusals) = listen(db, COPIER_PASSWORD, SessionAccess::ReadOnly).await;
+    let mut session = Client::open(local, COPIER, db, &[]).await;
+    let read = session
+        .simple(&format!("SELECT count(*) FROM {}", fixture.table))
+        .await;
+    assert_eq!(read.value(), Some("1"), "positive control: a read works");
+    for statement in &statements {
+        let refused = session.simple(statement).await;
+        assert!(refused.refused_with(READ_ONLY), "{statement}: {refused:?}");
+        assert_eq!(refused.message(), REFUSED, "{statement}");
+        assert_eq!(refused.status, b'I', "{statement}");
+    }
+    assert_eq!(session.simple(MODE).await.value(), Some("on"));
+    session.close().await;
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); statements.len()]
+    );
+
+    let revoked = setup
+        .simple(&format!(
+            "REVOKE pg_execute_server_program, pg_write_server_files FROM {COPIER}; \
+             REVOKE SELECT ON {} FROM {COPIER}",
+            fixture.table
+        ))
+        .await;
+    assert!(revoked.ok(), "{revoked:?}");
+    setup.close().await;
+    fixture.remove().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crosstab_functions_that_run_sql_text_are_refused() {
+    let Some(fixture) = Fixture::new("zs_ro_crosstab").await else {
+        return;
+    };
+    let mut setup = admin(&fixture.db).await;
+    let installed = setup
+        .simple("CREATE EXTENSION IF NOT EXISTS tablefunc")
+        .await;
+    assert!(installed.ok(), "{installed:?}");
+    let flip = "SELECT * FROM crosstab2('SELECT ''r''::text, ''c''::text, \
+                set_config(''default_transaction'' || ''_read_only'', ''off'', false)')";
+
+    let mut control = fixture.session(SessionAccess::ReadWrite).await;
+    assert!(
+        control
+            .simple("SET default_transaction_read_only = on")
+            .await
+            .ok()
+    );
+    let ran = control.simple(flip).await;
+    assert!(ran.ok(), "negative control: crosstab2 runs: {ran:?}");
+    assert_eq!(
+        control.simple(MODE).await.value(),
+        Some("off"),
+        "negative control: the SQL text switched the mode off"
+    );
+    control.close().await;
+
+    let mut session = fixture.session(SessionAccess::ReadOnly).await;
+    let refused = session.simple(flip).await;
+    assert!(refused.refused_with(READ_ONLY), "{refused:?}");
+    assert_eq!(refused.message(), REFUSED);
+    assert_still_read_only(&mut session, &fixture, flip).await;
+    session.close().await;
+    setup.simple("DROP EXTENSION IF EXISTS tablefunc").await;
+    setup.close().await;
     fixture.remove().await;
 }
