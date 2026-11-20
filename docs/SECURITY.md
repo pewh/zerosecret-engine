@@ -410,13 +410,53 @@ handshake response. The
 agent always refuses a PostgreSQL startup that carries the `replication` parameter, whatever its
 value and whatever the binding says, and audits `deny` `connect`, reason `replication refused`.
 
-**A PostgreSQL or MySQL client can change the password of its own account.** The agent does not
-authorize single statements (PRODUCT §3). A client under `zs run` can send `ALTER ROLE`,
-`ALTER USER` or `SET PASSWORD` for the brokered user. The new password then works without the
-agent, and the stored credential stops working. Give the brokered user the least rights that the
-app needs. On MySQL 8.0.13 and later, create the brokered user with `PASSWORD REQUIRE CURRENT`,
-so a change needs the current password, which the client never holds. PostgreSQL has no such
-setting.
+**A PostgreSQL or MySQL client can change the password of its own account.** Except on a
+read-only resource, the agent does not authorize single statements (PRODUCT §3). A client under
+`zs run` can send `ALTER ROLE`, `ALTER USER` or `SET PASSWORD` for the brokered user. The new
+password then works without the agent, and the stored credential stops working. Give the
+brokered user the least rights that the app needs. On MySQL 8.0.13 and later, create the brokered
+user with `PASSWORD REQUIRE CURRENT`, so a change needs the current password, which the client
+never holds. PostgreSQL has no such setting. On a read-only resource, the database refuses these
+statements in its read-only mode.
+
+**A read-only resource is a guardrail, not a security boundary** (ADR-0063). On a read-only
+resource, the ZeroSecret agent opens the database session in the database's read-only mode and
+refuses known ways to switch it off. This protects against mistakes and against tools and agents
+that misbehave. It does not stop an attacker: someone who holds the database password can connect
+without ZeroSecret, and a determined workload may find a way out on PostgreSQL that the agent catches
+only after one statement. The agent checks commands: statement text against a fixed word list,
+MongoDB and Redis command names against an allowlist. It never reads result rows or documents. A
+database account with read privileges only is the control that stops writes. The limits:
+
+- PostgreSQL 14 and later: a built-in that runs SQL text and is not on the word list, sent in one
+  `Query` with a `COMMIT` and a write, can make one write before the backstop closes the session.
+- PostgreSQL 13 and older do not report a change of the mode, so the agent has no backstop on
+  them. A switch-off that the word list misses lasts for the rest of the session.
+- A function or procedure that the customer already has can switch the mode off inside it.
+  Creating one needs write access, which a read-only session does not have.
+- Superuser and root logins have more ways out: the superuser word list covers the routes known
+  at release, and a superuser has more built-ins than any list.
+- Transaction-mode poolers between the agent and the database, and PostgreSQL-compatible servers
+  that are not PostgreSQL, are not supported; the agent refuses a read-only session when the
+  server does not confirm the mode.
+- MongoDB: `getMore` and `killCursors` pass only for a cursor that a read-only session of the
+  resource opened. A read cursor opened before a switch to read-only gets code 13 after it, and a
+  login that opens 65,536 cursors pushes out the cursors of its other sessions, which then get
+  code 13.
+- Refused reads: the word list matches inside strings and comments, so a read that contains a
+  refused word is refused, for example a MySQL literal `'reset'`, `SHOW REPLICA STATUS`, or a
+  PostgreSQL statement that names `copy` and later has `to` before a string literal. MySQL
+  query attributes (Connector/J with OpenTelemetry) and Redis `EVAL_RO`, `EVALSHA_RO` and
+  `FCALL_RO` are refused.
+- Audit: each refusal is one synchronous journal append in the relay, so a client that repeats
+  refused commands slows its own session. A PostgreSQL message larger than 64 MiB closes a
+  read-only session with no audit record; MySQL writes one. When a session ends on an access
+  change or a revocation, PostgreSQL closes both sockets before it writes the record, and the
+  other three relays write it first. No data crosses in either order.
+- Operator output: the MongoDB diag log names a refused command only when it is on the
+  allowlist, else `other`. `zs resources` prints `read-only (guardrail)` for an HTTP resource
+  even though the agent denies its read-only grant.
+- No CI job runs PostgreSQL 13. The path for PostgreSQL 13 and older was tested by hand on 13.23.
 
 **A PostgreSQL client sees the agent's denial reason.** When the agent refuses a PostgreSQL
 connection before materialization, the error response carries the denial text: it can name the
@@ -1046,7 +1086,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | A local endpoint or `/.zs/presign` request whose path does not start with the run token | 403 `ZeroSecret needs the run token`. No upstream, no audit record. Diagnostic event `caller_refused`, `listener` `endpoint` (`apps/zs/tests/fail_closed_matrix.rs` row 100) |
 | A database listener's peer lookup fails, finds no established socket of the agent's OS user for the connection, or runs on a platform with no lookup | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused` (`apps/zs/tests/fail_closed_matrix.rs` row 101) |
 | A database client whose OS user differs from the agent's (Linux, macOS) | Connection closed before any byte is read; no materialization, no upstream contact. Diagnostic event `caller_refused`. Windows database listeners do not check (§3) (`apps/zs/tests/fail_closed_matrix.rs` row 102, run in CI with a second OS user) |
-| A grant whose signed `version` is not 1 | Refused by name with `grant version not supported by this zs; upgrade zs`; no upstream contact, no audit record (`apps/zs/tests/fail_closed_matrix.rs` row 103) |
+| A grant whose signed `version` and `access` are not version 1 with read-write or version 2 with read-only | Refused by name with `grant version not supported by this zs; upgrade zs`; no upstream contact, no audit record (`apps/zs/tests/fail_closed_matrix.rs` row 103) |
 | A grant for an environment other than the device's enrolment | Refused with `grant is for another environment`; no upstream contact, no audit record (`apps/zs/tests/fail_closed_matrix.rs` row 104) |
 | A wire server certificate from a CA the control plane never published | The TLS handshake fails, so the refresh and any grant renewal fail closed; the agent keeps its last good key set and CA set (`apps/zs/tests/fail_closed_matrix.rs` row 105) |
 | An audit batch from a device whose enrolment has expired | 401 with `{"code":"enrolment_expired"}`; no audit row is written (commercial suite) |
@@ -1068,6 +1108,15 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | A Redis upstream answers the broker's `AUTH` with no password configured, and the binding does not set `upstream_auth_optional` (with or without `user: "default"`) | Refuse with `-ERR ZeroSecret upstream authentication failed`. Audit `deny` `connect`, reason `upstream authentication failed`. No client command reaches the upstream (`apps/zs/tests/fail_closed_matrix.rs` row 122; `crates/zs-proto-redis/tests/redis_real.rs`) |
 | Grant revoked or expired while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. Audit `deny` `connect`, reason `grant revoked` (ADR-0059, `apps/zs/tests/fail_closed_matrix.rs` row 123) |
 | Workload sends `Range` or `If-Range` on an injected request whose scheme sends the credential (every scheme except `aws-sigv4` and `hmac-body-signature`) | Remove both headers before the request reaches the upstream, so the workload cannot get an echoed credential in parts (ADR-0059, `apps/zs/tests/range_on_injected_request.rs`, `apps/zs/tests/fail_closed_matrix.rs` row 124) |
+| A PostgreSQL statement on a read-only resource names a known way to switch the read-only mode off, runs SQL text or a program, or writes a server file (the word list of ADR-0063); a `Parse` of `BEGIN READ WRITE`; a `FunctionCall` | Replace the statement with one that fails with SQLSTATE 25006 (a `Parse` with a call to a function that does not exist, 42883; a `FunctionCall` with the `Query` refusal). The session stays usable. A superuser session also refuses the superuser words. Audit `deny` `query`, reason `read-only` (`apps/zs/tests/fail_closed_matrix.rs` row 125) |
+| A read-only PostgreSQL session whose server does not confirm the read-only mode before the first `ReadyForQuery`: the mode reported off, no report on 14 and later, a `SHOW default_transaction_read_only` that is not one row `on` below 14, a single-byte server encoding, a `crdb_version` report, a `server_version` not in the PostgreSQL form | Send SQLSTATE 08004 `zs: the server cannot open a read-only session` and close. No client message reaches the server. Audit `deny` `connect`, reason `read-only escaped` (`apps/zs/tests/fail_closed_matrix.rs` row 126) |
+| A read-only PostgreSQL session gets a `ParameterStatus` `default_transaction_read_only` that is not `on` (14 and later) | Close the session before the next unit reaches the server. Audit `deny` `connect`, reason `read-only escaped` (`apps/zs/tests/fail_closed_matrix.rs` row 127) |
+| A MySQL statement on a read-only resource names a known way to switch the read-only mode off or an administration word (`COM_QUERY`, `COM_STMT_PREPARE`); a command that is not on the allowlist; the session-start `SET SESSION transaction_read_only = ON` fails or leaves a transaction open; a MariaDB server | Replace a refused statement or command with one that fails with error 1792 (a refused `COM_STMT_PREPARE` answers 1295). The session stays usable. When the session cannot start read-only, or the server is MariaDB, send error 1045 and close before a client command reaches the server. Audit `deny` `query` or `connect`, reason `read-only` (`apps/zs/tests/fail_closed_matrix.rs` row 128) |
+| A MongoDB command on a read-only resource that is not on the allowlist, `$out` or `$merge` at any depth, an `OP_MSG` with a document sequence, a `getMore` for a cursor that no read-only session of the resource opened | Answer code 13 `Unauthorized`. The command does not reach the server and the session stays usable. A refused `moreToCome` message or a malformed message closes the session with no reply. Audit `deny` `query`, reason `read-only` (`apps/zs/tests/fail_closed_matrix.rs` row 129) |
+| A Redis command on a read-only resource that is not on the allowlist | Answer `-NOPERM read-only resource` in reply position. The command does not reach the server. A refused command inside `MULTI` makes `EXEC` answer `-EXECABORT`, and the agent sends `DISCARD`. Audit `deny` `query`, reason `read-only`. More than 16,384 refusals that wait for their position close the session, audit `deny` `connect`, reason `read-only refusal backlog` (`apps/zs/tests/fail_closed_matrix.rs` row 130) |
+| The access of the grant changes while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. A new session opens with the new access. Audit `deny` `connect`, reason `access changed` (ADR-0063, `apps/zs/tests/fail_closed_matrix.rs` row 131) |
+| A read-only grant for a binding that is not PostgreSQL, MySQL, MongoDB or Redis | Deny: no credential, no upstream contact; the reason ends with `grant does not permit the requested operation` (`apps/zs/tests/fail_closed_matrix.rs` row 132) |
+| A MongoDB client message reuses the request id of a message whose reply is still awaited, in any session | Close the session. The second message does not reach the server (`apps/zs/tests/fail_closed_matrix.rs` row 133) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository

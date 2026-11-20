@@ -191,6 +191,7 @@ pub struct FakeControl {
     signing_key: Arc<std::sync::Mutex<ControlSigningKey>>,
     key_set: Arc<std::sync::Mutex<Vec<zs_wire::VerifyingKeyEntry>>>,
     mint_version: Arc<std::sync::atomic::AtomicU32>,
+    mint_access: Arc<std::sync::Mutex<zs_policy::Access>>,
     mint_environment: Arc<std::sync::Mutex<String>>,
     _runtime: tokio::runtime::Runtime,
 }
@@ -218,6 +219,10 @@ impl FakeControl {
             .store(version, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn set_minted_access(&self, access: zs_policy::Access) {
+        *self.mint_access.lock().unwrap() = access;
+    }
+
     pub fn set_minted_environment(&self, environment: &str) {
         *self.mint_environment.lock().unwrap() = environment.to_string();
     }
@@ -242,6 +247,7 @@ impl FakeControl {
         let grant_calls: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let user_agents: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let mint_version = Arc::new(std::sync::atomic::AtomicU32::new(zs_grant::GRANT_VERSION));
+        let mint_access = Arc::new(std::sync::Mutex::new(zs_policy::Access::ReadWrite));
         let mint_environment: Arc<std::sync::Mutex<String>> =
             Arc::new(std::sync::Mutex::new("development".to_string()));
         let listener = runtime
@@ -285,6 +291,7 @@ impl FakeControl {
             let (key, grant, grant_calls) = (key.clone(), grant.clone(), grant_calls.clone());
             let agents = user_agents.clone();
             let version = mint_version.clone();
+            let access = mint_access.clone();
             let environment = mint_environment.clone();
             move |headers: axum::http::HeaderMap,
                   axum::Json(request): axum::Json<serde_json::Value>| async move {
@@ -366,7 +373,7 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
-                            access: zs_policy::Access::ReadWrite,
+                            access: *access.lock().unwrap(),
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })
                         .unwrap()
@@ -390,7 +397,7 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
-                            access: zs_policy::Access::ReadWrite,
+                            access: *access.lock().unwrap(),
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })
                         .unwrap()
@@ -443,6 +450,7 @@ impl FakeControl {
             signing_key: key,
             key_set,
             mint_version,
+            mint_access,
             mint_environment,
             _runtime: runtime,
         }
@@ -476,7 +484,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly one hundred and twenty-four.
+/// exactly one hundred and thirty-three.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -500,8 +508,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        124,
-        "SECURITY §7 must have one hundred and twenty-four rows; found {}:\n{}",
+        133,
+        "SECURITY §7 must have one hundred and thirty-three rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

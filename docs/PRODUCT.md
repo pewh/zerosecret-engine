@@ -66,7 +66,8 @@ ZeroSecret is not, and will not become:
 - An infrastructure access platform.
 - A general egress proxy, API gateway, or tunnel.
 - An identity provider.
-- A DLP or traffic inspection product.
+- A DLP or traffic inspection product. The agent checks protocol commands to place credentials
+  and enforce a grant's access level. It never reads, filters or records data.
 
 The company runs one product. The webhook delivery product is out of scope for this
 repository and is not a shared roadmap.

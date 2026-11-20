@@ -5309,16 +5309,31 @@ fn row_103_a_grant_with_an_unknown_version_is_refused_by_name() {
         .expect("positive control: a version-1 grant");
     assert_eq!(minted.signed.grant.version, zs_grant::GRANT_VERSION);
 
-    control.set_minted_version(2);
-    let error = runtime
+    control.set_minted_version(zs_grant::GRANT_VERSION_ACCESS);
+    control.set_minted_access(zs_policy::Access::ReadOnly);
+    let read_only = runtime
         .block_on(client.request_grant(&rotation_request()))
-        .expect_err("a version-2 grant must be refused");
-    assert!(
-        error
-            .to_string()
-            .ends_with("grant version not supported by this zs; upgrade zs"),
-        "row 103: {error}"
-    );
+        .expect("positive control: a version-2 read-only grant");
+    assert_eq!(read_only.signed.grant.access, zs_policy::Access::ReadOnly);
+
+    for (version, access) in [
+        (zs_grant::GRANT_VERSION_ACCESS, zs_policy::Access::ReadWrite),
+        (zs_grant::GRANT_VERSION, zs_policy::Access::ReadOnly),
+        (3, zs_policy::Access::ReadOnly),
+        (3, zs_policy::Access::ReadWrite),
+    ] {
+        control.set_minted_version(version);
+        control.set_minted_access(access);
+        let error = runtime
+            .block_on(client.request_grant(&rotation_request()))
+            .expect_err("row 103: the pair must be refused");
+        assert!(
+            error
+                .to_string()
+                .ends_with("grant version not supported by this zs; upgrade zs"),
+            "row 103: version {version}, {access:?}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -5632,5 +5647,1139 @@ async fn row_124_range_is_removed_from_a_request_whose_scheme_sends_the_credenti
     assert!(
         common::header_lines(&head, "If-Range").is_empty(),
         "row 124: `If-Range` reached the upstream with the credential: {head}"
+    );
+}
+
+type PgStatus = &'static [(&'static str, &'static str)];
+type PgFrames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+const PG_CANNOT_OPEN: (&str, &str) = ("08004", "zs: the server cannot open a read-only session");
+const PG_CONFIRM: &str = "SHOW default_transaction_read_only";
+const PG_HIDDEN: &str = "SELECT zs_hidden()";
+const PG_SUPERUSER_LOGIN: PgStatus = &[
+    ("server_version", "16.4"),
+    ("server_encoding", "UTF8"),
+    ("default_transaction_read_only", "on"),
+    ("is_superuser", "on"),
+];
+
+fn pg_query(sql: &str) -> Vec<u8> {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    pg_fake::frame(b'Q', &body)
+}
+
+fn pg_parse(name: &str, sql: &str) -> Vec<u8> {
+    let mut body = name.as_bytes().to_vec();
+    body.push(0);
+    body.extend_from_slice(sql.as_bytes());
+    body.extend_from_slice(&[0, 0, 0]);
+    pg_fake::frame(b'P', &body)
+}
+
+fn pg_bind(statement: &str) -> Vec<u8> {
+    let mut body = vec![0];
+    body.extend_from_slice(statement.as_bytes());
+    body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+    pg_fake::frame(b'B', &body)
+}
+
+fn pg_execute() -> Vec<u8> {
+    pg_fake::frame(b'E', &[0, 0, 0, 0, 0])
+}
+
+fn pg_sync() -> Vec<u8> {
+    pg_fake::frame(b'S', &[])
+}
+
+fn pg_function_call() -> Vec<u8> {
+    let mut body = 2078u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&3u16.to_be_bytes());
+    for argument in [&b"default_transaction_read_only"[..], b"off", b"f"] {
+        body.extend_from_slice(&(argument.len() as u32).to_be_bytes());
+        body.extend_from_slice(argument);
+    }
+    body.extend_from_slice(&0u16.to_be_bytes());
+    pg_fake::frame(b'F', &body)
+}
+
+fn pg_complete(tag: &str) -> Vec<u8> {
+    let mut body = tag.as_bytes().to_vec();
+    body.push(0);
+    pg_fake::frame(b'C', &body)
+}
+
+fn pg_ready() -> Vec<u8> {
+    pg_fake::frame(b'Z', b"I")
+}
+
+fn pg_shown(value: &str) -> Vec<u8> {
+    let mut description = 1u16.to_be_bytes().to_vec();
+    description.extend_from_slice(b"default_transaction_read_only\0");
+    description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255]);
+    description.extend_from_slice(&[0, 0]);
+    let mut row = 1u16.to_be_bytes().to_vec();
+    row.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    row.extend_from_slice(value.as_bytes());
+    [
+        pg_fake::frame(b'T', &description),
+        pg_fake::frame(b'D', &row),
+        pg_complete("SHOW"),
+        pg_ready(),
+    ]
+    .concat()
+}
+
+async fn pg_emulated(status: PgStatus, show: &'static str) -> (std::net::SocketAddr, PgFrames) {
+    let frames: PgFrames = Arc::default();
+    let record = frames.clone();
+    let addr = pg_fake::start_with(move |mut tcp| {
+        let record = record.clone();
+        async move {
+            use tokio::io::AsyncWriteExt;
+            pg_fake::accept_login(&mut tcp, status).await?;
+            loop {
+                let (tag, body) = pg_fake::read_tagged(&mut tcp).await?;
+                record.lock().unwrap().push(pg_fake::frame(tag, &body));
+                let text = String::from_utf8_lossy(&body).into_owned();
+                let reply = match tag {
+                    b'Q' if text.contains(PG_CONFIRM) => pg_shown(show),
+                    b'Q' if text.contains(PG_HIDDEN) => [
+                        pg_complete("SELECT 1"),
+                        pg_fake::parameter_status("default_transaction_read_only", "off"),
+                        pg_ready(),
+                    ]
+                    .concat(),
+                    b'Q' => [pg_complete("SELECT 1"), pg_ready()].concat(),
+                    b'P' => pg_fake::frame(b'1', &[]),
+                    b'B' => pg_fake::frame(b'2', &[]),
+                    b'E' => pg_complete("SELECT 1"),
+                    b'S' => pg_ready(),
+                    _ => Vec::new(),
+                };
+                tcp.write_all(&reply).await?;
+            }
+        }
+    })
+    .await;
+    (addr, frames)
+}
+
+async fn pg_access_listener(
+    upstream: std::net::SocketAddr,
+    access: zs_protocol::SessionAccess,
+) -> (std::net::SocketAddr, fake::Refusals) {
+    let (audit, refusals) = fake::audit_recorder();
+    let materialize: zs_proto_postgres::Materialize =
+        Arc::new(move || Ok(pg_fake::granted_as(pg_fake::PASSWORD.as_bytes(), access)));
+    let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
+        "127.0.0.1:0",
+        zs_proto_postgres::UpstreamEndpoint::new("127.0.0.1", upstream.port()).unwrap(),
+        zs_proto_postgres::SslPolicy::RefuseOnLoopback,
+        UpstreamTls::WhenOffered,
+        materialize,
+    )
+    .await
+    .unwrap()
+    .with_refusal_audit(audit)
+    .with_caller_check(pg_fake::admit_all());
+    let local = listener.local_addr();
+    tokio::spawn(listener.serve());
+    (local, refusals)
+}
+
+async fn pg_until_ready(client: &mut tokio::net::TcpStream) {
+    loop {
+        let (tag, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pg_fake::read_tagged(client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if tag == b'Z' {
+            return;
+        }
+    }
+}
+
+async fn pg_closed(client: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_to_end(&mut rest),
+    )
+    .await
+    .expect("the session must close within 5 s")
+    .ok();
+    rest
+}
+
+async fn pg_pipelined_login(local: std::net::SocketAddr) -> Vec<u8> {
+    use tokio::io::AsyncWriteExt;
+    let mut client = tokio::net::TcpStream::connect(local).await.unwrap();
+    let mut first = zs_proto_postgres::startup_packet("alice", "appdb");
+    first.extend_from_slice(&pg_query("SELECT 'first'"));
+    client.write_all(&first).await.unwrap();
+    pg_closed(&mut client).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_125_a_refused_postgres_statement_is_replaced_and_the_session_stays_usable() {
+    use tokio::io::AsyncWriteExt;
+    use zs_proto_postgres::{PARSE_REFUSAL, QUERY_REFUSAL};
+    use zs_protocol::SessionAccess;
+    const REFUSED: [&str; 13] = [
+        "SET default_transaction_read_only = off",
+        "SELECT set_config('transaction_read_only', 'off', false)",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        "DO $$ BEGIN NULL; END $$",
+        "SELECT U&\"d\\0061ta\" FROM t",
+        "SELECT dblink_exec('host=x', 'DELETE FROM t')",
+        "SELECT * FROM crosstab3('SELECT 1')",
+        "SELECT query_to_xml('DELETE FROM t RETURNING 1', true, true, '')",
+        "SELECT lo_export(16384, '/tmp/zs-row-125')",
+        "SELECT pg_file_write('/tmp/zs-row-125', 'x', false)",
+        "COPY t TO PROGRAM 'true'",
+        "COPY t FROM PROGRAM 'true'",
+        "COPY t TO '/tmp/zs-row-125'",
+    ];
+    const SUPERUSER_ONLY: [&str; 2] = [
+        "SELECT pg_reload_conf()",
+        "ALTER SYSTEM SET work_mem = '64MB'",
+    ];
+    assert!(QUERY_REFUSAL.contains("ERRCODE = '25006'"), "row 125");
+    assert!(
+        PARSE_REFUSAL.contains("zs_refused_read_only_resource()"),
+        "row 125: the Parse refusal calls a function that does not exist (42883)"
+    );
+
+    let (writer, written) = pg_emulated(&pg_fake::READ_ONLY_LOGIN, "on").await;
+    let (local, refusals) = pg_access_listener(writer, SessionAccess::ReadWrite).await;
+    let mut client = pg_fake::login(local).await.unwrap();
+    for statement in REFUSED {
+        pg_fake::query(&mut client, statement).await;
+    }
+    assert_eq!(
+        *written.lock().unwrap(),
+        REFUSED.map(pg_query).to_vec(),
+        "row 125 negative control: a read-write session forwards every statement"
+    );
+    assert!(refusals.lock().unwrap().is_empty());
+
+    let (upstream, frames) = pg_emulated(&pg_fake::READ_ONLY_LOGIN, "on").await;
+    let (local, refusals) = pg_access_listener(upstream, SessionAccess::ReadOnly).await;
+    let mut client = pg_fake::login(local).await.unwrap();
+    assert_eq!(
+        pg_fake::query(&mut client, "SELECT 'before'").await,
+        "SELECT 1",
+        "row 125 positive control"
+    );
+    for statement in SUPERUSER_ONLY {
+        pg_fake::query(&mut client, statement).await;
+    }
+    for statement in REFUSED {
+        pg_fake::query(&mut client, statement).await;
+    }
+    client
+        .write_all(
+            &[
+                pg_parse("s1", "BEGIN READ WRITE"),
+                pg_bind("s1"),
+                pg_execute(),
+                pg_sync(),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+    pg_until_ready(&mut client).await;
+    client.write_all(&pg_function_call()).await.unwrap();
+    pg_until_ready(&mut client).await;
+    assert_eq!(
+        pg_fake::query(&mut client, "SELECT 'after'").await,
+        "SELECT 1",
+        "row 125: the session stays usable"
+    );
+
+    let mut expected = vec![pg_query("SELECT 'before'")];
+    expected.extend(SUPERUSER_ONLY.map(pg_query));
+    expected.extend(REFUSED.map(|_| pg_query(QUERY_REFUSAL)));
+    expected.extend([
+        pg_parse("s1", PARSE_REFUSAL),
+        pg_bind("s1"),
+        pg_execute(),
+        pg_sync(),
+        pg_query(QUERY_REFUSAL),
+        pg_query("SELECT 'after'"),
+    ]);
+    assert_eq!(*frames.lock().unwrap(), expected, "row 125");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); REFUSED.len() + 2],
+        "row 125: not audited"
+    );
+
+    let (superuser, frames) = pg_emulated(PG_SUPERUSER_LOGIN, "on").await;
+    let (local, refusals) = pg_access_listener(superuser, SessionAccess::ReadOnly).await;
+    let mut client = pg_fake::login(local).await.unwrap();
+    for statement in SUPERUSER_ONLY {
+        pg_fake::query(&mut client, statement).await;
+    }
+    assert_eq!(
+        *frames.lock().unwrap(),
+        SUPERUSER_ONLY.map(|_| pg_query(QUERY_REFUSAL)).to_vec(),
+        "row 125: a superuser session refuses the superuser words"
+    );
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); SUPERUSER_ONLY.len()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_126_a_postgres_server_that_cannot_confirm_read_only_is_refused_before_the_first_query()
+{
+    use zs_protocol::SessionAccess;
+    const CONFIRMED: PgStatus = &[
+        ("server_version", "16.4"),
+        ("server_encoding", "UTF8"),
+        ("default_transaction_read_only", "on"),
+        ("is_superuser", "off"),
+    ];
+    const OLD: PgStatus = &[
+        ("server_version", "13.16"),
+        ("server_encoding", "UTF8"),
+        ("is_superuser", "off"),
+    ];
+    const READ_WRITE: PgStatus = &[
+        ("server_version", "16.4"),
+        ("server_encoding", "UTF8"),
+        ("default_transaction_read_only", "off"),
+        ("is_superuser", "off"),
+    ];
+    let refused: [(&str, PgStatus, &'static str); 7] = [
+        ("the mode off", READ_WRITE, "on"),
+        (
+            "no report on 14+",
+            &[
+                ("server_version", "16.4"),
+                ("server_encoding", "UTF8"),
+                ("is_superuser", "off"),
+            ],
+            "on",
+        ),
+        ("SHOW off below 14", OLD, "off"),
+        ("SHOW On below 14", OLD, "On"),
+        (
+            "a single-byte encoding",
+            &[
+                ("server_version", "16.4"),
+                ("server_encoding", "LATIN1"),
+                ("default_transaction_read_only", "on"),
+                ("is_superuser", "off"),
+            ],
+            "on",
+        ),
+        (
+            "CockroachDB",
+            &[
+                ("server_version", "13.0.0"),
+                ("crdb_version", "CockroachDB CCL v23.2.0"),
+                ("server_encoding", "UTF8"),
+                ("default_transaction_read_only", "on"),
+                ("is_superuser", "off"),
+            ],
+            "on",
+        ),
+        (
+            "a server_version not in the PostgreSQL form",
+            &[
+                ("server_version", "11.2-YB-2.20.0.0-b0"),
+                ("server_encoding", "UTF8"),
+                ("is_superuser", "off"),
+            ],
+            "on",
+        ),
+    ];
+
+    for (status, expected) in [
+        (CONFIRMED, vec![pg_query("SELECT 'first'")]),
+        (OLD, vec![pg_query(PG_CONFIRM), pg_query("SELECT 'first'")]),
+    ] {
+        let (upstream, frames) = pg_emulated(status, "on").await;
+        let (local, refusals) = pg_access_listener(upstream, SessionAccess::ReadOnly).await;
+        let mut client = pg_fake::login(local)
+            .await
+            .expect("row 126 positive control: a confirmed read-only login works");
+        assert_eq!(
+            pg_fake::query(&mut client, "SELECT 'first'").await,
+            "SELECT 1"
+        );
+        assert_eq!(
+            *frames.lock().unwrap(),
+            expected,
+            "row 126 positive control"
+        );
+        assert!(refusals.lock().unwrap().is_empty());
+    }
+
+    let (upstream, _) = pg_emulated(READ_WRITE, "off").await;
+    let (local, refusals) = pg_access_listener(upstream, SessionAccess::ReadWrite).await;
+    let mut client = pg_fake::login(local)
+        .await
+        .expect("row 126 negative control: a read-write session does not need the mode");
+    assert_eq!(pg_fake::query(&mut client, "SELECT 'rw'").await, "SELECT 1");
+    assert!(refusals.lock().unwrap().is_empty());
+
+    for (name, status, show) in refused {
+        let (upstream, frames) = pg_emulated(status, show).await;
+        let (local, refusals) = pg_access_listener(upstream, SessionAccess::ReadOnly).await;
+        assert_eq!(
+            pg_pipelined_login(local).await,
+            pg_fake::error_frame(PG_CANNOT_OPEN),
+            "row 126, {name}: the fixed error and nothing else"
+        );
+        assert_eq!(
+            *refusals.lock().unwrap(),
+            vec![("connect", "read-only escaped")],
+            "row 126, {name}: not audited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let frames = frames.lock().unwrap().clone();
+        assert!(
+            frames.iter().all(|frame| *frame == pg_query(PG_CONFIRM)),
+            "row 126, {name}: a client message reached the server: {frames:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_127_a_postgres_session_that_leaves_read_only_closes_before_the_next_unit() {
+    use tokio::io::AsyncWriteExt;
+    use zs_protocol::SessionAccess;
+    const INSERT: &str = "INSERT INTO t VALUES (2)";
+    let pipelined = [pg_query(PG_HIDDEN), pg_query(INSERT)];
+
+    let (writer, written) = pg_emulated(&pg_fake::READ_ONLY_LOGIN, "on").await;
+    let (local, refusals) = pg_access_listener(writer, SessionAccess::ReadWrite).await;
+    let mut control = pg_fake::login(local).await.unwrap();
+    control.write_all(&pipelined.concat()).await.unwrap();
+    pg_until_ready(&mut control).await;
+    pg_until_ready(&mut control).await;
+    assert_eq!(
+        *written.lock().unwrap(),
+        pipelined.to_vec(),
+        "row 127 negative control: a read-write session forwards every unit"
+    );
+    assert!(refusals.lock().unwrap().is_empty());
+
+    let (upstream, frames) = pg_emulated(&pg_fake::READ_ONLY_LOGIN, "on").await;
+    let (local, refusals) = pg_access_listener(upstream, SessionAccess::ReadOnly).await;
+    let mut client = pg_fake::login(local).await.unwrap();
+    assert_eq!(
+        pg_fake::query(&mut client, "SELECT 'before'").await,
+        "SELECT 1",
+        "row 127 positive control"
+    );
+    client.write_all(&pipelined.concat()).await.unwrap();
+    let rest = pg_closed(&mut client).await;
+    assert!(
+        pg_complete("SELECT 1").starts_with(&rest),
+        "row 127: at most what came before the ParameterStatus reached the client: {rest:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec![pg_query("SELECT 'before'"), pg_query(PG_HIDDEN)],
+        "row 127: the next unit reached the server"
+    );
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", "read-only escaped")],
+        "row 127: not audited"
+    );
+}
+
+fn mysql_query(sql: &str) -> Vec<u8> {
+    let mut command = vec![packet::COM_QUERY];
+    command.extend_from_slice(sql.as_bytes());
+    command
+}
+
+fn mysql_with_status(status: u16) -> Vec<u8> {
+    let mut ok = vec![packet::OK_HEADER, 0, 0];
+    ok.extend_from_slice(&status.to_le_bytes());
+    ok.extend_from_slice(&[0, 0]);
+    ok.extend_from_slice(fake::OK_INFO);
+    ok
+}
+
+async fn mysql_access_rig(
+    script: fake::Script,
+    access: zs_protocol::SessionAccess,
+) -> (fake::Fake, std::net::SocketAddr, fake::Refusals) {
+    let upstream = fake::start(script).await;
+    let (audit, refusals) = fake::audit_recorder();
+    let local = fake::listen(
+        "127.0.0.1",
+        upstream.addr.port(),
+        UpstreamTls::WhenOffered,
+        fake::materialize_with(fake::PASSWORD, access),
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+    (upstream, local, refusals)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_128_a_refused_mysql_statement_is_replaced_and_a_session_that_cannot_start_read_only_is_refused()
+ {
+    use zs_proto_mysql::{READ_ONLY_REFUSED, REFUSAL, SESSION_START};
+    use zs_protocol::SessionAccess;
+    const REFUSED: [&str; 10] = [
+        "SET SESSION TRANSACTION READ WRITE",
+        "SET SESSION transaction_read_only = OFF",
+        "SET GLOBAL max_connections = 1",
+        "SELECT * FROM t INTO OUTFILE '/tmp/zs-row-128'",
+        "PREPARE s FROM @q",
+        "FLUSH TABLES",
+        "RESET MASTER",
+        "CHANGE MASTER TO MASTER_HOST = 'x'",
+        "ALTER INSTANCE ROTATE INNODB MASTER KEY",
+        "SHOW REPLICA STATUS",
+    ];
+    assert!(REFUSAL.contains("MYSQL_ERRNO = 1792"), "row 128");
+    assert_eq!(READ_ONLY_REFUSED.code, 1045, "row 128");
+    let mut prepare = vec![packet::COM_STMT_PREPARE];
+    prepare.extend_from_slice(b"SET TRANSACTION READ WRITE");
+    let reset = vec![packet::COM_RESET_CONNECTION];
+
+    let (writer, local, refusals) =
+        mysql_access_rig(mysql_script(fake::Flow::Accept), SessionAccess::ReadWrite).await;
+    let mut session = fake::login(local, fake::CLIENT_CAPS).await;
+    let mut sent: Vec<Vec<u8>> = REFUSED.map(mysql_query).to_vec();
+    sent.extend([prepare.clone(), reset.clone()]);
+    for command in &sent {
+        session.command(command).await.unwrap();
+    }
+    assert_eq!(
+        writer.seen(|s| s.commands.clone()),
+        sent,
+        "row 128 negative control: a read-write session forwards every command"
+    );
+    assert!(refusals.lock().unwrap().is_empty());
+
+    let (upstream, local, refusals) =
+        mysql_access_rig(mysql_script(fake::Flow::Accept), SessionAccess::ReadOnly).await;
+    let mut session = fake::login(local, fake::CLIENT_CAPS).await;
+    assert_eq!(session.reply.payload.first(), Some(&packet::OK_HEADER));
+    let answer = session.command(&mysql_query("SELECT 1")).await.unwrap();
+    assert!(
+        answer.payload.ends_with(fake::OK_INFO),
+        "row 128 positive control"
+    );
+    for command in &sent {
+        session.command(command).await.unwrap();
+    }
+    let answer = session.command(&mysql_query("SELECT 2")).await.unwrap();
+    assert!(
+        answer.payload.ends_with(fake::OK_INFO),
+        "row 128: the session stays usable"
+    );
+    let mut expected = vec![mysql_query(SESSION_START), mysql_query("SELECT 1")];
+    expected.extend(REFUSED.map(|_| mysql_query(REFUSAL)));
+    let mut prepared_refusal = vec![packet::COM_STMT_PREPARE];
+    prepared_refusal.extend_from_slice(REFUSAL.as_bytes());
+    expected.extend([
+        prepared_refusal,
+        mysql_query(REFUSAL),
+        mysql_query("SELECT 2"),
+    ]);
+    assert_eq!(upstream.seen(|s| s.commands.clone()), expected, "row 128");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); REFUSED.len() + 2],
+        "row 128: not audited"
+    );
+
+    for first_reply in [
+        packet::err_packet(1227, "42000", "Access denied; you need the privilege"),
+        mysql_with_status(0x0003),
+    ] {
+        let script = mysql_script(fake::Flow::Accept).with_first_reply(first_reply);
+        let (upstream, local, refusals) = mysql_access_rig(script, SessionAccess::ReadOnly).await;
+        let mut session = fake::login(local, fake::CLIENT_CAPS).await;
+        assert_eq!(session.reply.payload, READ_ONLY_REFUSED.packet(), "row 128");
+        assert!(session.closed().await, "row 128: the session must close");
+        assert_eq!(
+            upstream.seen(|s| s.commands.clone()),
+            vec![mysql_query(SESSION_START)],
+            "row 128: a client command reached the server"
+        );
+        assert_eq!(*refusals.lock().unwrap(), vec![("connect", "read-only")]);
+    }
+
+    let mariadb =
+        mysql_script(fake::Flow::Accept).with_server_version(b"5.5.5-10.11.6-MariaDB-log");
+    let (upstream, local, refusals) = mysql_access_rig(mariadb, SessionAccess::ReadOnly).await;
+    let mut session = fake::login(local, fake::CLIENT_CAPS).await;
+    assert_eq!(
+        session.reply.payload,
+        READ_ONLY_REFUSED.packet(),
+        "row 128: MariaDB"
+    );
+    assert!(session.closed().await);
+    assert_eq!(
+        upstream.seen(|s| s.responses),
+        0,
+        "row 128: a login reached MariaDB"
+    );
+    assert_eq!(*refusals.lock().unwrap(), vec![("connect", "read-only")]);
+}
+
+async fn mongo_access_rig(
+    access: zs_protocol::SessionAccess,
+) -> (
+    mongo_fake::FakeSet,
+    std::net::SocketAddr,
+    mongo_fake::Refusals,
+) {
+    let set = mongo_fake::start(mongo_fake::Script::set(1, Some(0))).await;
+    let (audit, refusals) = mongo_fake::audit_recorder();
+    let local = mongo_fake::listen(
+        set.seed(),
+        None,
+        mongo_fake::materialize_with(mongo_fake::PASSWORD, access),
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+    (set, local, refusals)
+}
+
+fn mongo_command(name: &str) -> zs_proto_mongo::bson::Doc {
+    zs_proto_mongo::bson::Doc::new()
+        .with_str(name, "orders")
+        .with_str("$db", "appdb")
+}
+
+fn mongo_aggregate(stages: &[zs_proto_mongo::bson::Doc]) -> zs_proto_mongo::bson::Doc {
+    let pipeline = stages
+        .iter()
+        .enumerate()
+        .fold(zs_proto_mongo::bson::Doc::new(), |array, (at, stage)| {
+            array.with_doc(&at.to_string(), stage)
+        });
+    zs_proto_mongo::bson::Doc::new()
+        .with_str("aggregate", "orders")
+        .with_array("pipeline", &pipeline)
+        .with_doc("cursor", &zs_proto_mongo::bson::Doc::new())
+        .with_str("$db", "appdb")
+}
+
+async fn mongo_answered(
+    client: &mut mongo_fake::Client,
+    message: zs_proto_mongo::wire::OpMsg,
+) -> zs_proto_mongo::bson::Doc {
+    let id = client.next_id();
+    client.send(&message.encode(id, 0)).await.unwrap();
+    let (header, reply) = client.read_doc().await.unwrap();
+    assert_eq!(header.response_to, id, "the reply answers the request");
+    reply
+}
+
+async fn mongo_silently_closed(client: &mut mongo_fake::Client) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut rest = Vec::new();
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.stream.read_to_end(&mut rest)
+        )
+        .await,
+        Ok(Ok(0))
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_129_a_refused_mongo_command_gets_code_13_and_the_session_stays_usable() {
+    use zs_proto_mongo::bson::Doc;
+    use zs_proto_mongo::wire::{MORE_TO_COME, OpMsg, Section};
+    use zs_protocol::SessionAccess;
+    const MARKER: &str = "zs-row-129-marker";
+    let insert = || {
+        Doc::new()
+            .with_str("insert", "orders")
+            .with_array(
+                "documents",
+                &Doc::new().with_doc("0", &Doc::new().with_str("probe", MARKER)),
+            )
+            .with_str("$db", "appdb")
+    };
+    let get_more = || mongo_command("getMore").with_i64("getMore", mongo_fake::OPEN_CURSOR);
+    let sequence = || {
+        let mut raw = b"documents\0".to_vec();
+        raw.extend_from_slice(&Doc::new().with_str("probe", MARKER).encode());
+        let mut section = ((raw.len() + 4) as i32).to_le_bytes().to_vec();
+        section.extend_from_slice(&raw);
+        Section::Sequence(section)
+    };
+    let merge = Doc::new().with_str("$merge", MARKER);
+
+    let (writer, local, refusals) = mongo_access_rig(SessionAccess::ReadWrite).await;
+    let mut client = mongo_fake::logged_in(local).await;
+    assert!(
+        mongo_answered(&mut client, OpMsg::new(insert()))
+            .await
+            .truthy("ok")
+    );
+    assert!(
+        writer.saw_bytes(MARKER.as_bytes()),
+        "row 129 negative control: a read-write session forwards insert"
+    );
+    assert!(refusals.lock().unwrap().is_empty());
+
+    let (set, local, refusals) = mongo_access_rig(SessionAccess::ReadOnly).await;
+    let mut client = mongo_fake::logged_in(local).await;
+    let refused_messages = [
+        OpMsg::new(get_more()),
+        OpMsg::new(insert()),
+        OpMsg::new(mongo_command("update")),
+        OpMsg::new(mongo_command("zsMadeUpCommand")),
+        OpMsg::new(mongo_aggregate(&[Doc::new().with_str("$out", MARKER)])),
+        OpMsg::new(mongo_aggregate(&[Doc::new().with_doc(
+            "$facet",
+            &Doc::new().with_array("a", &Doc::new().with_doc("0", &merge)),
+        )])),
+        OpMsg {
+            flags: 0,
+            sections: vec![Section::Body(mongo_command("find")), sequence()],
+        },
+    ];
+    let refused_count = refused_messages.len();
+    for message in refused_messages {
+        let reply = mongo_answered(&mut client, message).await;
+        mongo_fake::assert_error(&reply, 13, zs_proto_mongo::READ_ONLY_REFUSED.message);
+        assert_eq!(reply.str("codeName"), Some("Unauthorized"), "row 129");
+    }
+    let opened = mongo_answered(
+        &mut client,
+        OpMsg::new(mongo_fake::find().with_i32("batchSize", 1)),
+    )
+    .await;
+    assert!(opened.truthy("ok"), "row 129: the session stays usable");
+    assert!(
+        mongo_answered(&mut client, OpMsg::new(get_more()))
+            .await
+            .truthy("ok"),
+        "row 129 positive control: a cursor that a read-only session opened continues"
+    );
+    assert_eq!(
+        set.seen(0, |s| s.commands.clone()),
+        vec!["find".to_string(), "getMore".to_string()],
+        "row 129: a refused command reached the server"
+    );
+    assert!(!set.saw_bytes(MARKER.as_bytes()), "row 129");
+
+    let mut more = mongo_fake::logged_in(local).await;
+    let id = more.next_id();
+    more.send(
+        &OpMsg {
+            flags: MORE_TO_COME,
+            sections: vec![Section::Body(insert())],
+        }
+        .encode(id, 0),
+    )
+    .await
+    .unwrap();
+    assert!(
+        mongo_silently_closed(&mut more).await,
+        "row 129: a refused moreToCome message closes the session without a reply"
+    );
+    let mut malformed = mongo_fake::logged_in(local).await;
+    let id = malformed.next_id();
+    malformed
+        .send(
+            &OpMsg::new(
+                Doc::new()
+                    .with_str("explain", "find")
+                    .with_str("$db", "appdb"),
+            )
+            .encode(id, 0),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mongo_silently_closed(&mut malformed).await,
+        "row 129: a malformed message closes the session without a reply"
+    );
+    assert!(!set.saw_bytes(MARKER.as_bytes()), "row 129");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); refused_count + 2],
+        "row 129: not audited"
+    );
+}
+
+fn redis_frame(parts: &[&[u8]]) -> Vec<u8> {
+    zs_proto_redis::resp::Command::new(redis_args(parts))
+        .encode()
+        .to_vec()
+}
+
+async fn redis_access_rig(
+    script: redis_fake::Script,
+    access: zs_protocol::SessionAccess,
+) -> (redis_fake::Fake, std::net::SocketAddr, redis_fake::Refusals) {
+    let fake = redis_fake::start(script).await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_fake::listen(
+        fake.addr,
+        None,
+        redis_fake::auth(),
+        redis_fake::materialize_with(redis_fake::PASSWORD, access),
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+    (fake, local, refusals)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_130_a_refused_redis_command_gets_noperm_and_a_refusal_backlog_closes_the_session() {
+    use zs_proto_redis::{
+        EXEC_ABORTED, READ_ONLY_REFUSED, REFUSAL_BACKLOG, REFUSAL_BACKLOG_REASON,
+    };
+    use zs_protocol::SessionAccess;
+    const MARKER: &[u8] = b"zs-row-130-marker";
+    let noperm = READ_ONLY_REFUSED.frame();
+    assert_eq!(noperm, b"-NOPERM read-only resource\r\n", "row 130");
+    let refused: [&[&[u8]]; 5] = [
+        &[b"SET", b"k", MARKER],
+        &[b"FLUSHALL"],
+        &[b"EVAL", b"return 1", b"0"],
+        &[b"CONFIG", b"SET", b"maxmemory", b"1"],
+        &[b"ZS-MADE-UP", MARKER],
+    ];
+
+    let (writer, local, refusals) =
+        redis_access_rig(redis_fake::Script::new(), SessionAccess::ReadWrite).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        client.command(&[b"SET", b"k", MARKER]).await,
+        redis_fake::OK
+    );
+    assert!(
+        writer.saw_bytes(MARKER),
+        "row 130 negative control: a read-write session forwards SET"
+    );
+    assert!(refusals.lock().unwrap().is_empty());
+
+    let (upstream, local, refusals) =
+        redis_access_rig(redis_fake::Script::new(), SessionAccess::ReadOnly).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        client.command(&[b"GET", b"a"]).await,
+        redis_fake::OK,
+        "row 130 positive control"
+    );
+    for command in refused {
+        assert_eq!(client.command(command).await, noperm, "row 130");
+    }
+    assert_eq!(
+        client.command(&[b"GET", b"b"]).await,
+        redis_fake::OK,
+        "row 130: the session stays usable"
+    );
+    assert_eq!(
+        upstream.commands(),
+        vec![redis_args(&[b"GET", b"a"]), redis_args(&[b"GET", b"b"])],
+        "row 130: a refused command reached the server"
+    );
+    assert!(!upstream.saw_bytes(MARKER), "row 130");
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("query", "read-only"); refused.len()],
+        "row 130: not audited"
+    );
+
+    let script = redis_fake::Script::new()
+        .with_reply(redis_fake::OK.to_vec())
+        .with_reply(b"+QUEUED\r\n".to_vec())
+        .with_reply(redis_fake::OK.to_vec());
+    let (upstream, local, _) = redis_access_rig(script, SessionAccess::ReadOnly).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    client
+        .send(
+            &[
+                redis_frame(&[b"MULTI"]),
+                redis_frame(&[b"GET", b"k"]),
+                redis_frame(&[b"SET", b"k", MARKER]),
+                redis_frame(&[b"EXEC"]),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+    for expected in [
+        redis_fake::OK.to_vec(),
+        b"+QUEUED\r\n".to_vec(),
+        noperm.clone(),
+        EXEC_ABORTED.frame(),
+    ] {
+        assert_eq!(client.read_reply().await, expected, "row 130: MULTI");
+    }
+    assert_eq!(
+        upstream.commands(),
+        vec![
+            redis_args(&[b"MULTI"]),
+            redis_args(&[b"GET", b"k"]),
+            redis_args(&[b"DISCARD"]),
+        ],
+        "row 130: SET or EXEC reached the server"
+    );
+
+    let script = redis_fake::Script::new()
+        .with_reply_delay(std::time::Duration::from_secs(1))
+        .with_reply(b"$1\r\na\r\n".to_vec());
+    let (upstream, local, refusals) = redis_access_rig(script, SessionAccess::ReadOnly).await;
+    let mut client = redis_fake::Client::connect(local).await;
+    let mut write = redis_frame(&[b"GET", b"a"]);
+    for _ in 0..=REFUSAL_BACKLOG {
+        write.extend_from_slice(&redis_frame(&[b"SET", b"k", MARKER]));
+    }
+    write.extend_from_slice(&redis_frame(&[b"GET", b"c"]));
+    client.send(&write).await.unwrap();
+    let mut expected = b"$1\r\na\r\n".to_vec();
+    for _ in 0..REFUSAL_BACKLOG {
+        expected.extend_from_slice(&noperm);
+    }
+    let received = client.read_to_end().await;
+    assert!(
+        received == expected,
+        "row 130: received {} bytes, expected {}",
+        received.len(),
+        expected.len()
+    );
+    assert_eq!(upstream.commands(), vec![redis_args(&[b"GET", b"a"])]);
+    let refusals = refusals.lock().unwrap().clone();
+    assert_eq!(refusals.len(), REFUSAL_BACKLOG + 1, "row 130");
+    assert_eq!(
+        refusals[REFUSAL_BACKLOG],
+        ("connect", REFUSAL_BACKLOG_REASON),
+        "row 130: the backlog close is not audited"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_131_an_open_database_session_closes_when_the_access_of_its_grant_changes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zs_protocol::{ACCESS_CHANGED_REASON, SessionAccess};
+    let read_only = Arc::new(AtomicBool::new(false));
+    let state = read_only.clone();
+    let access_of = |read_only: bool| {
+        if read_only {
+            SessionAccess::ReadOnly
+        } else {
+            SessionAccess::ReadWrite
+        }
+    };
+    let materialize: zs_protocol::Materialize = Arc::new(move || {
+        let access = access_of(state.load(Ordering::SeqCst));
+        let state = state.clone();
+        let check: zs_protocol::SessionCheck = Arc::new(move || {
+            if access_of(state.load(Ordering::SeqCst)) == access {
+                Ok(())
+            } else {
+                Err(ACCESS_CHANGED_REASON)
+            }
+        });
+        Ok(zs_protocol::Materialized::new(
+            zs_credential::Credential::from_bytes(redis_fake::PASSWORD.as_bytes().to_vec())
+                .unwrap(),
+            access,
+            check,
+        ))
+    });
+    let fake = redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_fake::listen(
+        fake.addr,
+        None,
+        redis_fake::auth(),
+        materialize,
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+
+    let mut session = redis_fake::logged_in(local).await;
+    assert_eq!(
+        session.command(&[b"SET", b"row-131-before", b"v"]).await,
+        redis_fake::OK,
+        "row 131 positive control: a read-write session relays a write"
+    );
+    assert!(
+        fake.saw_bytes(b"row-131-before"),
+        "row 131 positive control"
+    );
+
+    read_only.store(true, Ordering::SeqCst);
+    let mut reopened = redis_fake::Client::connect(local).await;
+    assert_eq!(
+        reopened.command(&[b"SET", b"row-131-new", b"v"]).await,
+        zs_proto_redis::READ_ONLY_REFUSED.frame(),
+        "row 131 negative control: a new session opens with the new access"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert_eq!(
+        session.read_to_end().await,
+        Vec::<u8>::new(),
+        "row 131: the agent wrote a reply on the session that it ended"
+    );
+    let _ = session
+        .send_command(&[b"SET", b"row-131-after", b"v"])
+        .await;
+    assert!(
+        !redis_fake::eventually(|| fake.saw_bytes(b"row-131-after")).await,
+        "row 131: a command reached the upstream 6 s after the access changed"
+    );
+    assert!(!fake.saw_bytes(b"row-131-new"), "row 131");
+    let mut recorded = refusals.lock().unwrap().clone();
+    recorded.sort_unstable();
+    assert_eq!(
+        recorded,
+        vec![("connect", ACCESS_CHANGED_REASON), ("query", "read-only")],
+        "row 131: not audited"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_132_a_read_only_grant_for_a_binding_that_is_not_a_database_is_denied() {
+    const REFUSED: &str = "grant does not permit the requested operation";
+    let key = ControlSigningKey::generate("k1");
+    let request =
+        b"GET /v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n";
+
+    let allowed = serve(
+        binding(),
+        vec![key.sign(grant(now_ms() + 300_000, "g-1")).unwrap()],
+        &key,
+        Some(CREDENTIAL),
+    )
+    .await;
+    let response = common::tunneled_exchange(
+        &allowed.addr.to_string(),
+        &allowed.ca_pem,
+        HOST,
+        443,
+        request,
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "row 132 positive control: {response}"
+    );
+
+    let mut read_only = grant(now_ms() + 300_000, "g-2");
+    read_only.access = zs_policy::Access::ReadOnly;
+    read_only.version = zs_grant::GRANT_VERSION_ACCESS;
+    let refused = serve(
+        binding(),
+        vec![key.sign(read_only).unwrap()],
+        &key,
+        Some(CREDENTIAL),
+    )
+    .await;
+    let response = common::tunneled_exchange(
+        &refused.addr.to_string(),
+        &refused.ca_pem,
+        HOST,
+        443,
+        request,
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 502 ZeroSecret denied"),
+        "row 132: {response}"
+    );
+    assert!(
+        refused.upstream.heads.lock().unwrap().is_empty(),
+        "row 132: a request reached the upstream"
+    );
+    let Flow::Deny { reason } = classify(&refused.handler, HOST) else {
+        panic!("row 132: a read-only grant on an HTTPS binding must deny");
+    };
+    assert!(reason.ends_with(REFUSED), "row 132: {reason}");
+    match refused.handler.materialize(HOST, "GET") {
+        Ok(_) => panic!("row 132: a credential for a read-only grant on an HTTPS binding"),
+        Err(denied) => assert!(
+            denied.reason.ends_with(REFUSED),
+            "row 132: {}",
+            denied.reason
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_133_a_mongo_message_that_reuses_an_awaited_request_id_closes_the_session() {
+    use zs_proto_mongo::bson::Doc;
+    use zs_proto_mongo::wire::OpMsg;
+    use zs_protocol::SessionAccess;
+    let hello = || Doc::new().with_i32("hello", 1).with_str("$db", "admin");
+
+    for access in [SessionAccess::ReadWrite, SessionAccess::ReadOnly] {
+        let (set, local, _) = mongo_access_rig(access).await;
+        let mut client = mongo_fake::logged_in(local).await;
+        let (first, second) = (client.next_id(), client.next_id());
+        let mut frames = OpMsg::new(hello()).encode(first, 0);
+        frames.extend(OpMsg::new(hello()).encode(second, 0));
+        client.send(&frames).await.unwrap();
+        for id in [first, second] {
+            let (header, reply) = client.read_doc().await.unwrap();
+            assert_eq!(
+                header.response_to, id,
+                "row 133 positive control, {access:?}"
+            );
+            assert!(reply.truthy("ok"));
+        }
+
+        let id = client.next_id();
+        let mut frames = OpMsg::new(hello()).encode(id, 0);
+        frames.extend(OpMsg::new(mongo_command("count")).encode(id, 0));
+        client.send(&frames).await.unwrap();
+        assert!(
+            client.closed().await,
+            "row 133, {access:?}: the session must close"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let commands = set.seen(0, |s| s.commands.clone());
+        assert!(
+            !commands.iter().any(|name| name == "count"),
+            "row 133, {access:?}: the second message reached the server: {commands:?}"
+        );
+    }
+
+    let (set, local, _) = mongo_access_rig(SessionAccess::ReadOnly).await;
+    let mut client = mongo_fake::logged_in(local).await;
+    let id = client.next_id();
+    let mut frames = OpMsg::new(mongo_fake::find().with_i32("batchSize", 1)).encode(id, 0);
+    frames.extend(OpMsg::new(mongo_command("count")).encode(id, 0));
+    client.send(&frames).await.unwrap();
+    assert!(client.closed().await, "row 133: a cursor command id");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let commands = set.seen(0, |s| s.commands.clone());
+    assert!(
+        !commands.iter().any(|name| name == "count"),
+        "row 133: the second message reached the server: {commands:?}"
     );
 }

@@ -530,6 +530,17 @@ every request, and the endpoint strips the first path segment before it matches,
 `ZS_<RESOURCE>_URL` comes back without it. No line on stdout and no `listener_bound` event
 carries the token.
 
+**Read-only L3 resources (ADR-0063).** A resource with `access: read_only` gets a version-2 grant
+that signs `access` first. The L3 listener then checks commands, never data. PostgreSQL and
+MySQL sessions open in the database's own read-only mode (PostgreSQL startup option
+`-c default_transaction_read_only=on`, confirmed by the server's report or, below version 14, by
+one `SHOW` at login; MySQL `SET SESSION transaction_read_only = ON`), and a scan of each statement
+refuses the known ways to switch it off. MongoDB and Redis admit an allowlist of read commands;
+MongoDB `getMore` and `killCursors` pass only for cursors that read-only sessions opened. Every
+relay polls the session check that travels with the credential and closes an open session
+within 5 s when the access of the grant changes or the grant ends. This is a guardrail, not a
+boundary (SECURITY §3).
+
 This is not a system-wide proxy. Browsers, banking sites, and unrelated applications are
 untouched. ZeroSecret is not Zscaler and must never be described as though it were.
 

@@ -29,7 +29,8 @@ manage credentials again." "Every action in every stack is checked and logged."
 
 <!-- CLAIM-FENCE-END -->
 
-`zs resources` reports the interception layer and the strict-mode label of each resource.
+`zs resources` reports the interception layer and the strict-mode label of each resource, and
+ends the row of a read-only resource with `read-only (guardrail)`.
 The limits are in [docs/SECURITY.md](docs/SECURITY.md).
 
 ## What is in this repository
