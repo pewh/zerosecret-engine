@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-20
+
 ### Security
 
 - A PostgreSQL, MySQL, MongoDB or Redis resource can be read-only (ADR-0063). A policy resource
