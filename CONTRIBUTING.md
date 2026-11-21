@@ -37,7 +37,7 @@ Run these before you open a pull request. CI runs the same commands:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
-cargo deny check
+cargo deny check -D advisory-not-detected
 ```
 
 ## Run the conformance suite

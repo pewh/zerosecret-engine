@@ -118,7 +118,7 @@ jobs:
             grep -Fq "test result: ok. 1 passed" /tmp/zs-other-user.log
           '
       - run: cargo install cargo-deny --locked --version 0.20.2
-      - run: cargo deny check
+      - run: cargo deny check -D advisory-not-detected
 
   caller-clients:
     # T8: every client the spec measured must still carry the run token, so this job refuses to

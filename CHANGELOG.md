@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Development
+
+- CI runs `cargo deny check -D advisory-not-detected`: an advisory ignore in `deny.toml` that no
+  longer matches a crate fails the build. The RUSTSEC-2026-0543 (chrono) ignore therefore has to
+  go in the same change that drops chrono (cedar-policy/cedar PR 2714).
+- The `zs-upstream` connect-budget tests use a connect that never finishes instead of a full
+  listen backlog, so they pass on macOS hosts that reset such a connect.
+
 ## [0.7.0] - 2026-11-20
 
 ### Security

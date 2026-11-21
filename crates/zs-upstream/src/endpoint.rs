@@ -55,6 +55,22 @@ where
     R: FnOnce(String, u16) -> F,
     F: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
+    connect_via(endpoint, resolve, TcpStream::connect).await
+}
+
+/// `connect_with` with the TCP connect passed in, so tests can hold a connect open without
+/// relying on how the host treats a full listen backlog.
+async fn connect_via<R, F, C, G>(
+    endpoint: &UpstreamEndpoint,
+    resolve: R,
+    mut connect: C,
+) -> io::Result<TcpStream>
+where
+    R: FnOnce(String, u16) -> F,
+    F: Future<Output = io::Result<Vec<SocketAddr>>>,
+    C: FnMut(SocketAddr) -> G,
+    G: Future<Output = io::Result<TcpStream>>,
+{
     let attempt = async {
         let candidates = resolve(endpoint.host.clone(), endpoint.port)
             .await
@@ -83,9 +99,7 @@ where
             "all upstream candidates failed",
         );
         for candidate in seen {
-            match tokio::time::timeout(CANDIDATE_CONNECT_BUDGET, TcpStream::connect(candidate))
-                .await
-            {
+            match tokio::time::timeout(CANDIDATE_CONNECT_BUDGET, connect(candidate)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(_)) => {
                     last_error = io::Error::new(
@@ -213,42 +227,34 @@ mod tests {
         assert!(!error.to_string().contains(SENTINEL_HOST));
     }
 
-    async fn hanging_listener() -> (SocketAddr, TcpListener, Vec<std::net::TcpStream>) {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let listener = socket.listen(1).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut fillers = Vec::new();
-        for _ in 0..8 {
-            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
-            {
-                Ok(filler) => fillers.push(filler),
-                Err(_) => break,
-            }
+    /// A TCP connect that never finishes, as to a host that drops the SYN. It records each
+    /// address it was asked for. A real socket cannot do this portably: Linux drops a SYN to
+    /// a full listen backlog, macOS may answer it with a reset.
+    fn hanging_connect(
+        attempts: std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    ) -> impl FnMut(SocketAddr) -> std::future::Pending<io::Result<TcpStream>> {
+        move |addr| {
+            attempts.lock().unwrap().push(addr);
+            std::future::pending()
         }
-        assert!(
-            !fillers.is_empty(),
-            "the backlog must accept at least one filler"
-        );
-        (addr, listener, fillers)
+    }
+
+    fn test_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, 1], port))
     }
 
     #[tokio::test(start_paused = true)]
     async fn total_budget_is_bounded() {
-        let mut candidates = Vec::with_capacity(3);
-        let mut keep = Vec::with_capacity(3);
-        for _ in 0..3 {
-            let (addr, listener, fillers) = hanging_listener().await;
-            candidates.push(addr);
-            keep.push((listener, fillers));
-        }
+        let candidates = vec![test_addr(1), test_addr(2), test_addr(3)];
+        let attempts = std::sync::Arc::default();
 
         let endpoint = UpstreamEndpoint::new(SENTINEL_HOST, 5432).unwrap();
         let t0 = tokio::time::Instant::now();
-        let error = connect_with(&endpoint, move |_host, _port| {
-            let candidates = candidates.clone();
-            async move { Ok(candidates) }
-        })
+        let error = connect_via(
+            &endpoint,
+            move |_host, _port| async move { Ok(candidates) },
+            hanging_connect(std::sync::Arc::clone(&attempts)),
+        )
         .await
         .unwrap_err();
         let elapsed = t0.elapsed();
@@ -256,25 +262,32 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(!error.to_string().contains(SENTINEL_HOST));
         assert_eq!(elapsed, TOTAL_CONNECT_BUDGET);
-        drop(keep);
+        // 2 s + 2 s spent on the first two; the total budget cuts the third short.
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![test_addr(1), test_addr(2), test_addr(3)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn duplicate_candidates_are_not_retried() {
-        let (addr, listener, fillers) = hanging_listener().await;
+        let addr = test_addr(1);
+        let attempts = std::sync::Arc::default();
 
         let endpoint = UpstreamEndpoint::new(SENTINEL_HOST, 5432).unwrap();
         let t0 = tokio::time::Instant::now();
-        let error = connect_with(&endpoint, move |_host, _port| async move {
-            Ok(vec![addr, addr])
-        })
+        let error = connect_via(
+            &endpoint,
+            move |_host, _port| async move { Ok(vec![addr, addr]) },
+            hanging_connect(std::sync::Arc::clone(&attempts)),
+        )
         .await
         .unwrap_err();
         let elapsed = t0.elapsed();
 
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(elapsed, CANDIDATE_CONNECT_BUDGET);
-        drop((listener, fillers));
+        assert_eq!(*attempts.lock().unwrap(), vec![addr]);
     }
 
     #[tokio::test]

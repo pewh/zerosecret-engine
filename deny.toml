@@ -4,6 +4,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Every ignore below must still match a crate in the tree. CI runs
+# `cargo deny check -D advisory-not-detected`, so an ignore that no longer matches fails the
+# build and has to be removed in the same change. RUSTSEC-2026-0543 goes away when cedar drops
+# chrono: cedar-policy/cedar issue 2707, PR 2714 ("vendor chrono").
 ignore = [
   { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained notice, not a vulnerability; only cedar-policy-core 4.14 uses it, through its default datetime feature that cedar-policy always enables; remove when cedar drops chrono" },
 ]

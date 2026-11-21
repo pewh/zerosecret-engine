@@ -30,7 +30,7 @@ cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings \
   -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
-cargo deny check
+cargo deny check -D advisory-not-detected
 ```
 
 - Agent tests need a native credential store: a private Secret Service on the D-Bus session
