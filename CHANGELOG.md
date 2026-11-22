@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-21
+
 ### Development
 
 - CI runs `cargo deny check -D advisory-not-detected`: an advisory ignore in `deny.toml` that no
@@ -9,6 +11,49 @@
   go in the same change that drops chrono (cedar-policy/cedar PR 2714).
 - The `zs-upstream` connect-budget tests use a connect that never finishes instead of a full
   listen backlog, so they pass on macOS hosts that reset such a connect.
+
+### Security
+
+- The agent learns of a revocation or a policy change when it is written, in about one second.
+  It holds `GET /wire/revocations?after=<cursor>` open; the control plane answers the hold when
+  the organization's policy version or revocation set changes, woken by a PostgreSQL `NOTIFY`
+  trigger on `policies` and `revoked_grants`. A hold ends after 25 s at most; while the `LISTEN`
+  connection is down, each held request answers at once and the next is held at most 5 s. An
+  answer without a `cursor` makes the agent sleep the refresh interval. A failed request retries
+  after 1 s, doubling to that interval, and the retry carries no cursor, so it is answered at
+  once with the current keys and CA set even behind a proxy that cuts every hold. Once the
+  control plane answers again, a change is learned within 60 s; while it does not answer, the
+  bound is one TTL (ADR-0064).
+- `RevocationsResponse` carries `policy_version` and `cursor`; `GrantMintResponse` carries the
+  `policy_version` it evaluated. Both fields are optional and skipped when absent, so a control
+  plane from before this release keeps working, and an agent from before it ignores the fields.
+- A changed `policy_version` wakes the renewal task, which renews every grant minted under
+  another version before its 150 s window. A missing or equal version renews no grant early.
+- When the control plane sends a policy version, a renewal refused with 403 withdraws the
+  cached grant (against an older control plane the grant is kept and retried as before): the
+  agent forgets the materialized value, prints `zs: grant for <resource> withdrawn by the
+  control plane`, emits `grant_withdrawn`, denies the next request, and ends an open database
+  session with `grant revoked` and an open WebSocket session with Close 1008
+  (`websocket revoked`). A 5xx, a transport error or a malformed answer keeps the grant until it
+  expires. The next policy version change mints a withdrawn grant again, and a binding refused
+  with 403 at startup too; a mint that needs a restart to be used is reported once per policy
+  change. A renewed grant the agent cannot use (a changed credential source or connection)
+  leaves the old grant in place until it expires, and the binding is tried again on the next
+  policy change, not on every refresh. A 403 that no policy edit cures keeps the binding
+  withdrawn until the next policy change or a restart. A grant revoked through `/wire/revoke` is
+  still never renewed. At startup the agent reads the revocations answer before it mints, so a
+  policy edit during startup is not missed, and a control plane that never answers refuses the
+  run after one request timeout.
+- Every open session (WebSocket, PostgreSQL, MySQL, MongoDB, Redis) checks its grant at once
+  when a grant changes (a renewal, a withdrawal or an applied revocation), not on the next 5 s
+  tick. The 5 s tick stays as the floor.
+- Control plane: `AFTER INSERT` triggers send `pg_notify('zs_wire', '<schema>/<organization_id>')`;
+  one hub per control instance holds one `LISTEN zs_wire` connection and wakes the held requests
+  of that organization; after 30 s without a notification it pings the connection and replaces
+  it when the ping fails, so a silently dead connection is found within 35 s. A held request
+  releases its database resources, and
+  `zs_control_wire_revocations_waiting` counts the holds. The `/wire/revocations`
+  request-duration histogram counts the hold time, up to 25 s.
 
 ## [0.7.0] - 2026-11-20
 

@@ -73,7 +73,8 @@ letting one test stand in for the set.
 
 **Key rings.** The grant signing key, the federation key and the device CA are rings in one
 `ZS_CONTROL_CA_DIR` (ADR-0053). A device trusts the published grant keys and CA certificates that
-the control plane sends in the 60-second revocations response; an absent or empty set leaves its
+the control plane sends in every revocations response (a request held up to 25 s, ADR-0064); an
+absent or empty set leaves its
 set unchanged, and a set with one invalid entry is rejected whole. Every control instance must
 read the same directory: separate copies publish different sets, and a device that refreshes from
 one drops the key the other promoted. A key retires only after its grace period: 320 seconds for
@@ -142,26 +143,52 @@ expires.
 **Malicious code on the agent host.** Root, kernel, or EDR-level compromise defeats the
 agent. ZeroSecret is not a sandbox.
 
-**Revocation faster than the refresh interval.** A grant is verified offline, so a
-revocation cannot reach an agent until it next contacts the control plane. `POST
-/wire/revoke` records the withdrawal immediately and durably; the agent learns of it when
-it next calls `GET /wire/revocations` and refuses the grant from that moment, before its
-own expiry. An open WebSocket session that carries an injected credential, a header-scheme
-session (`bearer`, `basic`, `api-key-header`) included, is checked again every 5 s: it ends
-within 5 s of a revocation that the agent has learned of, or of grant expiry. The workload
-gets a Close frame with code 1008 (or the connection drops if a frame was partly written),
-and the agent audits `deny` `websocket revoked` (§7 row 91). An open PostgreSQL, MySQL,
-MongoDB or Redis session is checked again every 5 s too: it ends within 5 s of a revocation
-that the agent has learned of, or of grant expiry. The agent closes both directions and writes
-no reply, and it audits `deny` `connect`, reason `grant revoked` (ADR-0059).
+**Revocation and policy changes reach a connected agent when they are written.** A grant
+is verified offline, so a revocation cannot reach an agent that does not contact the control
+plane. `POST /wire/revoke` records the withdrawal immediately and durably, and a dashboard
+policy edit writes a new policy version. The agent holds `GET /wire/revocations?after=<cursor>`
+open. The control plane answers the held request when the organization's policy version or
+revocation set changes: a PostgreSQL `NOTIFY` wakes it at commit, and the answer carries the
+organization's current policy version and a new cursor. A connected agent therefore learns of a
+revocation or a policy change in about one second, and it refuses a revoked grant from that
+moment, before the grant's own expiry. Only a new policy version and a new revocation wake a
+held request. Removing a member and deleting a device or a project wake nothing: the member or
+device gets no new grant, and a grant it already holds runs until it expires (one TTL). A key or
+CA change wakes nothing either; it arrives with the next answer, within 25 s. Behind a proxy that
+cuts held requests, it arrives with the request the agent sends without a cursor after each cut,
+which the control plane answers at once; those come about one refresh interval apart, plus the
+time the proxy takes to cut a hold.
+An open WebSocket session that carries an injected
+credential, a header-scheme session (`bearer`, `basic`, `api-key-header`) included, is checked
+again every 5 s, or at once when its grant changes: it ends within 5 s of a revocation that the
+agent has learned of, or of grant expiry. The workload gets a Close frame with code 1008 (or
+the connection drops if a frame was partly written), and the agent audits `deny` `websocket
+revoked` (§7 row 91). An open PostgreSQL, MySQL, MongoDB or Redis session is checked again
+every 5 s too, or at once when its grant changes: it ends within 5 s of a revocation that the
+agent has learned of, or of grant expiry. The agent closes both directions and writes no
+reply, and it audits `deny` `connect`, reason `grant revoked` (ADR-0059, §7 row 137).
 
-**The bound is the refresh interval, not the grant TTL.** Revocation does not wait for a
-grant to expire — that is the distinction between revocation and expiry, and it is why
-shortening TTLs is not a substitute. The fetch runs on its own 60 s timer, separately from grant renewal, so a slow renewal cannot
-delay it.
-An agent that cannot reach the control plane keeps
-using cached grants until they expire (SECURITY §7 row 5), so an unreachable agent's worst
-case remains one TTL.
+**The bound is the retry cadence while the control plane answers, and one TTL while it does not.**
+While the control plane answers, revocation does not wait for a grant to expire — that is the
+distinction between revocation and expiry, and it is why shortening TTLs is not a substitute.
+When the `LISTEN` connection is down, the hub wakes every held request, each answers at
+once with the state it reads, and the next request is held at most 5 s instead of 25 s, so the
+design degrades to a 5 s poll and never to a missed change. A connection that dies without
+closing is found by a ping after 30 s without a notification, which fails after 5 s; until it
+is found, a change waits for the 25 s hold. A failing request is retried after
+1 s, doubling up to the refresh interval (60 s by default), so once the control plane answers
+again a change is learned within 60 s. While the control plane does not answer at all, no change
+is learned and the agent keeps using cached grants until they expire (§7 row 5), so the bound is
+then one TTL. The grant TTL does not set the speed of a change (§8).
+
+**Why the agent holds a request open, and what a hold costs.** A hold is one request that the
+control plane answers only when the answer would change, so an unchanged system costs about
+2.4 requests a minute per agent, and a change costs no polling delay. A held request releases
+every database resource and waits on a channel: it holds one goroutine and one TLS connection,
+and no database connection or transaction. The control plane counts the waiting holds in the
+gauge `zs_control_wire_revocations_waiting`. Each control instance also holds one `LISTEN
+zs_wire` connection for all of its held requests. There is no cap on held requests per
+organization or per instance in v1.
 
 **Revocations are served for 660 s and need standing.** `GET /wire/revocations` returns
 only the last 660 s of revocations: two 300 s grant lifetimes plus 60 s of clock skew. An
@@ -993,7 +1020,7 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | Audit sink unavailable | Deny |
 | Materialization failed | Deny. Never fall back to a weaker path |
 | Protocol implementation panicked | Deny that resource. Agent stays up |
-| Grant revoked | Deny before expiry. Lag bounded by the refresh interval (ADR-0018) |
+| Grant revoked | Deny before expiry. Lag about 1 s while the revocations long poll answers; while it fails, the next retry (at most the refresh interval) once the control plane answers again (ADR-0018, ADR-0064) |
 | Local CA storage locked, denied, unavailable, ambiguous, malformed or mismatched | Deny startup before any listener or child. Never mint a replacement CA (§6) |
 | Grant revoked, then renewed | Deny. A renewal keeps each revoked grant's ID in the chain of the grant it replaced, for the last 32 renewals (ADR-0026) |
 | Request method not in the grant | Deny that request. Audit the method (ADR-0026) |
@@ -1117,6 +1144,10 @@ interface and SQL; the binary named by `ZS_CONTROL_BIN` is what the suite starts
 | The access of the grant changes while a PostgreSQL, MySQL, MongoDB or Redis session is open | Close the connection within 5 s of the agent learning of it, no reply. A new session opens with the new access. Audit `deny` `connect`, reason `access changed` (ADR-0063, `apps/zs/tests/fail_closed_matrix.rs` row 131) |
 | A read-only grant for a binding that is not PostgreSQL, MySQL, MongoDB or Redis | Deny: no credential, no upstream contact; the reason ends with `grant does not permit the requested operation` (`apps/zs/tests/fail_closed_matrix.rs` row 132) |
 | A MongoDB client message reuses the request id of a message whose reply is still awaited, in any session | Close the session. The second message does not reach the server (`apps/zs/tests/fail_closed_matrix.rs` row 133) |
+| A dashboard policy edit writes a new policy version while an agent holds `GET /wire/revocations?after=<cursor>` | The held request answers with the new `policy_version` and a new `cursor`, and the agent renews every grant minted under another version before its 150 s window. A policy edit that lands between the agent's startup mint and its first poll renews the same way, because the agent reads the version before it mints. In this suite a fake control plane stands in for the control plane's database wake (`apps/zs/tests/fail_closed_matrix.rs` row 134, `row_134_a_policy_edit_renews_before_the_window` and `row_134_a_policy_edit_during_startup_renews_at_once`) |
+| A control plane answers a revocation poll without a `cursor`, with an equal policy version, or with no policy version | The agent keeps its cadence: without a `cursor` it sleeps the refresh interval, so it polls no faster than that interval; an equal or missing version renews no grant early (`apps/zs/tests/fail_closed_matrix.rs` rows 135, `row_135_an_old_control_plane_is_not_polled_fast` and `row_135_an_equal_version_does_not_renew`; the missing version in `apps/zs/src/lib.rs`, `an_unknown_version_is_never_stale`) |
+| A grant renewal answers 403 | When the control plane sends a policy version, a 403 renewal withdraws the cached grant for the binding (against an older control plane that sends none, the grant is kept and retried as before, `a_403_withdraws_only_when_the_policy_version_is_known` in `apps/zs/src/run.rs`): it prints `zs: grant for <resource> withdrawn by the control plane` and writes the `grant_withdrawn` diagnostic event. The next request is denied and reaches no upstream, and the binding is not minted again until the policy version changes. A 5xx keeps the grant and the next request succeeds. A binding refused with 403 at startup is minted on the next policy version change and then allowed; when its file leaves the connection to the signed grant, that mint cannot be used without a restart, and the agent says so once per policy change, not on every refresh (`apps/zs/tests/fail_closed_matrix.rs` rows 136, `row_136_a_policy_refusal_withdraws_the_grant`, `row_136_a_server_error_keeps_the_grant`, `row_136_a_binding_refused_at_startup_is_minted_after_the_next_policy_change` and `row_136_a_startup_refused_binding_that_needs_a_restart_is_tried_once_per_policy_change`) |
+| The grant of an open WebSocket, PostgreSQL, MySQL, MongoDB or Redis session changes: a renewal, a withdrawal or an applied revocation | The session check runs at once, not on the next 5 s tick, in every relay: the four database relays build their session in `l3_materialize`, which carries the grant epoch (asserted by `the_l3_materialize_session_watch_ends_on_a_grant_change` in `apps/zs/src/run.rs`), and the WebSocket relay takes the same epoch from `FlowHandler::grant_changes`. A revocation ends the Redis session within 1 s, with no reply, and audits `deny` `connect`, reason `grant revoked`; it ends a WebSocket session opened through the proxy within 1 s with Close 1008 (`apps/zs/tests/fail_closed_matrix.rs` row 137, `row_137_an_open_session_ends_at_once_on_revocation` and `row_137_a_proxied_websocket_ends_at_once_on_revocation`) |
 
 Rows marked `(commercial suite)` run against the Go control plane: the binary built from
 `control/`, driven as a process by the Go suite in `control/e2e` in the commercial repository
@@ -1161,12 +1192,17 @@ Tracked here until answered, then moved into a decision.
   | | Value | Where |
   |---|---|---|
   | Grant TTL | **5 minutes** | `wire_grant`, `expires_at_ms: now + 300_000` |
-  | Revocation refresh | **60 seconds** | `REFRESH_SECONDS` in `apps/zs/src/main.rs` |
+  | Revocation refresh | **held up to 25 seconds**, answered about 1 s after a change (ADR-0064) | the control plane's hold |
+  | Revocation retry cap, and the cadence against a control plane that sends no `cursor` | **60 seconds** | `REFRESH_SECONDS` in `apps/zs/src/run.rs` |
 
   Corrected 2026-09-17: this entry said v1 hardcodes **1 h**. It does not, and never did.
   The difference matters — TTL is the revocation bound for an agent that cannot reach the
   control plane (§3), so an overstated TTL overstates that window by a factor of twelve.
   Making it configurable is the v2 work; the number itself is no longer unknown.
+
+  **The TTL no longer sets the speed of a change (2026-11-21).** A connected agent learns of
+  a revocation or a policy change in about one second (§3), so the 300 s value now bounds only
+  the agent that cannot reach the control plane. A shorter TTL buys no speed; it adds mints.
 
 ## 9. Reporting a vulnerability
 

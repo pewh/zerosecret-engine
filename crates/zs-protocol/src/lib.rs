@@ -66,6 +66,8 @@ pub struct Materialized {
     credential: Credential,
     access: SessionAccess,
     check: SessionCheck,
+    #[cfg(feature = "session")]
+    wake: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 impl Materialized {
@@ -74,7 +76,16 @@ impl Materialized {
             credential,
             access,
             check,
+            #[cfg(feature = "session")]
+            wake: None,
         }
+    }
+
+    #[cfg(feature = "session")]
+    #[must_use]
+    pub fn with_wake(mut self, wake: tokio::sync::watch::Receiver<u64>) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     pub fn access(&self) -> SessionAccess {
@@ -82,7 +93,14 @@ impl Materialized {
     }
 
     pub fn into_parts(self) -> (Credential, SessionWatch) {
-        (self.credential, SessionWatch { check: self.check })
+        (
+            self.credential,
+            SessionWatch {
+                check: self.check,
+                #[cfg(feature = "session")]
+                wake: self.wake,
+            },
+        )
     }
 }
 
@@ -90,17 +108,33 @@ impl Materialized {
 pub struct SessionWatch {
     #[cfg_attr(not(feature = "session"), allow(dead_code))]
     check: SessionCheck,
+    #[cfg(feature = "session")]
+    wake: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 #[cfg(feature = "session")]
 impl SessionWatch {
     pub async fn ended(self) -> &'static str {
+        let mut wake = self.wake;
         let mut ticks = tokio::time::interval_at(
             tokio::time::Instant::now() + REVALIDATE_EVERY,
             REVALIDATE_EVERY,
         );
         loop {
-            ticks.tick().await;
+            tokio::select! {
+                _ = ticks.tick() => {}
+                changed = async {
+                    match wake.as_mut() {
+                        Some(wake) => wake.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        wake = None;
+                        continue;
+                    }
+                }
+            }
             if let Err(reason) = (self.check)() {
                 return reason;
             }
@@ -426,7 +460,7 @@ mod tests {
 
         const REVOKED: &str = "grant revoked";
 
-        fn watch(fails_from: usize) -> (SessionWatch, Arc<AtomicUsize>) {
+        fn checker(fails_from: usize) -> (SessionCheck, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let count = calls.clone();
             let check: SessionCheck = Arc::new(move || {
@@ -436,9 +470,26 @@ mod tests {
                     Ok(())
                 }
             });
+            (check, calls)
+        }
+
+        fn materialized(check: SessionCheck) -> Materialized {
             let credential = Credential::from_bytes(b"secret".to_vec()).unwrap();
-            let (_, watch) =
-                Materialized::new(credential, SessionAccess::ReadWrite, check).into_parts();
+            Materialized::new(credential, SessionAccess::ReadWrite, check)
+        }
+
+        fn watch(fails_from: usize) -> (SessionWatch, Arc<AtomicUsize>) {
+            let (check, calls) = checker(fails_from);
+            let (_, watch) = materialized(check).into_parts();
+            (watch, calls)
+        }
+
+        fn watch_with(
+            fails_from: usize,
+            wake: tokio::sync::watch::Receiver<u64>,
+        ) -> (SessionWatch, Arc<AtomicUsize>) {
+            let (check, calls) = checker(fails_from);
+            let (_, watch) = materialized(check).with_wake(wake).into_parts();
             (watch, calls)
         }
 
@@ -472,6 +523,59 @@ mod tests {
             let waited = REVALIDATE_EVERY * 12 + Duration::from_secs(2);
             assert!(tokio::time::timeout(waited, watch.ended()).await.is_err());
             assert_eq!(calls.load(Ordering::SeqCst), 12);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ended_checks_at_once_on_a_wake() {
+            let (tx, rx) = tokio::sync::watch::channel(0u64);
+            let (watch, calls) = watch_with(1, rx);
+            let started = tokio::time::Instant::now();
+            let ended = watch.ended();
+            tokio::pin!(ended);
+            tokio::select! {
+                _ = tokio::time::sleep(REVALIDATE_EVERY / 5) => {}
+                reason = &mut ended => panic!("ended before the wake: {reason}"),
+            }
+            tx.send(1).unwrap();
+            assert_eq!((&mut ended).await, REVOKED);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                started.elapsed() < REVALIDATE_EVERY,
+                "{:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_wake_with_a_passing_check_keeps_the_session() {
+            let (tx, rx) = tokio::sync::watch::channel(0u64);
+            let (watch, calls) = watch_with(usize::MAX, rx);
+            let ended = watch.ended();
+            tokio::pin!(ended);
+            for value in 1..=3 {
+                tx.send(value).unwrap();
+                tokio::select! {
+                    reason = &mut ended => panic!("ended on a passing check: {reason}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert!(
+                tokio::time::timeout(REVALIDATE_EVERY * 2, &mut ended)
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_dropped_wake_sender_keeps_the_tick() {
+            let (tx, rx) = tokio::sync::watch::channel(0u64);
+            let (watch, calls) = watch_with(3, rx);
+            drop(tx);
+            let started = tokio::time::Instant::now();
+            assert_eq!(watch.ended().await, REVOKED);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(started.elapsed(), REVALIDATE_EVERY * 3);
         }
 
         #[tokio::test]

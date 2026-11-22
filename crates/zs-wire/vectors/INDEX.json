@@ -6,10 +6,10 @@
     "dto-enrollment-response.json": 7,
     "dto-enrollment-token-response.json": 4,
     "dto-grant-mint-request.json": 4,
-    "dto-grant-mint-response.json": 4,
+    "dto-grant-mint-response.json": 6,
     "dto-login-claim.json": 4,
     "dto-policy-response.json": 4,
-    "dto-revocations-response.json": 7,
+    "dto-revocations-response.json": 9,
     "dto-revoke-request.json": 4,
     "dto-wire-refusal.json": 7,
     "login-code.json": 1

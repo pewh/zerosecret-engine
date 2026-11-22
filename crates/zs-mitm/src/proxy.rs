@@ -105,6 +105,10 @@ pub trait FlowHandler: Send + Sync {
     fn credential_ref(&self, _resource: &str) -> Option<String> {
         None
     }
+
+    fn grant_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 pub struct ProxyServer {
@@ -1809,6 +1813,7 @@ async fn serve_websocket(
             injection,
             &on_inject,
             &revalidate,
+            shared.handler.grant_changes(),
         )
         .await;
         let denied = match ended {

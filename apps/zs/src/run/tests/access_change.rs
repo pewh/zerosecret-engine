@@ -126,6 +126,9 @@ impl Rig {
             shipped: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
             ca: std::sync::Arc::new(LocalCa::load_or_create(home.path().join(".zs-ca")).unwrap()),
             wire: None,
+            revocation_cursor: None,
+            revocation_hold: false,
+            revocation_started: std::time::Instant::now(),
             stored: false,
             agent,
             audit_subject: "alice".into(),
@@ -167,6 +170,7 @@ impl Rig {
                 &self.prepared.agent,
                 &self.prepared.file.bindings[0],
                 Ok(grant(&self.key, &self.spec, self.port, &id, access).into()),
+                None,
                 true,
                 &DiagLog::disabled()
             ),

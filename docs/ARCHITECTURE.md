@@ -128,6 +128,7 @@ does not know the tenant and an enrolment token names its organization.
 | `internal/tenant` | the organization selected by the request host, and its IdP |
 | `internal/store` | PostgreSQL: `sqlc` queries, startup migration, per-run test schemas |
 | `internal/wire` | `/wire/*` handlers and wire authorization |
+| `internal/wake` | the `LISTEN zs_wire` connection and the hub for held `/wire/revocations` requests |
 | `internal/session` | login, OIDC callback, logout, session authorization, CSRF |
 | `internal/dashboard` | operator pages and mutations, `templ` templates and the stylesheet |
 | `internal/policy` | `cedar-go` evaluation over the fixed policy set |
@@ -342,10 +343,13 @@ sets it, and the stop line names the field.
 A grant carries a credential **reference**, never a credential value. Materialization
 happens after verification, inside the data plane.
 
-Revocation lag is bounded by the **refresh interval**, not by grant TTL (ADR-0018). An
-agent that cannot reach the control plane falls back to the TTL bound, because it cannot
-learn of a revocation until it next connects. Both bounds are documented in
-[SECURITY.md](SECURITY.md) §3, not hidden.
+Revocation lag is about one second for a connected agent (ADR-0064). When the control plane's
+`LISTEN` connection is lost, the next held request answers within **5 s**; a connection that
+dies without closing is found within 35 s, and until then a change waits for the **25 s** hold.
+When the agent's revocation requests fail, it retries from 1 s up to the **refresh interval**
+(60 s), and learns of a change at the first answer. An agent that cannot reach the control
+plane falls back to the TTL bound, because it cannot learn of a revocation until it next
+connects. Both bounds are documented in [SECURITY.md](SECURITY.md) §3, not hidden.
 
 **Implementation status, 2026-09-13 — stated rather than implied.** The control plane
 mints and signs grants, evaluates policy before minting, and verifies device signatures
@@ -359,11 +363,61 @@ authority (ADR-0017). The offline-verification property described above is a pro
 the running agent, not only of the crate.
 
 **Grant revocation exists (step 22, ADR-0018).** `POST /wire/revoke` records a withdrawal
-durably; the agent fetches the list on its normal refresh and refuses a revoked grant
-before its expiry. Expiry is therefore no longer the only revocation mechanism. An
+durably; the agent fetches the list on its held revocations request and refuses a revoked
+grant before its expiry. Expiry is therefore no longer the only revocation mechanism. An
 operator revokes a grant ID from the dashboard (`POST /grants/revoke`). The refresh loop
 renews a grant before it expires, never a revoked one, and revoking any grant in a renewal
 chain stops the session (ADR-0026).
+
+### The wake path
+
+`GET /wire/revocations` answers a change when it is written, not on the agent's timer. The
+agent sends the cursor of its last answer as `after`. The control plane holds the request when
+the cursor still matches, releases every database resource, and answers when the organization's
+policy version or revocation set changes, or after 25 s. The answer carries the organization's
+current `policy_version` and a new `cursor`. An answer without a `cursor` (a control plane
+from before this release) makes the agent sleep the refresh interval, so an old control plane
+is never polled fast.
+
+```mermaid
+sequenceDiagram
+    participant D as Dashboard
+    participant DB as PostgreSQL
+    participant C as Control plane
+    participant A as Agent
+    A->>C: GET /wire/revocations?after=cursor
+    Note over C: held, no DB connection
+    D->>DB: INSERT policies (version 8)
+    DB-->>C: NOTIFY zs_wire, org
+    C-->>A: 200 policy_version 8, new cursor
+    A->>C: POST /wire/grant (renew)
+    C-->>A: signed grant, policy_version 8
+    Note over A: sessions on the old grant checked now
+    A->>C: GET /wire/revocations?after=new cursor
+```
+
+An `AFTER INSERT` trigger on `policies` and on `revoked_grants` calls
+`pg_notify('zs_wire', '<schema>/<organization_id>')`. `NOTIFY` is sent at commit, so a change
+that rolls back wakes nobody. The schema prefix keeps two schemas of one database apart; a hub
+ignores a payload whose prefix is not its own. Each control instance holds **one** `LISTEN
+zs_wire` connection outside the pool and fans each notification out to the held requests of
+that organization. After 30 s without a notification the hub pings the connection. If the
+connection fails, or the ping gets no answer within 5 s, the hub wakes every held request and
+reconnects with backoff (1 s doubling to 30 s); each held request answers at once with the state
+it reads, and the next request is held at most 5 s instead of 25 s. The design degrades to a
+5 s poll, never to a missed change.
+
+A change wakes every held request of its organization at once, and each reads the state with two
+queries that queue on the database pool; a policy edit then makes every agent of the
+organization mint each of its grants within about a second. Neither burst is spread out in v1.
+A failing state read counts in the store error counter under `op="wire_state"`.
+
+A hold costs one goroutine and one TLS connection, and no database connection. The control
+plane exposes the number of waiting holds as `zs_control_wire_revocations_waiting`. The
+`/wire/revocations` request-duration histogram (`zs_control_http_request_seconds`, by listener
+and route) counts the time a request is held, so a held request appears as an observation of
+up to 25 s; the buckets reach 30 s so a hold is not counted as `+Inf`. It is not the store's
+service time.
 
 **Each request is authorized for its method (ADR-0026).** A binding lists its operations.
 The agent checks the request method against the signed grant on every request.
@@ -406,13 +460,17 @@ until its next reload), 7 days plus 1 hour for the device CA, so every certifica
 has expired. Device certificates are
 not reissued in place; a device gets a certificate from the new CA at its next `zs login`.
 
-The agent does not need a new control-plane address: the 60-second revocations response carries the
-published grant keys and CA certificates. The agent verifies a grant under any published key and
-trusts any published CA at the wire handshake. An absent or empty set leaves its current set
-unchanged, and a set with one invalid entry is rejected whole. The published CA set is the whole
-wire trust: once a CA is retired and drops out of the set, the agent stops trusting it, even when
-it is the CA pinned at enrolment. A device enrolled before `v0.4.0` has no stored CA set, so the
-pinned CA is its set of one until the first refresh.
+The agent does not need a new control-plane address: the revocations response carries the
+published grant keys and CA certificates. A key set or CA change does not wake a held request;
+the agent learns of it at the next answer, within 25 s. After a failed request the agent sends
+the next one without a cursor, which the control plane answers at once, so a proxy that cuts
+held requests delays a key or CA change by about one refresh interval plus the time it takes to
+cut a hold. The agent verifies a grant under any
+published key and trusts any published CA at the wire handshake. An absent or empty set leaves
+its current set unchanged, and a set with one invalid entry is rejected whole. The published CA
+set is the whole wire trust: once a CA is retired and drops out of the set, the agent stops
+trusting it, even when it is the CA pinned at enrolment. A device enrolled before `v0.4.0` has
+no stored CA set, so the pinned CA is its set of one until the first refresh.
 
 A device that is offline for the whole 10-minute publish window of a new device CA misses it: after
 the promotion its wire handshake fails. It recovers by saving the control plane's current CA

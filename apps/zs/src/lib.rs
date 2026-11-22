@@ -447,6 +447,7 @@ impl ResourceBinding {
 pub struct MintedGrant {
     pub signed: SignedGrant,
     pub token: Option<IdentityToken>,
+    pub policy_version: Option<u64>,
 }
 
 impl std::fmt::Debug for MintedGrant {
@@ -454,6 +455,7 @@ impl std::fmt::Debug for MintedGrant {
         f.debug_struct("MintedGrant")
             .field("grant_id", &self.signed.grant.grant_id)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("policy_version", &self.policy_version)
             .finish()
     }
 }
@@ -463,6 +465,7 @@ impl From<SignedGrant> for MintedGrant {
         Self {
             signed,
             token: None,
+            policy_version: None,
         }
     }
 }
@@ -502,6 +505,18 @@ impl GrantCache {
             .cloned()
     }
 
+    pub fn remove(
+        &self,
+        subject: &str,
+        workload: &str,
+        resource: &str,
+    ) -> Option<Arc<MintedGrant>> {
+        self.grants
+            .lock()
+            .ok()?
+            .remove(&Self::key(subject, workload, resource))
+    }
+
     pub fn all(&self) -> Vec<Arc<MintedGrant>> {
         self.grants
             .lock()
@@ -521,9 +536,15 @@ impl RevocationSet {
     }
 
     // Additive only: replacing the set would resurrect revoked grants (ADR-0018).
-    pub fn extend(&self, grant_ids: &[String]) {
-        if let Ok(mut revoked) = self.revoked.lock() {
-            revoked.extend(grant_ids.iter().cloned());
+    // Returns true when the set grew, so the caller can wake each session exactly once.
+    pub fn extend(&self, grant_ids: &[String]) -> bool {
+        match self.revoked.lock() {
+            Ok(mut revoked) => {
+                let before = revoked.len();
+                revoked.extend(grant_ids.iter().cloned());
+                revoked.len() > before
+            }
+            Err(_) => false,
         }
     }
 
@@ -944,6 +965,12 @@ pub struct AgentHandler {
     verifier: AgentVerifier,
     revoked: RevocationSet,
     lineage: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    policy_version: std::sync::Mutex<Option<u64>>,
+    withdrawn: std::sync::Mutex<HashMap<String, Option<u64>>>,
+    // A held grant whose renewal at this version could not be used: not stale again until
+    // the policy version moves, so it is not minted on every refresh.
+    settled: std::sync::Mutex<HashMap<String, Option<u64>>>,
+    epoch: tokio::sync::watch::Sender<u64>,
     diag: Option<zs_diag::DiagLog>,
 }
 
@@ -1070,6 +1097,10 @@ impl AgentHandler {
             verifier,
             revoked: RevocationSet::new(),
             lineage: std::sync::Mutex::new(HashMap::new()),
+            policy_version: std::sync::Mutex::new(None),
+            withdrawn: std::sync::Mutex::new(HashMap::new()),
+            settled: std::sync::Mutex::new(HashMap::new()),
+            epoch: tokio::sync::watch::channel(0u64).0,
             diag: None,
         }
     }
@@ -1084,11 +1115,14 @@ impl AgentHandler {
     }
 
     pub fn apply_revocations(&self, grant_ids: &[String]) {
-        self.revoked.extend(grant_ids);
+        let grew = self.revoked.extend(grant_ids);
         for minted in self.grants.all() {
             if self.is_revoked(&minted.signed.grant.grant_id) {
                 self.materializer.forget(&minted.signed.grant.resource);
             }
+        }
+        if grew {
+            self.bump_epoch();
         }
     }
 
@@ -1115,6 +1149,7 @@ impl AgentHandler {
             lineage.insert(minted.signed.grant.grant_id.clone(), chain);
         }
         self.grants.insert(minted);
+        self.bump_epoch();
     }
 
     pub fn accept_renewal(
@@ -1133,6 +1168,12 @@ impl AgentHandler {
             return Err(connection::Mismatch::Source);
         }
         connection::grant_matches(&minted.signed, binding)?;
+        if let Ok(mut withdrawn) = self.withdrawn.lock() {
+            withdrawn.remove(&minted.signed.grant.resource);
+        }
+        if let Ok(mut settled) = self.settled.lock() {
+            settled.remove(&minted.signed.grant.resource);
+        }
         self.renew_grant(minted);
         Ok(())
     }
@@ -1160,6 +1201,104 @@ impl AgentHandler {
             }
             None => false,
         }
+    }
+
+    pub fn note_policy_version(&self, version: Option<u64>) -> bool {
+        let Some(version) = version else {
+            return false;
+        };
+        let Ok(mut stored) = self.policy_version.lock() else {
+            return false;
+        };
+        if *stored == Some(version) {
+            return false;
+        }
+        *stored = Some(version);
+        true
+    }
+
+    pub fn policy_version(&self) -> Option<u64> {
+        self.policy_version
+            .lock()
+            .map(|stored| *stored)
+            .unwrap_or(None)
+    }
+
+    // A grant minted under another version is stale, and so is a resource withdrawn under an
+    // older version: both make the renewal task mint again (ADR-0064).
+    pub fn grant_policy_stale(&self, resource: &str) -> bool {
+        let Ok(current) = self.policy_version.lock().map(|stored| *stored) else {
+            return true;
+        };
+        let Some(current) = current else {
+            return false;
+        };
+        if let Some(minted) =
+            self.grants
+                .get(self.subject.as_str(), self.workload.as_str(), resource)
+            && !self.is_revoked(&minted.signed.grant.grant_id)
+            && minted
+                .policy_version
+                .is_some_and(|version| version != current)
+        {
+            return match self.settled.lock() {
+                Ok(settled) => settled.get(resource) != Some(&Some(current)),
+                Err(_) => true,
+            };
+        }
+        match self.withdrawn.lock() {
+            Ok(withdrawn) => withdrawn
+                .get(resource)
+                .is_some_and(|withdrawn_at| *withdrawn_at != Some(current)),
+            Err(_) => true,
+        }
+    }
+
+    pub fn withdraw_grant(&self, resource: &str, at: Option<u64>) -> bool {
+        let removed = self
+            .grants
+            .remove(self.subject.as_str(), self.workload.as_str(), resource)
+            .is_some();
+        if removed {
+            self.materializer.forget(resource);
+        }
+        let current = at.or_else(|| self.policy_version());
+        let marked = match self.withdrawn.lock() {
+            Ok(mut withdrawn) => withdrawn.insert(resource.to_string(), current) != Some(current),
+            Err(_) => false,
+        };
+        if removed || marked {
+            self.bump_epoch();
+        }
+        removed
+    }
+
+    // A mint the agent could not use is tried again on the next policy change, not on every
+    // refresh. A binding that holds no grant (withdrawn, or refused at startup) moves its
+    // withdrawn mark to `at`; a binding that holds a grant keeps it until it expires and is
+    // marked settled at `at`.
+    pub fn settle_unusable_mint(&self, resource: &str, at: Option<u64>) {
+        if self
+            .grants
+            .get(self.subject.as_str(), self.workload.as_str(), resource)
+            .is_none()
+        {
+            self.withdraw_grant(resource, at);
+            return;
+        }
+        let at = at.or_else(|| self.policy_version());
+        if let Ok(mut settled) = self.settled.lock() {
+            settled.insert(resource.to_string(), at);
+        }
+    }
+
+    pub fn grant_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.epoch.subscribe()
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     fn authorized(
@@ -1378,6 +1517,10 @@ impl FlowHandler for AgentHandler {
                 &binding.resource,
             )
             .map(|minted| minted.signed.grant.source.display_ref())
+    }
+
+    fn grant_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.grant_changes())
     }
 }
 
@@ -1700,5 +1843,244 @@ mod renewal_lineage_tests {
             denial(&handler).contains("revoked"),
             "positive control: a revoked ancestor inside the window still denies"
         );
+    }
+}
+
+#[cfg(test)]
+mod grant_policy_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::sync::Arc;
+
+    use super::{AgentHandler, GrantCache, MintedGrant, ResourceBinding};
+    use zs_grant::{ControlSigningKey, Grant, SignedGrant};
+    use zs_mitm::FlowHandler;
+
+    const RESOURCE: &str = "stripe-production";
+    const HOST: &str = "api.stripe.com";
+
+    struct NoExchange;
+
+    #[async_trait::async_trait]
+    impl zs_materializer::ExchangeProvider for NoExchange {
+        async fn exchange(
+            &self,
+            _grant: &Grant,
+        ) -> Result<zs_credential::Credential, zs_materializer::MaterializationError> {
+            Err(zs_materializer::MaterializationError::Exchange(
+                "not configured".into(),
+            ))
+        }
+    }
+
+    fn binding() -> ResourceBinding {
+        serde_json::from_value(serde_json::json!({
+            "resource": RESOURCE,
+            "host": HOST,
+            "protocol": "https",
+            "auth": {"scheme": "bearer"}
+        }))
+        .unwrap()
+    }
+
+    fn grant(key: &ControlSigningKey, grant_id: &str) -> SignedGrant {
+        let connection = zs_policy::Connection::default()
+            .resolve(HOST, "https")
+            .unwrap();
+        key.sign(Grant {
+            subject: "alice@company.com".into(),
+            workload: "claude-code".into(),
+            resource: RESOURCE.into(),
+            host: HOST.into(),
+            protocol: "https".into(),
+            source: zs_policy::CredentialSource::file("stripe-prod"),
+            operations: vec!["GET".into()],
+            environment: "development".into(),
+            expires_at_ms: super::clock_ms(std::time::SystemTime::now()) + 300_000,
+            grant_id: grant_id.into(),
+            materialization: zs_policy::Materialization::Retrieve,
+            upstream_host: connection.upstream_host,
+            upstream_port: connection.upstream_port,
+            upstream_tls: connection.upstream_tls,
+            local_endpoint: connection.local_endpoint,
+            access: zs_policy::Access::ReadWrite,
+            version: zs_grant::GRANT_VERSION,
+        })
+        .unwrap()
+    }
+
+    fn minted(key: &ControlSigningKey, grant_id: &str, policy_version: Option<u64>) -> MintedGrant {
+        MintedGrant {
+            signed: grant(key, grant_id),
+            token: None,
+            policy_version,
+        }
+    }
+
+    fn handler(key: &ControlSigningKey, policy_version: Option<u64>) -> AgentHandler {
+        let cache = GrantCache::new();
+        cache.insert(minted(key, "g-0", policy_version));
+        let verifier = zs_grant::AgentVerifier::new(vec![(
+            key.key_id().to_string(),
+            ed25519_dalek::VerifyingKey::from_bytes(&key.verifying_key_bytes()).unwrap(),
+        )]);
+        let materializer = Arc::new(zs_materializer::Materializer::new(
+            zs_materializer::StoreRegistry::new(Arc::new(zs_materializer::FileStore::new(
+                "/nonexistent",
+            ))),
+            Arc::new(NoExchange),
+        ));
+        AgentHandler::from_grants(
+            zs_identity::Subject::new("alice@company.com").unwrap(),
+            zs_identity::WorkloadLabel::new("claude-code").unwrap(),
+            vec![binding()],
+            cache,
+            verifier,
+            materializer,
+        )
+    }
+
+    #[test]
+    fn a_grant_minted_under_another_version_is_stale() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(!handler.grant_policy_stale(RESOURCE));
+
+        assert!(handler.note_policy_version(Some(8)));
+        assert!(handler.grant_policy_stale(RESOURCE));
+
+        assert!(handler.note_policy_version(Some(7)));
+        assert!(!handler.grant_policy_stale(RESOURCE));
+    }
+
+    #[test]
+    fn an_unknown_version_is_never_stale() {
+        let key = ControlSigningKey::generate("k1");
+        let minted_without_version = handler(&key, None);
+        assert!(minted_without_version.note_policy_version(Some(8)));
+        assert!(!minted_without_version.grant_policy_stale(RESOURCE));
+
+        let version_not_noted = handler(&key, Some(7));
+        assert!(!version_not_noted.grant_policy_stale(RESOURCE));
+    }
+
+    #[test]
+    fn a_revoked_grant_is_never_stale() {
+        let key = ControlSigningKey::generate("k1");
+        let revoked_handler = handler(&key, Some(7));
+        revoked_handler.apply_revocations(&["g-0".to_string()]);
+        assert!(revoked_handler.note_policy_version(Some(8)));
+        assert!(!revoked_handler.grant_policy_stale(RESOURCE));
+
+        let live = handler(&key, Some(7));
+        assert!(live.note_policy_version(Some(8)));
+        assert!(
+            live.grant_policy_stale(RESOURCE),
+            "negative control: the same grant is stale while it is not revoked"
+        );
+    }
+
+    #[test]
+    fn note_policy_version_reports_a_change_once() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(handler.note_policy_version(Some(8)));
+        assert!(!handler.note_policy_version(Some(8)));
+        assert!(!handler.note_policy_version(None));
+        assert!(handler.note_policy_version(Some(7)));
+    }
+
+    #[test]
+    fn withdrawal_denies_the_next_request() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(handler.authorize_message(HOST, "GET").is_ok());
+
+        assert!(handler.withdraw_grant(RESOURCE, None));
+        let denied = handler.authorize_message(HOST, "GET").unwrap_err();
+        assert!(denied.reason.contains("no grant for"), "{}", denied.reason);
+        assert!(!handler.withdraw_grant(RESOURCE, None));
+    }
+
+    #[test]
+    fn an_unusable_mint_for_a_held_grant_waits_for_the_next_policy_change() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(handler.note_policy_version(Some(8)));
+        assert!(
+            handler.grant_policy_stale(RESOURCE),
+            "positive control: a grant minted under 7 is stale at 8"
+        );
+
+        handler.settle_unusable_mint(RESOURCE, Some(8));
+        assert!(
+            !handler.grant_policy_stale(RESOURCE),
+            "a mint the agent could not use at 8 was tried again at 8"
+        );
+        assert!(
+            handler.authorize_message(HOST, "GET").is_ok(),
+            "the held grant is kept until it expires"
+        );
+
+        assert!(handler.note_policy_version(Some(9)));
+        assert!(
+            handler.grant_policy_stale(RESOURCE),
+            "the next policy change tries the binding again"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_moves_the_epoch() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        let mut epoch = handler.grant_changes();
+        assert!(!epoch.has_changed().unwrap());
+
+        assert!(handler.withdraw_grant(RESOURCE, None));
+        tokio::time::timeout(std::time::Duration::from_secs(5), epoch.changed())
+            .await
+            .expect("the withdrawal must move the epoch")
+            .expect("the sender must be alive");
+    }
+
+    #[test]
+    fn a_withdrawn_grant_is_minted_again_after_the_next_policy_change() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(8));
+        assert!(handler.note_policy_version(Some(8)));
+        assert!(handler.withdraw_grant(RESOURCE, Some(8)));
+        assert!(!handler.grant_policy_stale(RESOURCE));
+
+        assert!(handler.note_policy_version(Some(9)));
+        assert!(handler.grant_policy_stale(RESOURCE));
+
+        handler
+            .accept_renewal(&binding(), minted(&key, "g-1", Some(9)))
+            .unwrap();
+        assert!(!handler.grant_policy_stale(RESOURCE));
+        assert!(handler.authorize_message(HOST, "GET").is_ok());
+    }
+
+    #[test]
+    fn a_second_refusal_moves_the_withdrawn_mark() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(handler.withdraw_grant(RESOURCE, Some(8)));
+
+        assert!(handler.note_policy_version(Some(9)));
+        assert!(handler.grant_policy_stale(RESOURCE));
+
+        assert!(!handler.withdraw_grant(RESOURCE, Some(9)));
+        assert!(!handler.grant_policy_stale(RESOURCE));
+    }
+
+    #[test]
+    fn withdrawal_without_a_grant_still_records_the_version() {
+        let key = ControlSigningKey::generate("k1");
+        let handler = handler(&key, Some(7));
+        assert!(handler.withdraw_grant(RESOURCE, Some(7)));
+
+        assert!(!handler.withdraw_grant(RESOURCE, Some(9)));
+        assert!(handler.note_policy_version(Some(9)));
+        assert!(!handler.grant_policy_stale(RESOURCE));
     }
 }

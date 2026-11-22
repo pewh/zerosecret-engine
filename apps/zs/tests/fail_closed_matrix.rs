@@ -2841,24 +2841,41 @@ async fn row_44_a_websocket_session_stops_injecting_after_revocation() {
     );
 
     served.handler.apply_revocations(&["g-1".to_string()]);
-    tls.write_all(&ws_fake::frame(1, WS_AUTH, Some([7, 1, 9, 3])))
-        .await
-        .unwrap();
-    assert!(ws_fake::read_frame(&mut tls).await.is_none(), "row 44");
+    let _ = tls
+        .write_all(&ws_fake::frame(1, WS_AUTH, Some([7, 1, 9, 3])))
+        .await;
+    let journal = revoked_session_ends(&served, &mut tls, "row 44").await;
     assert_eq!(
         seen.lock().unwrap().messages,
         1,
         "row 44: a message after revocation reached the upstream"
     );
-    let journal = journal_text(&served);
     assert!(
         journal.contains(r#""operation":"websocket message","decision":"allow""#),
         "row 44 positive control: {journal}"
     );
-    assert!(
-        journal.contains(r#""operation":"websocket message","decision":"deny""#),
-        "row 44: {journal}"
-    );
+}
+
+// The refused message and the 5 s revalidation tick race after a revocation: the first ends the
+// session without a frame, the second with a Close 1008. Both write the deny record.
+async fn revoked_session_ends(
+    served: &Served,
+    tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    row: &str,
+) -> String {
+    match ws_fake::read_frame(tls).await {
+        None => {}
+        Some((8, close)) => assert_eq!(close, 1008u16.to_be_bytes(), "{row}"),
+        Some((opcode, _)) => panic!("{row}: a frame with opcode {opcode} after revocation"),
+    }
+    let deny = r#""operation":"websocket message","decision":"deny""#;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !journal_text(served).contains(deny) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let journal = journal_text(served);
+    assert!(journal.contains(deny), "{row}: {journal}");
+    journal
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2881,26 +2898,18 @@ async fn a_revoked_grant_stops_injection_on_a_path_scoped_websocket_binding() {
     );
 
     served.handler.apply_revocations(&["g-1".to_string()]);
-    tls.write_all(&ws_fake::frame(1, WS_AUTH, Some([7, 1, 9, 3])))
-        .await
-        .unwrap();
-    assert!(
-        ws_fake::read_frame(&mut tls).await.is_none(),
-        "row 44 paths"
-    );
+    let _ = tls
+        .write_all(&ws_fake::frame(1, WS_AUTH, Some([7, 1, 9, 3])))
+        .await;
+    let journal = revoked_session_ends(&served, &mut tls, "row 44 paths").await;
     assert_eq!(
         seen.lock().unwrap().messages,
         1,
         "row 44 paths: a message after revocation reached the upstream"
     );
-    let journal = journal_text(&served);
     assert!(
         journal.contains(r#""operation":"websocket message","decision":"allow""#),
         "row 44 paths positive control: {journal}"
-    );
-    assert!(
-        journal.contains(r#""operation":"websocket message","decision":"deny""#),
-        "row 44 paths: {journal}"
     );
 }
 
@@ -3743,6 +3752,7 @@ impl Ssm {
         zs::MintedGrant {
             signed: self.key.sign(remote).unwrap(),
             token: token.map(zs_credential::IdentityToken::from_string),
+            policy_version: None,
         }
     }
 
@@ -5402,20 +5412,20 @@ fn row_105_a_wire_server_certificate_from_a_ca_outside_the_set_is_refused() {
     let client = tls_rotation_client(&wire.url, &first.certificate_pem());
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let response = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: the pinned CA is trusted");
     client
         .set_roots(&response.control_ca_pems)
         .expect("the published set parses");
     wire.set_leaf(&second);
     runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: a published CA is trusted");
 
     wire.set_leaf(&outside);
     let before = wire.requests();
     let error = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect_err("a CA outside the set must be refused");
     assert!(
         matches!(error, zs::wire_client::WireError::Transport(_)),
@@ -5445,7 +5455,7 @@ fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
     let client = tls_rotation_client(&wire.url, &first.certificate_pem());
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let response = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: the pinned CA is trusted");
     assert!(
         client
@@ -5464,7 +5474,7 @@ fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
     wire.set_leaf(&second);
     wire.set_ca_pems(vec![second.certificate_pem()]);
     let response = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: the promoted CA is trusted");
     assert!(
         client
@@ -5473,14 +5483,14 @@ fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
         "the retire changes the roots"
     );
     runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: the active CA still authenticates the wire");
 
     // A server certificate from the retired CA, the one pinned at enrolment, is now refused.
     wire.set_leaf(&first);
     let before = wire.requests();
     let error = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect_err("row 109: the retired pinned CA must be refused");
     assert!(
         matches!(error, zs::wire_client::WireError::Transport(_)),
@@ -6781,5 +6791,903 @@ async fn row_133_a_mongo_message_that_reuses_an_awaited_request_id_closes_the_se
     assert!(
         !commands.iter().any(|name| name == "count"),
         "row 133: the second message reached the server: {commands:?}"
+    );
+}
+
+/// A running `zs run` under test: its two output streams feed one line channel, and its proxy
+/// answers a request with the run token the child received.
+#[cfg(unix)]
+struct RunningAgent {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+    home: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl RunningAgent {
+    fn start(home: &PlainHome, env: &[(&str, &str)]) -> Self {
+        let env_file = home.home.path().join("child.env");
+        let pending = home.home.path().join("child.env.pending");
+        let _ = std::fs::remove_file(&env_file);
+        let _ = std::fs::remove_file(&pending);
+        let script = format!(
+            "env > '{}'; mv '{}' '{}'; exec sleep 60 >/dev/null 2>&1",
+            pending.display(),
+            pending.display(),
+            env_file.display()
+        );
+        let mut child = home.spawn_child(&["sh", "-c", script.as_str()], env);
+        let (sender, lines) = std::sync::mpsc::channel::<String>();
+        let mut readers = Vec::new();
+        let streams: [Option<Box<dyn std::io::Read + Send>>; 2] = [
+            child
+                .stdout
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
+        ];
+        for stream in streams.into_iter().flatten() {
+            let sender = sender.clone();
+            readers.push(std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stream)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let _ = sender.send(line);
+                }
+            }));
+        }
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+            readers,
+            home: home.home.path().to_path_buf(),
+        }
+    }
+
+    fn wait_for(
+        &mut self,
+        limit: std::time::Duration,
+        until: impl Fn(&str) -> bool,
+    ) -> Option<std::time::Duration> {
+        let started = std::time::Instant::now();
+        let deadline = started + limit;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    if until(&line) {
+                        return Some(started.elapsed());
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn drain(&mut self, limit: std::time::Duration) -> Vec<String> {
+        let deadline = std::time::Instant::now() + limit;
+        let mut fresh = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    fresh.push(line);
+                }
+                Err(_) => return fresh,
+            }
+        }
+    }
+
+    fn value(&self, prefix: &str) -> Option<String> {
+        self.seen
+            .iter()
+            .find_map(|line| line.strip_prefix(prefix))
+            .map(|rest| rest.trim().to_string())
+    }
+
+    fn wait_ready(&mut self) {
+        let limit = std::time::Duration::from_secs(15);
+        for prefix in ["zs: proxy ", "zs: ca-cert "] {
+            if self.value(prefix).is_none() {
+                let seen = self.wait_for(limit, |line| line.starts_with(prefix));
+                assert!(
+                    seen.is_some(),
+                    "the agent did not print {prefix:?}: {:?}",
+                    self.seen
+                );
+            }
+        }
+    }
+
+    fn exchange(&mut self, request: &[u8]) -> String {
+        self.wait_ready();
+        let proxy = self.value("zs: proxy ").expect("the proxy listener opens");
+        let ca_path = self.value("zs: ca-cert ").expect("the agent CA is named");
+        let ca_pem = std::fs::read_to_string(ca_path).expect("the agent CA is readable");
+        let env_file = self.home.join("child.env");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !env_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never wrote its environment"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (authorization, _) =
+            common::parse_child_env(&std::fs::read_to_string(&env_file).unwrap());
+        assert!(
+            !authorization.is_empty(),
+            "the child's HTTPS_PROXY carries no run token"
+        );
+        common::register_proxy_authorization(&proxy, &authorization);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(common::tunneled_exchange(
+                &proxy, &ca_pem, HOST, 443, request,
+            ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RunningAgent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn soon(deadline: std::time::Duration, mut until: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + deadline;
+    while std::time::Instant::now() < end {
+        if until() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    until()
+}
+
+#[cfg(unix)]
+#[test]
+fn row_134_a_policy_edit_renews_before_the_window() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+
+    assert!(
+        soon(Duration::from_secs(15), || fake.revocation_requests() >= 2),
+        "row 134 positive control: the agent long-polls; requests {}",
+        fake.revocation_requests()
+    );
+    assert!(
+        fake.grant_calls() >= 1,
+        "row 134 positive control: the agent minted its grant at startup"
+    );
+
+    fake.set_policy_version(Some(8));
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(2), |line| line
+                .starts_with("zs: renewed grant "))
+            .is_some(),
+        "row 134: no renewal within 2 s of the policy edit: {:?}",
+        agent.seen
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn row_135_an_old_control_plane_is_not_polled_fast() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[("ZS_REFRESH_SECONDS", "2")]);
+    agent.wait_ready();
+
+    std::thread::sleep(Duration::from_secs(5));
+    let requests = fake.revocation_requests();
+    assert!(
+        requests >= 2,
+        "row 135 positive control: the agent polls a control plane that sends no cursor"
+    );
+    assert!(
+        requests <= 3,
+        "row 135: an answer without a cursor was polled {requests} times in 5 s with a 2 s refresh interval"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn row_135_an_equal_version_does_not_renew() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+    assert!(
+        soon(Duration::from_secs(15), || fake.revocation_requests() >= 2),
+        "row 135 positive control: the agent long-polls"
+    );
+
+    fake.set_policy_version(Some(8));
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(2), |line| line
+                .starts_with("zs: renewed grant "))
+            .is_some(),
+        "row 135 positive control: a changed policy version renews: {:?}",
+        agent.seen
+    );
+
+    fake.set_policy_version(Some(8));
+    let after = agent.drain(Duration::from_secs(3));
+    assert!(
+        !after
+            .iter()
+            .any(|line| line.starts_with("zs: renewed grant ")),
+        "row 135: an equal policy version renewed a grant: {after:?}"
+    );
+}
+
+#[cfg(unix)]
+fn diag_log_text(home: &PlainHome) -> String {
+    let dir = home.home.path().join(".zs-log");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_run = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("run-") && name.ends_with(".jsonl"));
+        if is_run && let Ok(content) = std::fs::read_to_string(&path) {
+            text.push_str(&content);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+#[cfg(unix)]
+fn diag_log_until(home: &PlainHome, needle: &str) -> String {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = diag_log_text(home);
+        if text.contains(needle) || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn row_136_a_refused_renewal(status: u16) -> (String, usize) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let upstream = common::spawn_fake_upstream();
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    fake.answer(FakeGrant::Signed(
+        HOST,
+        "https",
+        common::loopback_connection(upstream.addr.port(), true),
+    ));
+    let home = fake.token_home_with(serde_json::json!({
+        "resource": RESOURCE,
+        "host": HOST,
+        "protocol": "https",
+        "upstream_host": "127.0.0.1",
+        "upstream_port": upstream.addr.port(),
+        "upstream_plaintext": true,
+    }));
+    let credentials = home.home.path().join(".zs-credentials");
+    std::fs::create_dir_all(&credentials).unwrap();
+    std::fs::write(credentials.join("fake"), "sk_test_matrix_row_136").unwrap();
+    let request =
+        b"GET /v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n";
+    let mut agent = if status == 403 {
+        RunningAgent::start(&home, &[("ZS_REFRESH_SECONDS", "1")])
+    } else {
+        RunningAgent::start(&home, &[])
+    };
+
+    let response = agent.exchange(request);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "row 136 positive control ({status}): the first request is allowed: {response}"
+    );
+    assert!(
+        upstream.saw_authorization.load(Ordering::SeqCst),
+        "row 136 positive control ({status}): the credential reached the upstream"
+    );
+    assert!(
+        soon(Duration::from_secs(15), || fake.revocation_requests() >= 2),
+        "row 136 positive control ({status}): the agent long-polls"
+    );
+
+    let held = fake.revocation_requests();
+    fake.set_mint_refusal(Some(status));
+    assert!(
+        soon(Duration::from_secs(5), || fake.revocation_requests() > held),
+        "row 136 ({status}): the agent did not continue its long poll"
+    );
+    fake.set_policy_version(Some(8));
+
+    let awaited = if status == 403 {
+        format!("zs: grant for {RESOURCE} withdrawn by the control plane")
+    } else {
+        format!("zs: cannot renew the grant for {RESOURCE}")
+    };
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(5), |line| line.starts_with(&awaited))
+            .is_some(),
+        "row 136 ({status}): no {awaited:?} within 5 s: {:?}",
+        agent.seen
+    );
+
+    if status == 403 {
+        let log = diag_log_until(&home, "grant_withdrawn");
+        assert!(
+            log.lines().any(|line| line.contains("grant_withdrawn")),
+            "row 136 (403): no grant_withdrawn diagnostic event within 5 s: {log:?}"
+        );
+    } else {
+        let log = diag_log_until(&home, "renewal_failed");
+        assert!(
+            log.lines().any(|line| line.contains("renewal_failed")),
+            "row 136 (503) positive control: no renewal_failed diagnostic event within 5 s: {log:?}"
+        );
+        assert!(
+            !log.lines().any(|line| line.contains("grant_withdrawn")),
+            "row 136 (503): a 5xx wrote a grant_withdrawn diagnostic event: {log:?}"
+        );
+    }
+
+    if status == 403 {
+        let polled = fake.revocation_requests();
+        assert!(
+            soon(Duration::from_secs(5), || fake.revocation_requests()
+                > polled),
+            "row 136: the agent did not continue its long poll after the first withdrawal"
+        );
+        fake.set_policy_version(Some(9));
+        assert!(
+            agent
+                .wait_for(Duration::from_secs(5), |line| line.starts_with(&awaited))
+                .is_some(),
+            "row 136: no second withdrawal after a second 403: {:?}",
+            agent.seen
+        );
+        let quiet = agent.drain(Duration::from_secs(3));
+        assert!(
+            !quiet.iter().any(|line| line.starts_with(&awaited)),
+            "row 136: a withdrawn resource was minted and withdrawn again with no policy change: {quiet:?}"
+        );
+        let withdrawals = agent
+            .seen
+            .iter()
+            .filter(|line| line.starts_with(&awaited))
+            .count();
+        assert_eq!(
+            withdrawals, 2,
+            "row 136: the withdrawn resource was reported {withdrawals} times: {:?}",
+            agent.seen
+        );
+    }
+
+    let response = agent.exchange(request);
+    (response, upstream.requests.load(Ordering::SeqCst))
+}
+
+#[cfg(unix)]
+#[test]
+fn row_136_a_policy_refusal_withdraws_the_grant() {
+    let (response, served) = row_136_a_refused_renewal(403);
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "row 136: a request was allowed after the control plane withdrew the grant: {response}"
+    );
+    assert_eq!(
+        served, 1,
+        "row 136: a request reached the upstream after the withdrawal"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn row_136_a_server_error_keeps_the_grant() {
+    let (response, served) = row_136_a_refused_renewal(503);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "row 136 positive control: a 503 renewal refusal keeps the old grant: {response}"
+    );
+    assert_eq!(
+        served, 2,
+        "row 136 positive control: the kept grant still reaches the upstream"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn row_136_a_binding_refused_at_startup_is_minted_after_the_next_policy_change() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let upstream = common::spawn_fake_upstream();
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    fake.set_mint_refusal(Some(403));
+    fake.answer(FakeGrant::Signed(
+        HOST,
+        "https",
+        common::loopback_connection(upstream.addr.port(), true),
+    ));
+    let home = fake.token_home_with(serde_json::json!({
+        "resource": RESOURCE,
+        "host": HOST,
+        "protocol": "https",
+        "upstream_host": "127.0.0.1",
+        "upstream_port": upstream.addr.port(),
+        "upstream_plaintext": true,
+    }));
+    let credentials = home.home.path().join(".zs-credentials");
+    std::fs::create_dir_all(&credentials).unwrap();
+    std::fs::write(credentials.join("fake"), "sk_test_matrix_row_136").unwrap();
+    let request =
+        b"GET /v1/customers HTTP/1.1\r\nHost: api.stripe.com\r\nConnection: close\r\n\r\n";
+    let mut agent = RunningAgent::start(&home, &[]);
+
+    let refused = format!("zs: no grant for {RESOURCE}");
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(15), |line| line.starts_with(&refused))
+            .is_some(),
+        "row 136 positive control: the startup mint is refused: {:?}",
+        agent.seen
+    );
+    let response = agent.exchange(request);
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "row 136 positive control: a binding refused at startup is denied: {response}"
+    );
+    assert!(
+        soon(Duration::from_secs(15), || fake.revocation_requests() >= 2),
+        "row 136 positive control: the agent long-polls"
+    );
+
+    let minted = fake.grant_calls();
+    fake.set_mint_refusal(None);
+    let quiet = agent.drain(Duration::from_secs(3));
+    assert_eq!(
+        fake.grant_calls(),
+        minted,
+        "row 136: the refused binding was minted again with no policy change: {quiet:?}"
+    );
+
+    fake.set_policy_version(Some(8));
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(5), |line| line
+                .starts_with("zs: renewed grant "))
+            .is_some(),
+        "row 136: a binding refused at startup was not minted after the policy change: {:?}",
+        agent.seen
+    );
+    let response = agent.exchange(request);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "row 136: the binding granted by the policy change is still denied: {response}"
+    );
+    assert_eq!(upstream.requests.load(Ordering::SeqCst), 1);
+}
+
+// The binding leaves its connection to the signed grant, and the startup refusal skipped the
+// reconcile that would have taken it: a mint after the next policy change cannot be used without
+// a restart. The agent must say so once per policy change, not on every refresh.
+#[cfg(unix)]
+#[test]
+fn row_136_a_startup_refused_binding_that_needs_a_restart_is_tried_once_per_policy_change() {
+    use std::time::Duration;
+    let upstream = common::spawn_fake_upstream();
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    fake.set_mint_refusal(Some(403));
+    fake.answer(FakeGrant::Signed(
+        HOST,
+        "https",
+        common::loopback_connection(upstream.addr.port(), true),
+    ));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[("ZS_REFRESH_SECONDS", "1")]);
+    agent.wait_ready();
+    assert!(
+        soon(Duration::from_secs(15), || fake.revocation_requests() >= 2),
+        "row 136 positive control: the agent long-polls"
+    );
+
+    fake.set_mint_refusal(None);
+    fake.set_policy_version(Some(8));
+    let restart = "restart zs run to use it";
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(5), |line| line.ends_with(restart))
+            .is_some(),
+        "row 136 positive control: the mint after the policy change needs a restart: {:?}",
+        agent.seen
+    );
+    let minted = fake.grant_calls();
+    let quiet = agent.drain(Duration::from_secs(3));
+    assert!(
+        !quiet.iter().any(|line| line.ends_with(restart)),
+        "row 136: the binding was minted and refused again with no policy change: {quiet:?}"
+    );
+    assert_eq!(
+        fake.grant_calls(),
+        minted,
+        "row 136: the agent kept minting the binding on every refresh"
+    );
+
+    fake.set_policy_version(Some(9));
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(5), |line| line.ends_with(restart))
+            .is_some(),
+        "row 136: the next policy change did not try the binding again: {:?}",
+        agent.seen
+    );
+}
+
+// The startup revocations read comes before the mints; a control plane that enrols the device
+// and then never answers must refuse the run after one request timeout (30 s), not two.
+#[cfg(unix)]
+#[test]
+fn a_silent_control_plane_refuses_startup_after_one_request_timeout() {
+    use std::time::{Duration, Instant};
+    let fake = FakeControl::start();
+    fake.set_silent(true);
+    let home = fake.token_home();
+    let started = Instant::now();
+    let mut agent = RunningAgent::start(&home, &[]);
+    let refused = agent.wait_for(Duration::from_secs(50), |line| {
+        line.starts_with("zs: control plane unavailable at ")
+    });
+    let elapsed = started.elapsed();
+    assert!(
+        refused.is_some(),
+        "positive control: a silent control plane refuses the run: {:?}",
+        agent.seen
+    );
+    assert!(
+        elapsed >= Duration::from_secs(25),
+        "positive control: the refusal came from the request timeout, after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "a silent control plane cost two request timeouts: {elapsed:?}"
+    );
+    assert_eq!(
+        fake.grant_calls(),
+        0,
+        "the agent minted after the startup read timed out"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn row_134_a_policy_edit_during_startup_renews_at_once() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    fake.set_policy_version(Some(7));
+    fake.set_hold(Some(Duration::from_secs(20)));
+    fake.set_policy_version_after_mint(Some(8));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+
+    assert!(
+        agent
+            .wait_for(Duration::from_secs(5), |line| line
+                .starts_with("zs: renewed grant "))
+            .is_some(),
+        "row 134: a policy edit between the startup mint and the first read did not renew: {:?}",
+        agent.seen
+    );
+    let after = agent.drain(Duration::from_secs(3));
+    assert!(
+        !after
+            .iter()
+            .any(|line| line.starts_with("zs: renewed grant ")),
+        "row 134: the grant minted under the current version was renewed again: {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_137_an_open_session_ends_at_once_on_revocation() {
+    const REVOKED: &str = "grant revoked";
+    let key = ControlSigningKey::generate("k1");
+    let handler = Arc::new(agent_with(
+        vec![key.sign(grant(now_ms() + 300_000, "g-1")).unwrap()],
+        &key,
+    ));
+    let materialize: zs_protocol::Materialize = {
+        let handler = handler.clone();
+        Arc::new(move || {
+            let handler = handler.clone();
+            let wake = handler.grant_changes();
+            let check: zs_protocol::SessionCheck = Arc::new(move || {
+                handler
+                    .authorize_message(RESOURCE, "connect")
+                    .map_err(|_| REVOKED)
+            });
+            Ok(zs_protocol::Materialized::new(
+                zs_credential::Credential::from_bytes(redis_fake::PASSWORD.as_bytes().to_vec())
+                    .unwrap(),
+                zs_protocol::SessionAccess::ReadWrite,
+                check,
+            )
+            .with_wake(wake))
+        })
+    };
+    let fake = redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await;
+    let (audit, refusals) = redis_fake::audit_recorder();
+    let local = redis_fake::listen(
+        fake.addr,
+        None,
+        redis_fake::auth(),
+        materialize,
+        zs_diag::DiagLog::disabled(),
+        Some(audit),
+    )
+    .await;
+
+    let mut session = redis_fake::logged_in(local).await;
+    assert_eq!(
+        session.command(&[b"GET", b"row-137-before"]).await,
+        redis_fake::OK,
+        "row 137 positive control: the session relays while the grant is valid"
+    );
+    assert!(
+        fake.saw_bytes(b"row-137-before"),
+        "row 137 positive control"
+    );
+
+    let revoked_at = std::time::Instant::now();
+    handler.apply_revocations(&["g-1".to_string()]);
+    let ended =
+        tokio::time::timeout(std::time::Duration::from_secs(1), session.read_to_end()).await;
+    assert!(
+        ended.is_ok(),
+        "row 137: the session stayed open 1 s after the revocation"
+    );
+    assert!(
+        revoked_at.elapsed() < std::time::Duration::from_secs(1),
+        "row 137: the session ended after the 1 s bound"
+    );
+    assert_eq!(
+        ended.unwrap(),
+        Vec::<u8>::new(),
+        "row 137: the agent wrote a reply on the session that it ended"
+    );
+
+    let _ = session.send_command(&[b"GET", b"row-137-after"]).await;
+    assert!(
+        !redis_fake::eventually(|| fake.saw_bytes(b"row-137-after")).await,
+        "row 137: a command reached the upstream after the revocation"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while refusals.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *refusals.lock().unwrap(),
+        vec![("connect", REVOKED)],
+        "row 137: not audited"
+    );
+}
+
+// Through the real proxy and `AgentHandler`: fails if `serve_websocket` or the agent's
+// `FlowHandler::grant_changes` stops passing the grant epoch to the relay.
+#[tokio::test(flavor = "multi_thread")]
+async fn row_137_a_proxied_websocket_ends_at_once_on_revocation() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let key = ControlSigningKey::generate("k1");
+    let seen = Arc::new(std::sync::Mutex::new(ws_fake::Seen::default()));
+    let port = ws_fake::spawn_ws_upstream(ws_fake::Reply::Ok, seen.clone()).await;
+    let served = serve_with_upstream(
+        binding(),
+        vec![key.sign(grant(now_ms() + 300_000, "g-1")).unwrap()],
+        &key,
+        Some(CREDENTIAL),
+        Recorder {
+            port,
+            heads: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+    )
+    .await;
+    let (mut tls, head) = ws_upgrade(&served).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "row 137: {head}");
+
+    let ping = ws_fake::frame(1, br#"{"op":"ping"}"#, Some([7, 1, 9, 3]));
+    tls.write_all(&ping).await.unwrap();
+    let relayed = tokio::time::timeout(Duration::from_secs(2), ws_fake::read_frame(&mut tls))
+        .await
+        .expect("row 137 positive control: no reply before the revocation");
+    assert!(
+        matches!(relayed, Some((opcode, _)) if opcode != 8),
+        "row 137 positive control: the session relays before the revocation: {relayed:?}"
+    );
+
+    // Past the relay's immediate first check, so only a wake can end the session within 1 s.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    served.handler.apply_revocations(&["g-1".to_string()]);
+    let revoked_at = std::time::Instant::now();
+    let close = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match ws_fake::read_frame(&mut tls).await {
+                Some((8, payload)) => break Some(payload),
+                Some(_) => continue,
+                None => break None,
+            }
+        }
+    })
+    .await
+    .expect("row 137: the proxied WebSocket stayed open 1 s after the revocation");
+    assert!(
+        revoked_at.elapsed() < zs_protocol::REVALIDATE_EVERY,
+        "row 137: the session ended on the tick, not on the revocation"
+    );
+    assert_eq!(close, Some(1008u16.to_be_bytes().to_vec()), "row 137");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dropped_hold_backs_off() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    fake.set_hold(Some(Duration::from_secs(20)));
+    fake.drop_holds_after(Some(Duration::from_millis(500)));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+    assert!(
+        soon(Duration::from_secs(10), || fake.revocation_requests() >= 2),
+        "positive control: the agent long-polls before its holds are dropped"
+    );
+
+    // The fake cuts the connection instead of answering, so the agent must report a transport
+    // or parse failure; a refusal line here would mean the fake answered HTTP instead.
+    let cut = agent.wait_for(Duration::from_secs(10), |line| {
+        line.starts_with("zs: revocation refresh failed: ")
+            && (line.contains("transport:") || line.contains("malformed response:"))
+    });
+    let seen = agent
+        .seen
+        .iter()
+        .find(|line| line.starts_with("zs: revocation refresh failed: "))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        cut.is_some(),
+        "a dropped hold must look like a cut connection, not an HTTP refusal; the agent reported: {seen:?} (all lines: {:?})",
+        agent.seen
+    );
+
+    // After a cut the agent sends the next request without a cursor, so the control plane
+    // answers it at once with the current keys and CA set: a proxy that cuts every hold must
+    // not keep a key rotation from the agent.
+    let unheld = fake.unheld_requests();
+    assert!(
+        soon(Duration::from_secs(5), || fake.unheld_requests() > unheld),
+        "after a cut hold the agent never sent a request the control plane answers at once"
+    );
+
+    // Counted over 12 s: each cut doubles the backoff (1, 2, 4, 8 s), and the answered request
+    // after it does not reset it, which makes about 6 requests (a cut hold and an answered one
+    // per round); with no backoff it would be about 12, and with a reset on every answer about 10.
+    let baseline = fake.revocation_requests();
+    std::thread::sleep(Duration::from_secs(12));
+    let requests = fake.revocation_requests() - baseline;
+    assert!(
+        requests >= 2,
+        "positive control: the agent retries after a cut (cut line: {seen:?})"
+    );
+    assert!(
+        requests <= 7,
+        "a dropped hold was polled {requests} times in 12 s: the agent does not back off (cut line: {seen:?})"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_request_answers_at_its_hold_without_a_drop() {
+    use std::time::Duration;
+    let fake = FakeControl::start();
+    fake.set_hold(Some(Duration::from_millis(500)));
+    fake.drop_holds_after(None);
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+
+    assert!(
+        soon(Duration::from_secs(10), || fake.revocation_requests() >= 4),
+        "row 135 negative control: an answered hold is followed by the next long poll; {} requests",
+        fake.revocation_requests()
+    );
+    let after = agent.drain(Duration::from_secs(1));
+    assert!(
+        !after
+            .iter()
+            .any(|line| line.starts_with("zs: revocation refresh failed: ")),
+        "row 135 negative control: a held request was cut instead of answered: {after:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_changing_cursor_is_polled_at_most_once_a_second() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let fake = Arc::new(FakeControl::start());
+    fake.set_hold(Some(Duration::ZERO));
+    let home = fake.token_home();
+    let mut agent = RunningAgent::start(&home, &[]);
+    agent.wait_ready();
+    let baseline = fake.revocation_requests();
+    let stop = Arc::new(AtomicBool::new(false));
+    let changer = {
+        let fake = fake.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut next = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                fake.revoke(&format!("g-live-{next}"));
+                next += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_secs(5));
+    stop.store(true, Ordering::SeqCst);
+    changer.join().unwrap();
+
+    let requests = fake.revocation_requests() - baseline;
+    assert!(
+        requests >= 2,
+        "positive control: the agent polls a control plane that answers at once"
+    );
+    assert!(
+        requests <= 6,
+        "a cursor that changed on every answer was polled {requests} times in 5 s"
     );
 }

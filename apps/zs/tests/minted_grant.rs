@@ -107,6 +107,7 @@ fn minted(key: &ControlSigningKey, grant_id: &str, token: &str) -> MintedGrant {
     MintedGrant {
         signed: signed(key, grant_id),
         token: Some(IdentityToken::from_string(token.to_string())),
+        policy_version: None,
     }
 }
 

@@ -33,6 +33,22 @@
       "expect": {
         "accepted": false
       }
+    },
+    {
+      "name": "policy_version_round_trips",
+      "input": "{\"signed_grant_json\": \"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\", \"identity_token\": \"eyJhbGciOiJFUzI1NiJ9.e30.AA\", \"policy_version\": 7}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\",\"identity_token\":\"eyJhbGciOiJFUzI1NiJ9.e30.AA\",\"policy_version\":7}"
+      }
+    },
+    {
+      "name": "absent_policy_version_round_trips",
+      "input": "{\"signed_grant_json\": \"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\", \"identity_token\": \"eyJhbGciOiJFUzI1NiJ9.e30.AA\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"signed_grant_json\":\"{\\\"grant\\\":{\\\"grant_id\\\":\\\"g-0123456789abcdef0123456789abcdef\\\"},\\\"signature\\\":\\\"AA==\\\",\\\"signing_key_id\\\":\\\"control-k1\\\"}\",\"identity_token\":\"eyJhbGciOiJFUzI1NiJ9.e30.AA\"}"
+      }
     }
   ]
 }

@@ -179,6 +179,8 @@ pub(crate) fn control_policy(args: &super::Args) -> Option<zs_policy::Policy> {
 
 const REFRESH_SECONDS: u64 = 60;
 const RENEW_WITHIN_MS: u64 = 150_000;
+const REVOCATION_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+const CURSOR_MAX_LEN: usize = 128;
 
 // A shorter interval is for tests and for an operator who wants a tighter revocation bound;
 // it can never be longer than the bound the agent claims.
@@ -189,6 +191,17 @@ fn refresh_interval() -> std::time::Duration {
         .unwrap_or(REFRESH_SECONDS)
         .clamp(1, REFRESH_SECONDS);
     std::time::Duration::from_secs(seconds)
+}
+
+// The cursor is opaque, so the agent sends one back only when every byte is in the alphabet the
+// control plane uses; any other value is treated as absent, so a control plane cannot inject
+// into the query string (ADR-0064).
+fn cursor_is_opaque(cursor: &str) -> bool {
+    !cursor.is_empty()
+        && cursor.len() <= CURSOR_MAX_LEN
+        && cursor
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[derive(Clone)]
@@ -245,7 +258,7 @@ impl L3Audit {
 type L3Materialize = zs_protocol::Materialize;
 
 fn l3_materialize(audit: L3Audit) -> L3Materialize {
-    std::sync::Arc::new(move || {
+    let build = |audit: &L3Audit| {
         let outcome = audit
             .handler
             .session_access(&audit.resource)
@@ -286,6 +299,21 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
             }
         });
         Ok(zs_protocol::Materialized::new(credential, access, check))
+    };
+    std::sync::Arc::new(move || with_grant_wake(&*audit.handler, || build(&audit)))
+}
+
+// Subscribes to grant changes before `build` reads the grant, so a change that lands while the
+// session is being built wakes its watch at once instead of waiting for the first 5 s check.
+fn with_grant_wake(
+    handler: &dyn zs_mitm::FlowHandler,
+    build: impl FnOnce() -> Result<zs_protocol::Materialized, zs_protocol::Denied>,
+) -> Result<zs_protocol::Materialized, zs_protocol::Denied> {
+    let wake = handler.grant_changes();
+    let materialized = build()?;
+    Ok(match wake {
+        Some(wake) => materialized.with_wake(wake),
+        None => materialized,
     })
 }
 
@@ -368,11 +396,14 @@ async fn renew_grants(
     let subject = zs_mitm::FlowHandler::subject(agent);
     let workload = zs_mitm::FlowHandler::workload(agent);
     for binding in bindings {
-        if !agent.grant_needs_renewal(&binding.resource, RENEW_WITHIN_MS) {
+        if !agent.grant_needs_renewal(&binding.resource, RENEW_WITHIN_MS)
+            && !agent.grant_policy_stale(&binding.resource)
+        {
             continue;
         }
+        let at = agent.policy_version();
         let minted = mint_grant(client, binding, &subject, &workload).await;
-        match renewal(agent, binding, minted, stored, diag) {
+        match renewal(agent, binding, minted, at, stored, diag) {
             Ok(line) => stdout_line!("{line}"),
             Err(line) => stderr_line!("{line}"),
         }
@@ -383,6 +414,7 @@ fn renewal(
     agent: &AgentHandler,
     binding: &zs::ResourceBinding,
     minted: Result<zs::MintedGrant, WireError>,
+    at: Option<u64>,
     stored: bool,
     diag: &DiagLog,
 ) -> Result<String, String> {
@@ -394,6 +426,20 @@ fn renewal(
     };
     let minted = match minted {
         Ok(minted) => minted,
+        // Only with a known policy version: a withdrawn grant comes back on a version change, and
+        // a control plane that sends none would leave it withdrawn until `zs run` restarts.
+        Err(WireError::Refused { status: 403 }) if at.is_some() => {
+            agent.withdraw_grant(&binding.resource, at);
+            diag.emit(
+                Event::new(Component::Grant, "grant_withdrawn")
+                    .warn()
+                    .resource(&binding.resource),
+            );
+            return Err(format!(
+                "zs: grant for {} withdrawn by the control plane",
+                binding.resource
+            ));
+        }
         Err(e) => {
             diag.emit(failed("wire"));
             return Err(device_refusal_line(&e, stored).unwrap_or_else(|| {
@@ -412,6 +458,7 @@ fn renewal(
             Ok(renewed)
         }
         Err(mismatch) => {
+            agent.settle_unusable_mint(&binding.resource, at);
             diag.emit(failed(mismatch.failure()));
             Err(mismatch.renewal_line(&binding.resource))
         }
@@ -548,10 +595,23 @@ async fn enrol_and_fetch(
     subject: &zs_identity::Subject,
     workload: &zs_identity::WorkloadLabel,
     diag: &DiagLog,
-) -> Result<zs::wire_client::WireClient, RunRefusal> {
+) -> Result<Enrolled, RunRefusal> {
     let stored = connection.stored.is_some();
     let client = connect(connection, args).await?;
 
+    // Read before the mints, so its policy version is never newer than the one a mint below
+    // evaluates: a policy edit that lands during startup is seen as a change, not missed.
+    let revocations_started = std::time::Instant::now();
+    let revocations = client.fetch_revocations(None).await;
+    // An unreachable or silent control plane refuses the run here, as the first mint would,
+    // instead of costing a second request timeout on that mint.
+    if let Err(e @ WireError::Transport(_)) = &revocations
+        && let Some(line) = startup_refusal_line(e, stored, client.wire_url())
+    {
+        return Err(RunRefusal::Line(line));
+    }
+
+    let mut refused = Vec::new();
     let mut granted = 0usize;
     for binding in &mut file.bindings {
         match mint_grant(&client, binding, subject.as_str(), workload.as_str()).await {
@@ -571,6 +631,9 @@ async fn enrol_and_fetch(
             Err(e) => {
                 if let Some(line) = startup_refusal_line(&e, stored, client.wire_url()) {
                     return Err(RunRefusal::Line(line));
+                }
+                if matches!(e, WireError::Refused { status: 403 }) {
+                    refused.push(binding.resource.clone());
                 }
                 stderr_line!("zs: no grant for {}: {e}", binding.resource);
                 diag.emit(
@@ -593,7 +656,21 @@ async fn enrol_and_fetch(
         file.bindings.len()
     );
 
-    Ok(client)
+    Ok(Enrolled {
+        client,
+        revocations,
+        revocations_started,
+        refused,
+    })
+}
+
+struct Enrolled {
+    client: zs::wire_client::WireClient,
+    revocations: Result<zs_wire::RevocationsResponse, WireError>,
+    revocations_started: std::time::Instant,
+    // Bindings the control plane refused with a 403 at startup: recorded as withdrawn, so the
+    // next policy version change mints them, as for a grant withdrawn while running.
+    refused: Vec<String>,
 }
 
 struct BackgroundTasks(Vec<tokio::task::JoinHandle<()>>);
@@ -633,6 +710,9 @@ struct PreparedRun {
     shipped: std::sync::Arc<tokio::sync::Mutex<u64>>,
     ca: std::sync::Arc<LocalCa>,
     wire: Option<std::sync::Arc<zs::wire_client::WireClient>>,
+    revocation_cursor: Option<String>,
+    revocation_hold: bool,
+    revocation_started: std::time::Instant,
     stored: bool,
     agent: std::sync::Arc<AgentHandler>,
     audit_subject: String,
@@ -843,6 +923,7 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
     };
 
     let uses_stored = stored.is_some();
+    let mut startup = None;
     let wire = match args.control.as_deref() {
         None => None,
         Some(control) => {
@@ -850,7 +931,14 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
             match runtime.block_on(enrol_and_fetch(
                 connection, args, &mut file, &grants, &subject, &workload, diag,
             )) {
-                Ok(client) => Some(std::sync::Arc::new(client)),
+                Ok(enrolled) => {
+                    startup = Some((
+                        enrolled.revocations,
+                        enrolled.revocations_started,
+                        enrolled.refused,
+                    ));
+                    Some(std::sync::Arc::new(enrolled.client))
+                }
                 Err(refusal) => return Err(refuse_control(diag, control, refusal)),
             }
         }
@@ -877,11 +965,19 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
         .with_diag(diag.clone()),
     );
     let control = args.control.clone().unwrap_or_default();
-    if let Some(client) = wire.as_ref() {
-        match runtime.block_on(client.fetch_revocations()) {
+    let mut revocation_cursor = None;
+    let mut revocation_started = std::time::Instant::now();
+    if let (Some(client), Some((revocations, started, refused))) = (wire.as_ref(), startup) {
+        revocation_started = started;
+        match revocations {
             Ok(response) => {
                 client.install_key_set(&response.grant_verifying_keys, diag);
                 install_ca_set(client, &control, &response.control_ca_pems, diag);
+                agent.note_policy_version(response.policy_version);
+                for resource in &refused {
+                    agent.withdraw_grant(resource, response.policy_version);
+                }
+                revocation_cursor = response.cursor.filter(|cursor| cursor_is_opaque(cursor));
                 if !response.revoked_grant_ids.is_empty() {
                     agent.apply_revocations(&response.revoked_grant_ids);
                     stdout_line!(
@@ -908,12 +1004,16 @@ fn prepare(args: &super::Args, diag: &DiagLog) -> Result<PreparedRun, i32> {
         },
     };
 
+    let revocation_hold = revocation_cursor.is_some();
     Ok(PreparedRun {
         file,
         journal,
         shipped: std::sync::Arc::new(tokio::sync::Mutex::new(shipped)),
         ca: std::sync::Arc::new(ca),
         wire,
+        revocation_cursor,
+        revocation_hold,
+        revocation_started,
         stored: uses_stored,
         agent,
         audit_subject,
@@ -1238,15 +1338,36 @@ async fn start_services(
         let stored = prepared.stored;
         let diag = prepared.diag.clone();
         let every = refresh_interval();
+        let renew_now = std::sync::Arc::new(tokio::sync::Notify::new());
 
         let control = args.control.clone().unwrap_or_default();
         let (revocation_wire, revocation_agent, revocation_diag) =
             (wire.clone(), agent.clone(), diag.clone());
+        let revocation_renew = renew_now.clone();
+        let mut revocation_cursor = prepared.revocation_cursor.clone();
+        let mut wait = if prepared.revocation_hold {
+            REVOCATION_GAP.saturating_sub(prepared.revocation_started.elapsed())
+        } else {
+            every
+        };
         tasks.push(tokio::spawn(async move {
+            let mut backoff = REVOCATION_GAP;
             loop {
-                tokio::time::sleep(every).await;
-                match revocation_wire.fetch_revocations().await {
+                tokio::time::sleep(wait).await;
+                let last_request = std::time::Instant::now();
+                let held = revocation_cursor.is_some();
+                let answer = revocation_wire
+                    .fetch_revocations(revocation_cursor.as_deref())
+                    .await;
+                match answer {
                     Ok(response) => {
+                        // Only a held request that succeeds, or a control plane that holds
+                        // nothing, ends the backoff: the answer right after a cut hold does
+                        // not, so a proxy that cuts every hold still meets a growing backoff.
+                        let holds = response.cursor.as_deref().is_some_and(cursor_is_opaque);
+                        if held || !holds {
+                            backoff = REVOCATION_GAP;
+                        }
                         revocation_wire
                             .install_key_set(&response.grant_verifying_keys, &revocation_diag);
                         install_ca_set(
@@ -1264,6 +1385,18 @@ async fn start_services(
                                     .num("count", learned as u64),
                             );
                         }
+                        if revocation_agent.note_policy_version(response.policy_version) {
+                            revocation_renew.notify_one();
+                        }
+                        match response.cursor {
+                            Some(next) if cursor_is_opaque(&next) => {
+                                revocation_cursor = Some(next);
+                            }
+                            _ => {
+                                revocation_cursor = None;
+                                tokio::time::sleep(every).await;
+                            }
+                        }
                     }
                     Err(e) => {
                         stderr_line!("zs: revocation refresh failed: {e}");
@@ -1272,15 +1405,26 @@ async fn start_services(
                                 .warn()
                                 .failure("wire"),
                         );
+                        // The next request carries no cursor, so the control plane answers it
+                        // at once with the current keys and CA set: a proxy that cuts every
+                        // hold must not keep a key rotation from the agent.
+                        revocation_cursor = None;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(every);
                     }
                 }
+                wait = REVOCATION_GAP.saturating_sub(last_request.elapsed());
             }
         }));
 
         let (renewal_wire, renewal_agent, renewal_diag) = (wire.clone(), agent.clone(), diag);
+        let renewal_tick = renew_now;
         tasks.push(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(every).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => {}
+                    _ = renewal_tick.notified() => {}
+                }
                 renew_grants(
                     &renewal_wire,
                     &renewal_agent,
@@ -2169,6 +2313,7 @@ mod tests {
                 agent,
                 binding,
                 Ok(mysql_grant_with_access(key, 3306, grant_id, 600_000, access).into()),
+                None,
                 true,
                 &DiagLog::disabled()
             ),
@@ -2210,6 +2355,36 @@ mod tests {
     }
 
     #[test]
+    fn the_l3_materialize_session_watch_ends_on_a_grant_change() {
+        let session = open_session(60_000);
+        paused_clock().block_on(async {
+            let started = tokio::time::Instant::now();
+            let ended = session.watch.ended();
+            tokio::pin!(ended);
+            assert!(
+                session.agent.withdraw_grant("orders-mysql", Some(1)),
+                "positive control: the fixture held a live grant"
+            );
+            assert_eq!((&mut ended).await, GRANT_REVOKED_REASON);
+            assert!(
+                started.elapsed() < zs_protocol::REVALIDATE_EVERY / 2,
+                "{:?}",
+                started.elapsed()
+            );
+        });
+
+        let session = open_session(60_000);
+        paused_clock().block_on(async {
+            assert!(
+                tokio::time::timeout(zs_protocol::REVALIDATE_EVERY * 2, session.watch.ended())
+                    .await
+                    .is_err(),
+                "the watch ended a session whose check passes"
+            );
+        });
+    }
+
+    #[test]
     fn the_session_check_denies_after_expiry() {
         let session = open_session(SHORT_GRANT_MS);
         outlive_the_short_grant();
@@ -2229,6 +2404,7 @@ mod tests {
                 &session.agent,
                 &session.binding,
                 Ok(mysql_grant(&session.key, 3306, "g-2", 600_000).into()),
+                None,
                 true,
                 &DiagLog::disabled()
             ),
@@ -2329,6 +2505,149 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_change_while_a_session_is_built_wakes_it_at_once() {
+        let failing_session = || {
+            let check: zs_protocol::SessionCheck = std::sync::Arc::new(|| Err("grant revoked"));
+            Ok(zs_protocol::Materialized::new(
+                zs_credential::Credential::from_bytes(b"synthetic".to_vec()).unwrap(),
+                zs_protocol::SessionAccess::ReadWrite,
+                check,
+            ))
+        };
+
+        let session = open_session(60_000);
+        let built = with_grant_wake(&*session.agent, || {
+            assert!(session.agent.withdraw_grant("orders-mysql", Some(1)));
+            failing_session()
+        })
+        .unwrap();
+        let (_, watch) = built.into_parts();
+        paused_clock().block_on(async {
+            assert!(
+                tokio::time::timeout(zs_protocol::REVALIDATE_EVERY / 2, watch.ended())
+                    .await
+                    .is_ok(),
+                "a grant change while the session was built waited for the first check"
+            );
+        });
+
+        let quiet = open_session(60_000);
+        let built = with_grant_wake(&*quiet.agent, failing_session).unwrap();
+        let (_, watch) = built.into_parts();
+        paused_clock().block_on(async {
+            assert!(
+                tokio::time::timeout(zs_protocol::REVALIDATE_EVERY / 2, watch.ended())
+                    .await
+                    .is_err(),
+                "negative control: with no grant change the session waits for its first check"
+            );
+        });
+    }
+
+    // A withdrawn grant comes back only on a policy version change, so without a known version
+    // (a control plane from before ADR-0064) a 403 must keep today's behaviour: the grant stays
+    // cached and is retried on the next tick.
+    #[test]
+    fn a_403_withdraws_only_when_the_policy_version_is_known() {
+        let key = zs_grant::ControlSigningKey::generate("k1");
+        let mut binding: zs::ResourceBinding = serde_json::from_value(serde_json::json!({
+            "resource": "orders-mysql",
+            "host": "mysql.orders.test",
+            "protocol": "mysql",
+        }))
+        .unwrap();
+        zs::connection::reconcile(&mut binding, &mysql_grant(&key, 3306, "g-1", 60_000)).unwrap();
+
+        let old_control = renewal_agent(&key, &binding);
+        let line = renewal(
+            &old_control,
+            &binding,
+            Err(WireError::Refused { status: 403 }),
+            None,
+            true,
+            &DiagLog::disabled(),
+        )
+        .unwrap_err();
+        assert!(
+            line.starts_with("zs: cannot renew the grant for orders-mysql"),
+            "an unknown policy version withdrew the grant: {line}"
+        );
+        assert!(
+            zs_mitm::FlowHandler::authorize_message(&old_control, "orders-mysql", "connect")
+                .is_ok(),
+            "the grant is kept, as before ADR-0064"
+        );
+
+        let versioned = renewal_agent(&key, &binding);
+        assert!(versioned.note_policy_version(Some(8)));
+        let line = renewal(
+            &versioned,
+            &binding,
+            Err(WireError::Refused { status: 403 }),
+            Some(8),
+            true,
+            &DiagLog::disabled(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            line, "zs: grant for orders-mysql withdrawn by the control plane",
+            "positive control: a known version withdraws"
+        );
+        assert!(
+            zs_mitm::FlowHandler::authorize_message(&versioned, "orders-mysql", "connect").is_err(),
+            "positive control: the withdrawn grant denies"
+        );
+    }
+
+    #[test]
+    fn a_held_grant_whose_renewal_cannot_be_used_waits_for_the_next_policy_change() {
+        let key = zs_grant::ControlSigningKey::generate("k1");
+        let mut binding: zs::ResourceBinding = serde_json::from_value(serde_json::json!({
+            "resource": "orders-mysql",
+            "host": "mysql.orders.test",
+            "protocol": "mysql",
+        }))
+        .unwrap();
+        zs::connection::reconcile(&mut binding, &mysql_grant(&key, 3306, "g-1", 60_000)).unwrap();
+        let agent = renewal_agent(&key, &binding);
+        agent.cache_grant(zs::MintedGrant {
+            signed: mysql_grant(&key, 3306, "g-1", 600_000),
+            token: None,
+            policy_version: Some(7),
+        });
+        assert!(agent.note_policy_version(Some(8)));
+        assert!(
+            agent.grant_policy_stale("orders-mysql"),
+            "positive control: the grant minted under 7 is stale at 8"
+        );
+
+        let refused = renewal(
+            &agent,
+            &binding,
+            Ok(zs::MintedGrant {
+                signed: mysql_grant(&key, 3307, "g-2", 600_000),
+                token: None,
+                policy_version: Some(8),
+            }),
+            Some(8),
+            true,
+            &DiagLog::disabled(),
+        );
+        assert!(
+            refused.is_err_and(|line| line.ends_with("restart zs run to use it")),
+            "positive control: the changed connection is refused"
+        );
+        assert!(
+            !agent.grant_policy_stale("orders-mysql"),
+            "the binding is minted again at 8 on every refresh"
+        );
+        assert!(
+            zs_mitm::FlowHandler::authorize_message(&agent, "orders-mysql", "connect").is_ok(),
+            "the held grant runs until it expires"
+        );
+    }
+
+    #[test]
     fn a_renewed_grant_with_a_changed_connection_is_skipped() {
         let home = tempfile::tempdir().unwrap();
         let key = zs_grant::ControlSigningKey::generate("k1");
@@ -2348,6 +2667,7 @@ mod tests {
                 &equal,
                 &binding,
                 Ok(mysql_grant(&key, 3306, "g-2", 600_000).into()),
+                None,
                 true,
                 &diag
             ),
@@ -2361,6 +2681,7 @@ mod tests {
                 &changed,
                 &binding,
                 Ok(mysql_grant(&key, 3307, "g-3", 600_000).into()),
+                None,
                 true,
                 &diag
             ),
@@ -2501,6 +2822,9 @@ mod tests {
             shipped: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
             ca: std::sync::Arc::new(LocalCa::load_or_create(home.join(".zs-ca")).unwrap()),
             wire: None,
+            revocation_cursor: None,
+            revocation_hold: false,
+            revocation_started: std::time::Instant::now(),
             stored: false,
             agent,
             audit_subject: "alice".into(),
@@ -2508,6 +2832,20 @@ mod tests {
             runtime: tokio::runtime::Runtime::new().unwrap(),
             diag: DiagLog::disabled(),
         }
+    }
+
+    #[test]
+    fn only_an_opaque_cursor_is_sent_back() {
+        for cursor in ["7.0.0", "8.12.1733", "a", "A_b-c.d"] {
+            assert!(super::cursor_is_opaque(cursor), "{cursor}");
+        }
+        for cursor in [
+            "", "7 0 0", "7/0/0", "7?x=1", "7#frag", "7&x=1", "7.0.0\n", "é",
+        ] {
+            assert!(!super::cursor_is_opaque(cursor), "{cursor:?}");
+        }
+        assert!(!super::cursor_is_opaque(&"7".repeat(129)));
+        assert!(super::cursor_is_opaque(&"7".repeat(128)));
     }
 
     #[test]

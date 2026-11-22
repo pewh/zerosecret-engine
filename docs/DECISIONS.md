@@ -7,6 +7,91 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0064 — Policy changes and revocations reach the agent by long poll
+
+**2026-11-21 · Accepted** · owner decision 2026-11-21 (design record in the commercial
+repository) · amends ADR-0018 (the fetch cadence only) · reverses the 2026-11-15 choice to
+poll instead of push
+
+The agent learned of a revocation only when it called `GET /wire/revocations`, and that call
+ran on a 60 s timer. A dashboard policy edit wrote a new policy row and sent no signal at all:
+the agent learned of it at its next renewal, and the read-only live check measured 81.6 s and
+130.7 s from dashboard switch to agent. A revocation is a security action, so a refresh
+interval is a bound, not a prompt effect. The earlier read-only work of 2026-11-15 had dropped
+a pushed session-end signal in favour of polling, and this ADR reverses that choice by returning
+a pushed signal as a wake.
+
+**Decision.**
+- **Long poll.** The agent sends `GET /wire/revocations?after=<cursor>`, the cursor of its last
+  answer. The control plane holds the request when the cursor still matches, releases every
+  database resource, and answers when the organization's policy version or revocation set
+  changes, or after 25 s. While the `LISTEN` connection is down, a held request answers at once
+  and the next one is held at most 5 s. The answer carries the current `policy_version` and a
+  new `cursor`; the mint answer carries the `policy_version` it read. After a failed request the
+  agent sends the next one without a cursor, so it is answered at once with the current keys
+  and CA set even behind a proxy that cuts every hold; only a held request that succeeds, or an
+  answer without a cursor (a control plane that holds nothing), ends the backoff.
+- **Wake.** `AFTER INSERT` triggers on `policies` and `revoked_grants` call
+  `pg_notify('zs_wire', '<schema>/<organization_id>')`; `NOTIFY` is sent at commit, so a
+  rolled-back change wakes nobody and no writer can forget the call. The payload is
+  `<schema>/<organization_id>`, so two schemas of one database do not wake each other's hubs.
+  One hub per control instance holds one `LISTEN zs_wire` connection outside the pool. After
+  30 s without a notification the hub pings that connection; when the connection fails or the
+  ping gets no answer in 5 s, the hub wakes every held request and reconnects with backoff. A
+  connection that dies silently is therefore replaced within 35 s.
+- **Renewal on a change.** A changed `policy_version` wakes the renewal task, which renews every
+  grant minted under another version, before its 150 s window. A missing or equal version does
+  not renew early. An answer without a `cursor`, from a control plane before this entry, makes
+  the agent sleep the refresh interval, so an old control plane is not polled fast. At startup
+  the agent reads the revocations answer before it mints, so a policy edit that lands during
+  startup reaches it as a change. A renewed grant the agent cannot use (a changed credential
+  source or connection) leaves the old grant in place until it expires, and the binding is
+  tried again on the next policy change, not on every refresh.
+- **Withdrawal on a refusal.** When the control plane sends a policy version, a renewal refused
+  with 403 withdraws the cached grant (against a control plane that sends none, the grant is
+  kept and retried as before, because nothing would bring it back): the agent
+  forgets the materialized value and prints `zs: grant for <resource> withdrawn by the control
+  plane`. A withdrawal writes no audit record of its own; the next request and any open session
+  are denied through the existing paths: a database session ends with `grant revoked`, and a
+  WebSocket session with Close 1008, audited `websocket revoked`. A 5xx, a transport error or a
+  malformed answer keeps the grant until it expires. A withdrawn grant is minted again on the
+  next policy version change, and so is a binding the control plane refused with 403 at startup;
+  when such a mint cannot be used without a restart (the binding left its connection to a grant
+  it never received), the agent says so once per policy change. A 403 that no policy edit cures
+  (a missing federation issuer, a client certificate for another device) keeps the binding
+  withdrawn until the next policy change or a restart; a 5xx on such a mint is retried on every
+  refresh, as any 5xx renewal is, until the mint succeeds or is refused. A grant revoked through
+  `/wire/revoke` is still never renewed.
+- **Instant recheck.** A grant epoch (a `tokio::sync::watch`) moves on every renewal, withdrawal
+  and applied revocation. Every session check wakes on the epoch or on its 5 s tick, whichever
+  is first; the tick stays the floor.
+- **Cursor.** `"<policy_version>.<revoked_count>.<latest_revoked_at_ms>"`, decimal, `0` for
+  none. The agent sends a cursor back only when it matches `[0-9A-Za-z._-]{1,128}`; any other
+  value is treated as absent.
+- **Bounds.** A connected agent learns of a change in about one second. The bound is one retry
+  interval (60 s by default) once the control plane answers again, and one TTL (300 s,
+  unchanged) while it does not (SECURITY §3). A hold costs one goroutine and one TLS connection,
+  and no database connection; the gauge `zs_control_wire_revocations_waiting` counts the waiting
+  holds.
+
+**Consequence.** A policy edit or a revocation reaches every running agent of the
+organization in about one second, and every policy edit makes those agents renew every grant at
+once: one mint per binding per edit, with no spreading. One change also makes every held request
+of the organization read its state at the same moment, two queries each, queued on the
+database pool. At 1,000 agents the hold traffic is about 40 requests a
+second, one held goroutine and TLS connection per agent, and one `LISTEN` connection per control
+instance. The 300 s grant TTL no longer sets the speed of a change; it bounds the offline case,
+so an agent that cannot reach the control plane keeps its last grant until it expires. An agent
+from 0.7.0 ignores the new fields and keeps its 60 s bounds; a 0.7.0-era control plane sends no
+cursor and gets no hold.
+
+**Reverse it if** a proxy or load balancer in front of the control plane cannot carry a request
+held for 25 s, or the held connections cost more than the polling they replace. Then a short
+poll on the version hint returns, and a change takes up to one poll interval again; the wake
+path leaves with it.
+
+---
+
 ## ADR-0063 — A resource can be read-only; the grant carries `access` and the agent checks commands
 
 **2026-11-15 · Accepted** · owner decision 2026-11-15 · extends ADR-0053 (grant version)

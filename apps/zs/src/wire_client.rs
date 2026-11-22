@@ -19,6 +19,25 @@ use crate::device::{DeviceSecrets, Enrolment};
 
 const WIRE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+mod hold_tests {
+    use std::time::Duration;
+
+    // The longest the control plane holds `GET /wire/revocations` (ADR-0064). The request
+    // timeout must outlast it with room for the TLS handshake, or every held request ends as a
+    // timeout and the agent backs off.
+    const REVOCATIONS_HOLD: Duration = Duration::from_secs(25);
+
+    #[test]
+    fn the_request_timeout_outlasts_the_revocations_hold() {
+        assert!(
+            super::WIRE_REQUEST_TIMEOUT >= REVOCATIONS_HOLD + Duration::from_secs(5),
+            "WIRE_REQUEST_TIMEOUT {:?} must exceed the {REVOCATIONS_HOLD:?} revocations hold by 5 s",
+            super::WIRE_REQUEST_TIMEOUT
+        );
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WireError {
     #[error("transport: {0}")]
@@ -282,10 +301,17 @@ impl WireClient {
         }
     }
 
-    pub async fn fetch_revocations(&self) -> Result<zs_wire::RevocationsResponse, WireError> {
-        let response = self
+    pub async fn fetch_revocations(
+        &self,
+        after: Option<&str>,
+    ) -> Result<zs_wire::RevocationsResponse, WireError> {
+        let mut request = self
             .http()
-            .get(format!("{}/wire/revocations", self.wire_url))
+            .get(format!("{}/wire/revocations", self.wire_url));
+        if let Some(after) = after {
+            request = request.query(&[("after", after)]);
+        }
+        let response = request
             .header(reqwest::header::USER_AGENT, crate::WIRE_USER_AGENT)
             .send()
             .await
@@ -349,6 +375,7 @@ impl WireClient {
             token: minted
                 .identity_token
                 .map(zs_credential::IdentityToken::from_string),
+            policy_version: minted.policy_version,
         })
     }
 

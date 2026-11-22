@@ -178,6 +178,20 @@ pub enum FakeGrant {
     },
 }
 
+/// A cut connection, as a proxy or a VPN makes when it drops a held request: the response
+/// declares a body it never writes, so hyper aborts the connection instead of answering. The
+/// client must report a transport or parse failure, never an HTTP refusal.
+#[cfg(unix)]
+fn cut_connection() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut response = (axum::http::StatusCode::OK, "").into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_static("4096"),
+    );
+    response
+}
+
 /// A control plane wire API stand-in (plain HTTP): it enrols any device with the test CA and
 /// answers `/wire/grant` as told by `answer`.
 #[cfg(unix)]
@@ -193,6 +207,15 @@ pub struct FakeControl {
     mint_version: Arc<std::sync::atomic::AtomicU32>,
     mint_access: Arc<std::sync::Mutex<zs_policy::Access>>,
     mint_environment: Arc<std::sync::Mutex<String>>,
+    policy_version: Arc<std::sync::Mutex<Option<u64>>>,
+    policy_version_after_mint: Arc<std::sync::Mutex<Option<u64>>>,
+    silent: Arc<std::sync::atomic::AtomicBool>,
+    hold: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+    drop_holds_after: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+    revocation_requests: Arc<std::sync::atomic::AtomicUsize>,
+    unheld_requests: Arc<std::sync::atomic::AtomicUsize>,
+    mint_refusal: Arc<std::sync::Mutex<Option<u16>>>,
+    generation: tokio::sync::watch::Sender<u64>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -227,6 +250,55 @@ impl FakeControl {
         *self.mint_environment.lock().unwrap() = environment.to_string();
     }
 
+    pub fn set_policy_version(&self, version: Option<u64>) {
+        *self.policy_version.lock().unwrap() = version;
+        self.bump();
+    }
+
+    // One shot: the next mint answers with the current version, then the version becomes
+    // `version`, with no wake, as a policy edit that lands between a mint and the next read.
+    pub fn set_policy_version_after_mint(&self, version: Option<u64>) {
+        *self.policy_version_after_mint.lock().unwrap() = version;
+    }
+
+    // Enrolment still answers; every mint and revocations request then waits forever.
+    pub fn set_silent(&self, silent: bool) {
+        self.silent
+            .store(silent, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_hold(&self, hold: Option<std::time::Duration>) {
+        *self.hold.lock().unwrap() = hold;
+        self.bump();
+    }
+
+    pub fn drop_holds_after(&self, after: Option<std::time::Duration>) {
+        *self.drop_holds_after.lock().unwrap() = after;
+        self.bump();
+    }
+
+    pub fn set_mint_refusal(&self, status: Option<u16>) {
+        *self.mint_refusal.lock().unwrap() = status;
+        self.bump();
+    }
+
+    // Revocations requests sent without a cursor: the startup read, and any request the
+    // control plane answers at once whatever has changed.
+    pub fn unheld_requests(&self) -> usize {
+        self.unheld_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn revocation_requests(&self) -> usize {
+        self.revocation_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn bump(&self) {
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     pub fn user_agents(&self) -> Vec<String> {
         self.user_agents.lock().unwrap().clone()
     }
@@ -250,6 +322,20 @@ impl FakeControl {
         let mint_access = Arc::new(std::sync::Mutex::new(zs_policy::Access::ReadWrite));
         let mint_environment: Arc<std::sync::Mutex<String>> =
             Arc::new(std::sync::Mutex::new("development".to_string()));
+        let policy_version: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let policy_version_after_mint: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let silent: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let hold: Arc<std::sync::Mutex<Option<std::time::Duration>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let drop_holds_after: Arc<std::sync::Mutex<Option<std::time::Duration>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let revocation_requests: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let unheld_requests: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let mint_refusal: Arc<std::sync::Mutex<Option<u16>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let (generation, _) = tokio::sync::watch::channel(0u64);
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
@@ -293,9 +379,17 @@ impl FakeControl {
             let version = mint_version.clone();
             let access = mint_access.clone();
             let environment = mint_environment.clone();
+            let policy = policy_version.clone();
+            let policy_after = policy_version_after_mint.clone();
+            let refusal = mint_refusal.clone();
+            let silent = silent.clone();
             move |headers: axum::http::HeaderMap,
                   axum::Json(request): axum::Json<serde_json::Value>| async move {
                 use std::sync::atomic::Ordering;
+                if silent.load(Ordering::SeqCst) {
+                    grant_calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
                 if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
                     agents
                         .lock()
@@ -310,6 +404,13 @@ impl FakeControl {
                 if answered > 1 && matches!(&*grant.lock().unwrap(), FakeGrant::ShortThenHang) {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "slow renewal")
+                        .into_response();
+                }
+                if let Some(status) = *refusal.lock().unwrap() {
+                    return (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        "mint refused",
+                    )
                         .into_response();
                 }
                 let (host, protocol, forged, connection) = match &*grant.lock().unwrap() {
@@ -402,9 +503,18 @@ impl FakeControl {
                         })
                         .unwrap()
                 };
+                let evaluated = {
+                    let mut current = policy.lock().unwrap();
+                    let evaluated = *current;
+                    if let Some(next) = policy_after.lock().unwrap().take() {
+                        *current = Some(next);
+                    }
+                    evaluated
+                };
                 axum::Json(zs_wire::GrantMintResponse {
                     signed_grant_json: serde_json::to_string(&signed).unwrap(),
                     identity_token,
+                    policy_version: evaluated,
                 })
                 .into_response()
             }
@@ -418,20 +528,72 @@ impl FakeControl {
                     let revoked = revoked.clone();
                     let agents = user_agents.clone();
                     let keys = key_set.clone();
-                    move |headers: axum::http::HeaderMap| {
-                        let revoked = revoked.lock().unwrap().clone();
-                        if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
-                            agents
-                                .lock()
-                                .unwrap()
-                                .push(value.to_str().unwrap_or_default().to_string());
-                        }
+                    let version = policy_version.clone();
+                    let hold = hold.clone();
+                    let dropped = drop_holds_after.clone();
+                    let requests = revocation_requests.clone();
+                    let unheld = unheld_requests.clone();
+                    let generation = generation.clone();
+                    let silent = silent.clone();
+                    move |headers: axum::http::HeaderMap,
+                          axum::extract::Query(params): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| {
+                        let (revoked, agents, keys) =
+                            (revoked.clone(), agents.clone(), keys.clone());
+                        let (version, hold, dropped) =
+                            (version.clone(), hold.clone(), dropped.clone());
+                        let (requests, generation) = (requests.clone(), generation.clone());
+                        let unheld = unheld.clone();
+                        let silent = silent.clone();
                         async move {
+                            let mut wake = generation.subscribe();
+                            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if !params.contains_key("after") {
+                                unheld.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if silent.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::future::pending::<()>().await;
+                            }
+                            if let Some(value) = headers.get(axum::http::header::USER_AGENT) {
+                                agents
+                                    .lock()
+                                    .unwrap()
+                                    .push(value.to_str().unwrap_or_default().to_string());
+                            }
+                            let hold = *hold.lock().unwrap();
+                            // As the real control plane: a cursor that is not the current one
+                            // is answered at once.
+                            let current = format!(
+                                "{}.{}.0",
+                                version.lock().unwrap().unwrap_or(0),
+                                revoked.lock().unwrap().len()
+                            );
+                            let current_cursor =
+                                params.get("after").is_some_and(|after| *after == current);
+                            if let Some(held) = hold.filter(|_| current_cursor) {
+                                let dropped = *dropped.lock().unwrap();
+                                if let Some(after) = dropped {
+                                    tokio::time::sleep(after).await;
+                                    return cut_connection();
+                                }
+                                tokio::select! {
+                                    _ = tokio::time::sleep(held) => {}
+                                    _ = wake.changed() => {}
+                                }
+                            }
+                            let version = *version.lock().unwrap();
+                            let revoked = revoked.lock().unwrap().clone();
+                            let cursor = hold
+                                .map(|_| format!("{}.{}.0", version.unwrap_or(0), revoked.len()));
                             axum::Json(zs_wire::RevocationsResponse {
                                 revoked_grant_ids: revoked,
                                 grant_verifying_keys: keys.lock().unwrap().clone(),
                                 control_ca_pems: Vec::new(),
+                                policy_version: version,
+                                cursor,
                             })
+                            .into_response()
                         }
                     }
                 }),
@@ -452,6 +614,15 @@ impl FakeControl {
             mint_version,
             mint_access,
             mint_environment,
+            policy_version,
+            policy_version_after_mint,
+            silent,
+            hold,
+            drop_holds_after,
+            revocation_requests,
+            unheld_requests,
+            mint_refusal,
+            generation,
             _runtime: runtime,
         }
     }
@@ -484,7 +655,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly one hundred and thirty-three.
+/// exactly one hundred and thirty-seven.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -508,8 +679,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        133,
-        "SECURITY §7 must have one hundred and thirty-three rows; found {}:\n{}",
+        137,
+        "SECURITY §7 must have one hundred and thirty-seven rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

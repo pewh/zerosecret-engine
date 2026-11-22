@@ -428,6 +428,7 @@ pub(crate) async fn relay<C, U>(
     injection: Option<(Arc<dyn Protocol>, Credential)>,
     on_inject: &(dyn Fn() -> bool + Send + Sync),
     revalidate: &(dyn Fn() -> bool + Send + Sync),
+    wake: Option<tokio::sync::watch::Receiver<u64>>,
 ) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -439,13 +440,27 @@ where
     let (client_r, mut client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
     let mid_frame = AtomicBool::new(false);
-    let refused = async {
+    let refused = async move {
         if !injecting {
             return std::future::pending().await;
         }
+        let mut wake = wake;
         let mut every = tokio::time::interval(REVALIDATE_EVERY);
         loop {
-            every.tick().await;
+            tokio::select! {
+                _ = every.tick() => {}
+                changed = async {
+                    match wake.as_mut() {
+                        Some(wake) => wake.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        wake = None;
+                        continue;
+                    }
+                }
+            }
             if !revalidate() {
                 return;
             }
@@ -874,7 +889,15 @@ mod tests {
         let (client, mut workload) = tokio::io::duplex(1 << 16);
         let (upstream, _server) = tokio::io::duplex(1 << 16);
         let started = tokio::time::Instant::now();
-        let ended = relay(client, upstream, injection(), &|| true, &allows_once()).await;
+        let ended = relay(
+            client,
+            upstream,
+            injection(),
+            &|| true,
+            &allows_once(),
+            None,
+        )
+        .await;
         assert_eq!(ended, Ended::Revoked);
         let elapsed = started.elapsed();
         assert!(
@@ -892,13 +915,47 @@ mod tests {
         let (upstream, _server) = tokio::io::duplex(1 << 16);
         let uninjected = tokio::time::timeout(
             REVALIDATE_EVERY * 3,
-            relay(client, upstream, None, &|| true, &|| false),
+            relay(client, upstream, None, &|| true, &|| false, None),
         )
         .await;
         assert!(
             uninjected.is_err(),
             "a session without a credential is not revalidated"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_ends_a_revoked_relay_before_the_tick() {
+        let (client, mut workload) = tokio::io::duplex(1 << 16);
+        let (upstream, _server) = tokio::io::duplex(1 << 16);
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let wake = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = tx.send(1);
+        });
+        let started = std::time::Instant::now();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            relay(
+                client,
+                upstream,
+                injection(),
+                &|| true,
+                &allows_once(),
+                Some(rx),
+            ),
+        )
+        .await
+        .expect("the relay waited for the tick instead of the wake");
+        let elapsed = started.elapsed();
+        assert_eq!(ended, Ended::Revoked);
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        let close = read_frame(&mut workload).await.unwrap().unwrap();
+        assert_eq!(
+            (close.opcode, close.payload.as_slice()),
+            (0x8, &1008u16.to_be_bytes()[..])
+        );
+        wake.await.unwrap();
     }
 
     #[tokio::test]
@@ -910,7 +967,7 @@ mod tests {
         server.write_all(&message).await.unwrap();
         let relayed = tokio::spawn(async move {
             let revalidate = allows_once();
-            relay(client, upstream, injection(), &|| true, &revalidate).await
+            relay(client, upstream, injection(), &|| true, &revalidate, None).await
         });
         tokio::time::sleep(REVALIDATE_EVERY + std::time::Duration::from_millis(1)).await;
         let mut out = Vec::new();

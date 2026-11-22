@@ -57,6 +57,22 @@
         "accepted": true,
         "reserialized": "{\"revoked_grant_ids\":[\"g-0123456789abcdef0123456789abcdef\",\"g-1\"],\"control_ca_pems\":[\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\",\"-----BEGIN CERTIFICATE-----\\nMIIC\\n-----END CERTIFICATE-----\\n\"]}"
       }
+    },
+    {
+      "name": "version_and_cursor_round_trip",
+      "input": "{\"revoked_grant_ids\":[],\"policy_version\":8,\"cursor\":\"8.0.0\"}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"revoked_grant_ids\":[],\"policy_version\":8,\"cursor\":\"8.0.0\"}"
+      }
+    },
+    {
+      "name": "absent_version_and_cursor_round_trip",
+      "input": "{\"revoked_grant_ids\":[]}",
+      "expect": {
+        "accepted": true,
+        "reserialized": "{\"revoked_grant_ids\":[]}"
+      }
     }
   ]
 }

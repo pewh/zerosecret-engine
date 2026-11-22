@@ -250,7 +250,7 @@ fn a_refused_ca_set_keeps_the_working_client() {
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("the client still reaches the control plane after a refused set");
 }
 
@@ -297,7 +297,7 @@ fn a_new_device_ca_is_trusted_before_it_signs() {
     let client = tls_client(&wire.url, &first.certificate_pem(), None);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let response = runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("positive control: the pinned CA is trusted");
     assert_eq!(response.control_ca_pems.len(), 2);
     client
@@ -306,7 +306,7 @@ fn a_new_device_ca_is_trusted_before_it_signs() {
 
     wire.set_leaf(&second);
     runtime
-        .block_on(client.fetch_revocations())
+        .block_on(client.fetch_revocations(None))
         .expect("a published CA is trusted before it signs");
 }
 

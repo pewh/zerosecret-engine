@@ -49,7 +49,7 @@ async fn wire_client_times_out_a_silent_control_plane() {
     let client = WireClient::from_identity(&pem, &enrolment, &secrets).unwrap();
 
     let start = Instant::now();
-    let error = client.fetch_revocations().await.unwrap_err();
+    let error = client.fetch_revocations(None).await.unwrap_err();
     assert!(start.elapsed() < Duration::from_secs(35));
     assert!(
         matches!(&error, WireError::Transport(text) if text == "timed out"),

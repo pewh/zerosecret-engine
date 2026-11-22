@@ -108,6 +108,8 @@ pub struct GrantMintResponse {
     pub signed_grant_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u64>,
 }
 
 impl std::fmt::Debug for GrantMintResponse {
@@ -118,6 +120,7 @@ impl std::fmt::Debug for GrantMintResponse {
                 "identity_token",
                 &self.identity_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("policy_version", &self.policy_version)
             .finish()
     }
 }
@@ -162,6 +165,10 @@ pub struct RevocationsResponse {
     pub grant_verifying_keys: Vec<VerifyingKeyEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_ca_pems: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[cfg(test)]
