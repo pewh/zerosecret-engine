@@ -7,6 +7,80 @@ Format: context, decision, consequence, what would reverse it.
 
 ---
 
+## ADR-0065 — A database binding can listen on a Unix socket or on a signed network address
+
+**2026-11-22 · Accepted** · owner decision 2026-11-15 (design record in the commercial
+repository); the grant version and the refusal of the unspecified address decided in planning
+2026-11-22 · amends ADR-0052 (the caller check) · extends ADR-0063 (grant version)
+
+A database binding listens on `127.0.0.1` only. A workload whose network is isolated from the
+agent cannot reach it: a container on a Linux bridge network has no route to the host's
+loopback interface. This is the usual case on Linux CI runners and in Linux devcontainers. On
+macOS a container reaches the host's loopback through the virtual machine's network, so the
+problem does not show there. The HTTP proxy is no alternative, because it does not broker a
+database protocol.
+
+**Decision.**
+- **Unix socket (route A, preferred).** A `postgres`, `mysql`, `mongo` or `redis` binding can
+  set `listen_socket_dir`, an absolute path. The agent then serves that binding on a Unix
+  socket in the directory, not on TCP. The socket name is `.s.PGSQL.5432` for PostgreSQL,
+  because libpq makes the name from the port, so a directory holds one PostgreSQL binding. The
+  three other protocols use `<resource>.sock`. The agent makes a missing directory with mode
+  `0700` and the socket with mode `0600`. It refuses the run when the directory is group- or
+  world-writable, has another owner or is a symbolic link, when a live socket has the name, or
+  when a stale socket cannot be removed. It removes a stale socket only after a connect attempt
+  fails, and removes its own socket on exit.
+- **Signed network address (route B).** A binding can set `listen_addr`, one IP address of this
+  host and a port. A loopback address works as `listen_port` does. A non-loopback address needs
+  `listen_allow`, a list of source CIDRs, and the signed grant must carry the same two values.
+  The run is refused for an empty or missing list, `0.0.0.0/0`, `::/0`, the unspecified address
+  (`0.0.0.0`, `::`) and a policy-file value that is not the signed value. A policy file cannot
+  widen exposure by itself.
+- **The caller check of each listener kind.** The check runs before the agent reads a byte.
+
+  | Listener | Check | Boundary |
+  |---|---|---|
+  | TCP on a loopback address | The peer socket lookup of ADR-0052, unchanged | The OS user |
+  | Unix socket | The peer credentials of the socket (`SO_PEERCRED` on Linux, `getpeereid` on macOS) must give the agent's user ID | The OS user, held twice: by the `0600` socket and by the check |
+  | TCP on a non-loopback address | The source address must be inside the signed `listen_allow` | Each process that can send from an allowed address |
+
+  Route B has a weaker boundary than the two others: the OS-user lookup cannot run, because
+  the peer is not a process of this kernel. A refused caller on any listener gets a closed
+  connection, the diag event `caller_refused` with the listener kind, no materialization and no
+  upstream contact. On route B the refusal also writes an audit denial with the source address.
+  This changes ADR-0052, where a caller refusal wrote no audit record.
+- **What is signed.** `listen_addr` and `listen_allow` are grant fields. They enter the
+  canonical payload only when the grant has `listen_addr`, with `listen_allow` sorted. Such a
+  grant is version 3, read-write or read-only. The agent accepts version 1 with `read_write` and
+  no listener fields, version 2 with `read_only` and no listener fields, and version 3 with
+  `listen_addr`. Every grant that exists today keeps its bytes and its signature. An agent that
+  does not know the fields makes the payload without them, the signature does not verify, and
+  the agent refuses the grant. `listen_socket_dir` is not signed: a Unix socket does not widen
+  who can reach the listener, and the control plane cannot know a local path.
+- **Audit.** The audit record gets one optional field, `source_addr`. It is written, and enters
+  the hash chain, only for a connection on a non-loopback listener. A record of a loopback or
+  Unix-socket listener keeps its bytes, so an existing journal still verifies.
+- **Not encrypted.** The leg from the client to the agent stays plaintext, as on loopback. On
+  route B it crosses a network of the host, such as a container bridge. The client holds no
+  credential, so no credential crosses it; the query data does. Route B is for the networks of
+  one host, not for another host.
+- **Windows.** `listen_socket_dir` and a non-loopback `listen_addr` refuse the run on Windows,
+  where database listeners have no caller check (ADR-0052).
+
+**Consequence.** A devcontainer that shares a directory with the host reaches a brokered
+database with the same boundary as loopback. A CI job on a bridge network reaches it through an
+address that an admin signed, and the audit journal names each source. An agent older than this
+entry refuses a policy file with the new fields and refuses a version-3 grant. Each new refusal
+is a row in [SECURITY.md §7](SECURITY.md#7-fail-closed-matrix), and
+[SECURITY.md §3](SECURITY.md#3-what-zerosecret-does-not-defend-against) states the route-B
+boundary and the plaintext leg.
+
+**Reverse it if** a supported deployment shows that a source-address boundary is too weak for
+route B, for example a bridge network that other tenants share. Then route B leaves in a later
+grant version, and such a workload uses route A.
+
+---
+
 ## ADR-0064 — Policy changes and revocations reach the agent by long poll
 
 **2026-11-21 · Accepted** · owner decision 2026-11-21 (design record in the commercial
