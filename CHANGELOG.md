@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-23
+
 ### Security
 
 - A `postgres`, `mysql`, `mongo` or `redis` binding can listen on a Unix socket or on a signed

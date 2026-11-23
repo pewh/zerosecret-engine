@@ -76,7 +76,7 @@ targets are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-ap
 `x86_64-apple-darwin` and `x86_64-pc-windows-msvc`.
 
 ```bash
-version=0.8.0
+version=0.9.0
 target=x86_64-unknown-linux-gnu
 repo=pewh/zerosecret-engine
 gh release download "v$version" --repo "$repo" \
