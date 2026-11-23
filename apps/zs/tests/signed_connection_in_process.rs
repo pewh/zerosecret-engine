@@ -51,6 +51,8 @@ fn connection(host: &str, port: u16, tls: UpstreamTlsMode, local: bool) -> Resol
         upstream_port: port,
         upstream_tls: tls,
         local_endpoint: local,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     }
 }
 
@@ -77,7 +79,13 @@ fn grant_for(host: &str, protocol: &str, connection: ResolvedConnection) -> Gran
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
         access: zs_policy::Access::ReadWrite,
-        version: zs_grant::GRANT_VERSION,
+        version: if connection.listen_addr.is_some() {
+            zs_grant::GRANT_VERSION_LISTEN
+        } else {
+            zs_grant::GRANT_VERSION
+        },
+        listen_addr: connection.listen_addr,
+        listen_allow: connection.listen_allow,
     }
 }
 
@@ -916,4 +924,249 @@ fn a_connect_to_an_unsigned_port_is_denied() {
         reason.contains("port 8080 is not the signed port 80"),
         "{reason}"
     );
+}
+
+fn listening(addr: Option<&str>, allow: &[&str]) -> ResolvedConnection {
+    ResolvedConnection {
+        listen_addr: addr.map(str::to_string),
+        listen_allow: allow.iter().map(|entry| entry.to_string()).collect(),
+        ..connection(PG_HOST, 5432, UpstreamTlsMode::Default, false)
+    }
+}
+
+fn pg_file(extra: Value) -> ResourceBinding {
+    let mut file = json!({"host": PG_HOST, "protocol": "postgres"});
+    for (key, value) in extra.as_object().unwrap() {
+        file[key] = value.clone();
+    }
+    binding(file)
+}
+
+const BRIDGE: &str = "172.17.0.1:5433";
+
+#[test]
+fn a_non_loopback_listen_addr_that_the_grant_does_not_have_is_refused() {
+    let grant = signed(PG_HOST, "postgres", listening(None, &[]));
+    let mut loopback = pg_file(json!({"listen_addr": "127.0.0.1:6000"}));
+    assert_eq!(
+        reconcile(&mut loopback, &grant),
+        Ok(()),
+        "positive control: a loopback listen_addr is local"
+    );
+    assert_eq!(grant_matches(&grant, &loopback), Ok(()));
+
+    let mut file = pg_file(json!({"listen_addr": BRIDGE, "listen_allow": ["172.17.0.0/16"]}));
+    let before = format!("{file:?}");
+    let mismatch = reconcile(&mut file, &grant).unwrap_err();
+    assert_eq!(
+        mismatch.startup_line("r"),
+        field_line("r", "listen_addr", BRIDGE, "none")
+    );
+    assert_eq!(mismatch.deny_reason(), "listen_addr differs from the grant");
+    assert_eq!(format!("{file:?}"), before);
+}
+
+#[test]
+fn a_loopback_listen_addr_is_refused_when_the_grant_has_a_non_loopback_one() {
+    let grant = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16"]),
+    );
+    let mut file = pg_file(json!({"listen_addr": "127.0.0.1:5433"}));
+    assert_eq!(
+        reconcile(&mut file, &grant).map_err(|m| m.startup_line("r")),
+        Err(field_line("r", "listen_addr", "127.0.0.1:5433", BRIDGE))
+    );
+
+    let mut other = pg_file(json!({"listen_addr": "172.17.0.2:5433"}));
+    assert_eq!(
+        reconcile(&mut other, &grant).map_err(|m| m.startup_line("r")),
+        Err(field_line("r", "listen_addr", "172.17.0.2:5433", BRIDGE))
+    );
+
+    let mut same = pg_file(json!({"listen_addr": BRIDGE}));
+    assert_eq!(
+        reconcile(&mut same, &grant),
+        Ok(()),
+        "negative control: the signed address is accepted"
+    );
+    let mut mapped = pg_file(json!({"listen_addr": "[::ffff:172.17.0.1]:5433"}));
+    assert_eq!(reconcile(&mut mapped, &grant), Ok(()));
+}
+
+#[test]
+fn a_listen_allow_that_differs_from_the_grant_is_refused_as_a_set() {
+    let grant = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16", "10.0.0.0/8"]),
+    );
+    let mut reordered = pg_file(json!({
+        "listen_addr": BRIDGE,
+        "listen_allow": ["10.0.0.0/8", "172.17.0.0/16"],
+    }));
+    assert_eq!(
+        reconcile(&mut reordered, &grant),
+        Ok(()),
+        "positive control: the same set in another order"
+    );
+    assert_eq!(grant_matches(&grant, &reordered), Ok(()));
+
+    for allow in [
+        json!(["172.17.0.0/16"]),
+        json!(["172.17.0.0/16", "10.0.0.0/8", "192.168.0.0/16"]),
+        json!(["172.17.0.0/16", "11.0.0.0/8"]),
+    ] {
+        let mut file = pg_file(json!({"listen_addr": BRIDGE, "listen_allow": allow}));
+        let mismatch = reconcile(&mut file, &grant).unwrap_err();
+        assert!(
+            mismatch
+                .startup_line("r")
+                .starts_with("zs: r: listen_allow is "),
+            "{allow}"
+        );
+        assert_eq!(
+            mismatch.deny_reason(),
+            "listen_allow differs from the grant"
+        );
+    }
+
+    let open_grant = signed(PG_HOST, "postgres", listening(None, &[]));
+    let mut file = pg_file(json!({"listen_allow": ["10.0.0.0/8"]}));
+    assert!(matches!(
+        reconcile(&mut file, &open_grant),
+        Err(Mismatch::Field {
+            field: "listen_allow",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_grant_with_the_listener_fields_fills_a_file_without_them() {
+    let grant = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16", "10.0.0.0/8"]),
+    );
+    let mut file = pg_file(json!({}));
+    assert_eq!(reconcile(&mut file, &grant), Ok(()));
+    assert_eq!(file.listen_addr.as_deref(), Some(BRIDGE));
+    assert_eq!(file.listen_allow, ["172.17.0.0/16", "10.0.0.0/8"]);
+    match file.listen().unwrap() {
+        zs::Listen::Network { addr, allow } => {
+            assert_eq!(addr, BRIDGE.parse().unwrap());
+            assert_eq!(allow.len(), 2);
+        }
+        other => panic!("expected a network listener, got {other:?}"),
+    }
+    assert_eq!(grant_matches(&grant, &file), Ok(()));
+    assert_eq!(
+        file.connection().unwrap().listen_addr.as_deref(),
+        Some(BRIDGE)
+    );
+
+    let mut plain = pg_file(json!({}));
+    reconcile(
+        &mut plain,
+        &signed(PG_HOST, "postgres", listening(None, &[])),
+    )
+    .unwrap();
+    assert_eq!(plain.listen_addr, None);
+    assert!(plain.listen_allow.is_empty());
+}
+
+#[test]
+fn a_filled_in_listen_addr_is_validated_against_the_rest_of_the_file() {
+    let grant = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16"]),
+    );
+    let mut ok = pg_file(json!({}));
+    assert_eq!(reconcile(&mut ok, &grant), Ok(()), "positive control");
+
+    let mut port = pg_file(json!({"listen_port": 5440}));
+    let mismatch = reconcile(&mut port, &grant).unwrap_err();
+    assert_eq!(
+        mismatch.startup_line("r"),
+        "zs: r: listen_addr cannot be set with listen_port or listen_socket_dir"
+    );
+    assert_eq!(
+        mismatch.deny_reason(),
+        "r: listen_addr cannot be set with listen_port or listen_socket_dir"
+    );
+
+    let mut dir = pg_file(json!({"listen_socket_dir": "/run/zs"}));
+    assert_eq!(
+        reconcile(&mut dir, &grant).map_err(|m| m.startup_line("r")),
+        Err("zs: r: listen_addr cannot be set with listen_port or listen_socket_dir".to_string())
+    );
+
+    let mut https = binding(json!({"host": PG_HOST, "protocol": "https"}));
+    let https_grant = signed(
+        PG_HOST,
+        "https",
+        ResolvedConnection {
+            listen_addr: Some(BRIDGE.into()),
+            listen_allow: vec!["172.17.0.0/16".into()],
+            ..connection(PG_HOST, 443, UpstreamTlsMode::Default, false)
+        },
+    );
+    assert!(reconcile(&mut https, &https_grant).is_err());
+}
+
+#[test]
+fn a_renewal_with_other_listener_fields_than_the_running_binding_is_a_mismatch() {
+    let grant = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16"]),
+    );
+    let mut running = pg_file(json!({}));
+    reconcile(&mut running, &grant).unwrap();
+    assert_eq!(grant_matches(&grant, &running), Ok(()));
+
+    let moved = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some("172.17.0.9:5433"), &["172.17.0.0/16"]),
+    );
+    let mismatch = grant_matches(&moved, &running).unwrap_err();
+    assert_eq!(
+        mismatch.renewal_line("r"),
+        format!(
+            "zs: r: the control plane changed listen_addr (signed 172.17.0.9:5433, running {BRIDGE}); restart zs run to use it"
+        )
+    );
+
+    let widened = signed(
+        PG_HOST,
+        "postgres",
+        listening(Some(BRIDGE), &["172.17.0.0/16", "10.0.0.0/8"]),
+    );
+    assert!(matches!(
+        grant_matches(&widened, &running),
+        Err(Mismatch::Field {
+            field: "listen_allow",
+            ..
+        })
+    ));
+
+    let gained = signed(PG_HOST, "postgres", listening(None, &[]));
+    assert_eq!(
+        grant_matches(&gained, &running).map_err(|m| m.deny_reason()),
+        Err("listen_addr differs from the grant".to_string()),
+        "a running network listener against a grant without one"
+    );
+
+    let bare = pg_file(json!({}));
+    assert!(matches!(
+        grant_matches(&grant, &bare),
+        Err(Mismatch::Field {
+            field: "listen_addr",
+            ..
+        })
+    ));
 }

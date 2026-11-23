@@ -74,6 +74,8 @@ fn workspace(https_mode: zs_policy::Materialization) -> tempfile::TempDir {
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    listen_addr: connection.listen_addr.clone(),
+                    listen_allow: connection.listen_allow.clone(),
                     access: zs_policy::Access::ReadWrite,
                     version: zs_grant::GRANT_VERSION,
                 })
@@ -275,6 +277,8 @@ fn protocol_case_and_near_misses_are_classified_by_one_allowlist() {
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    listen_addr: connection.listen_addr.clone(),
+                    listen_allow: connection.listen_allow.clone(),
                     access: zs_policy::Access::ReadWrite,
                     version: zs_grant::GRANT_VERSION,
                 })
@@ -378,6 +382,8 @@ fn resources_prints_read_only_guardrail_label() {
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    listen_addr: connection.listen_addr.clone(),
+                    listen_allow: connection.listen_allow.clone(),
                     access,
                     version,
                 })

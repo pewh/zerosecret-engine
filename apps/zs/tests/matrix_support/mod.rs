@@ -45,6 +45,8 @@ pub fn grant(expires_at_ms: u64, grant_id: &str) -> Grant {
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        listen_addr: connection.listen_addr.clone(),
+        listen_allow: connection.listen_allow.clone(),
         access: zs_policy::Access::ReadWrite,
         version: zs_grant::GRANT_VERSION,
     }
@@ -477,6 +479,8 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
+                            listen_addr: connection.listen_addr.clone(),
+                            listen_allow: connection.listen_allow.clone(),
                             access: *access.lock().unwrap(),
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })
@@ -501,6 +505,8 @@ impl FakeControl {
                             upstream_port: connection.upstream_port,
                             upstream_tls: connection.upstream_tls,
                             local_endpoint: connection.local_endpoint,
+                            listen_addr: connection.listen_addr.clone(),
+                            listen_allow: connection.listen_allow.clone(),
                             access: *access.lock().unwrap(),
                             version: version.load(std::sync::atomic::Ordering::SeqCst),
                         })

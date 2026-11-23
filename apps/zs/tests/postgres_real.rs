@@ -116,6 +116,8 @@ fn workspace_for(host: &str, port: u16) -> common::TestHome {
         upstream_port: port,
         upstream_tls: zs_policy::UpstreamTlsMode::Default,
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     };
     let grant = serde_json::to_string(
         &signing
@@ -135,6 +137,8 @@ fn workspace_for(host: &str, port: u16) -> common::TestHome {
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                listen_addr: connection.listen_addr.clone(),
+                listen_allow: connection.listen_allow.clone(),
                 access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })

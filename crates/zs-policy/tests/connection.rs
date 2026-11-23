@@ -81,6 +81,47 @@ fn tls_mode_round_trips_its_string_form() {
 }
 
 #[test]
+fn the_listener_fields_leave_today_s_policy_json_unchanged() {
+    assert!(Connection::default().is_default());
+    let plain = Connection {
+        upstream_port: Some(8443),
+        ..Connection::default()
+    };
+    assert_eq!(
+        serde_json::to_string(&plain).unwrap(),
+        r#"{"upstream_host":null,"upstream_port":8443,"upstream_tls":"default","local_endpoint":false}"#
+    );
+    let parsed: Connection = serde_json::from_str(r#"{"upstream_port":8443}"#).unwrap();
+    assert_eq!(parsed, plain);
+    assert_eq!(parsed.listen_addr, None);
+    assert!(parsed.listen_allow.is_empty());
+
+    let listening = Connection {
+        listen_addr: Some("172.17.0.1:5433".to_string()),
+        listen_allow: vec!["172.17.0.0/16".to_string()],
+        ..Connection::default()
+    };
+    assert!(!listening.is_default());
+    let json = serde_json::to_value(&listening).unwrap();
+    assert_eq!(json["listen_addr"], "172.17.0.1:5433");
+    assert_eq!(json["listen_allow"], serde_json::json!(["172.17.0.0/16"]));
+    let back: Connection = serde_json::from_value(json).unwrap();
+    assert_eq!(back, listening);
+    let allow_only = Connection {
+        listen_allow: vec!["10.0.0.0/8".to_string()],
+        ..Connection::default()
+    };
+    assert!(!allow_only.is_default());
+
+    let resolved = listening.resolve("db.x", "postgres").unwrap();
+    assert_eq!(resolved.listen_addr.as_deref(), Some("172.17.0.1:5433"));
+    assert_eq!(resolved.listen_allow, vec!["172.17.0.0/16".to_string()]);
+    let none = Connection::default().resolve("db.x", "postgres").unwrap();
+    assert_eq!(none.listen_addr, None);
+    assert!(none.listen_allow.is_empty());
+}
+
+#[test]
 fn an_old_resource_without_connection_reads_as_default() {
     let json = r#"{"name":"a","host":"h","protocol":"https","operations":["GET"]}"#;
     let resource: ResourcePolicy = serde_json::from_str(json).unwrap();
@@ -114,6 +155,8 @@ fn resolve_fills_protocol_defaults() {
                 upstream_port: port,
                 upstream_tls: UpstreamTlsMode::Default,
                 local_endpoint: false,
+                listen_addr: None,
+                listen_allow: Vec::new(),
             }
         );
     }
@@ -124,6 +167,8 @@ fn resolve_fills_protocol_defaults() {
         upstream_port: Some(8443),
         upstream_tls: UpstreamTlsMode::PinSha256(bytes()),
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     };
     assert_eq!(
         set.resolve("db.x", "postgres").unwrap(),
@@ -132,6 +177,8 @@ fn resolve_fills_protocol_defaults() {
             upstream_port: 8443,
             upstream_tls: UpstreamTlsMode::PinSha256(bytes()),
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
         }
     );
     assert!(
@@ -332,6 +379,8 @@ fn summary_names_only_the_parts_that_are_not_default() {
             upstream_port: Some(59080),
             upstream_tls: UpstreamTlsMode::Plaintext,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
         }
         .summary(),
         "127.0.0.1:59080 plaintext"

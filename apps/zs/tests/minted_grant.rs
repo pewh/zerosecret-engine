@@ -97,6 +97,8 @@ fn signed(key: &ControlSigningKey, grant_id: &str) -> SignedGrant {
         upstream_port: 5432,
         upstream_tls: zs_policy::UpstreamTlsMode::Default,
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
         access: zs_policy::Access::ReadWrite,
         version: zs_grant::GRANT_VERSION,
     })

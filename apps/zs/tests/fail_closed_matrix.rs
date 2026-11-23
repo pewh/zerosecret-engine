@@ -614,6 +614,8 @@ fn signed_for(
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                listen_addr: connection.listen_addr.clone(),
+                listen_allow: connection.listen_allow.clone(),
                 ..signed.grant
             })
             .unwrap()
@@ -3443,6 +3445,8 @@ fn ca_signed(fake: &FakeControl, sha256: [u8; 32]) {
             upstream_port: 5432,
             upstream_tls: zs_policy::UpstreamTlsMode::CaSha256(sha256),
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
         },
     ));
 }
@@ -5099,6 +5103,8 @@ fn peer_setup(
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            listen_addr: connection.listen_addr.clone(),
+            listen_allow: connection.listen_allow.clone(),
             access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })

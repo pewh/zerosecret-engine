@@ -104,6 +104,8 @@ fn verified_for(
             upstream_port: 3306,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
             access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })

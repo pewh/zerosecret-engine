@@ -93,6 +93,8 @@ fn grant_with(
         upstream_port: connection.upstream_port,
         upstream_tls: connection.upstream_tls,
         local_endpoint: connection.local_endpoint,
+        listen_addr: connection.listen_addr.clone(),
+        listen_allow: connection.listen_allow.clone(),
         access: zs_policy::Access::ReadWrite,
         version: zs_grant::GRANT_VERSION,
     }
@@ -372,6 +374,8 @@ async fn the_proxy_does_not_send_an_https_credential_to_a_database_port() {
         upstream_port: port,
         upstream_tls: zs_policy::UpstreamTlsMode::Plaintext,
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     };
     let home = tempfile::tempdir().unwrap();
     let credentials = home.path().join("credentials");

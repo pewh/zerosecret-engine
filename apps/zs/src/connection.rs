@@ -1,7 +1,10 @@
+use std::net::SocketAddr;
+
 use zs_grant::SignedGrant;
 use zs_policy::{ResolvedConnection, UpstreamTlsMode, default_port};
 
 use crate::ResourceBinding;
+use crate::cidr::Cidr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mismatch {
@@ -26,6 +29,7 @@ pub enum Mismatch {
         signed_hex: String,
     },
     Source,
+    Listen(String),
 }
 
 const HOST_MISMATCH: &str = "binding host does not match the grant";
@@ -56,6 +60,7 @@ impl Mismatch {
                 "zs: {resource}: the control plane signed a CA bundle with SHA-256 {signed_hex}; set upstream_ca to that file"
             ),
             Self::Source => format!("zs: {resource}: source changed"),
+            Self::Listen(message) => format!("zs: {message}"),
         }
     }
 
@@ -92,6 +97,7 @@ impl Mismatch {
                 UpstreamTlsMode::Default.to_string(),
             ),
             Self::Source => return format!("zs: {resource}: source changed"),
+            Self::Listen(message) => return format!("zs: {message}"),
         };
         format!(
             "zs: {resource}: the control plane changed {field} (signed {signed}, running {running}); restart zs run to use it"
@@ -104,6 +110,7 @@ impl Mismatch {
             Self::Field { field, .. } => field,
             Self::Tls { .. } | Self::CaHash { .. } | Self::CaMissing { .. } => TLS,
             Self::Source => return "source changed".to_string(),
+            Self::Listen(message) => return message.clone(),
         };
         format!("{field} differs from the grant")
     }
@@ -114,7 +121,8 @@ impl Mismatch {
             Self::Field { .. }
             | Self::Tls { .. }
             | Self::CaHash { .. }
-            | Self::CaMissing { .. } => "connection_mismatch",
+            | Self::CaMissing { .. }
+            | Self::Listen(_) => "connection_mismatch",
             Self::Source => "source_mismatch",
         }
     }
@@ -147,6 +155,8 @@ impl ResourceBinding {
             upstream_port,
             upstream_tls: self.tls_mode()?,
             local_endpoint: self.local_endpoint,
+            listen_addr: self.listen_addr.clone(),
+            listen_allow: self.listen_allow.clone(),
         })
     }
 
@@ -219,6 +229,14 @@ pub fn reconcile(binding: &mut ResourceBinding, signed: &SignedGrant) -> Result<
     if binding.local_endpoint && !wanted.local_endpoint {
         return Err(field("local_endpoint", "true", "false"));
     }
+    if let Some(mismatch) = listen_mismatch(
+        binding.listen_addr.as_deref(),
+        &binding.listen_allow,
+        &wanted,
+        false,
+    ) {
+        return Err(mismatch);
+    }
 
     if binding.upstream_host.is_none() && !wanted.upstream_host.eq_ignore_ascii_case(&binding.host)
     {
@@ -237,7 +255,90 @@ pub fn reconcile(binding: &mut ResourceBinding, signed: &SignedGrant) -> Result<
         _ => {}
     }
     binding.local_endpoint = wanted.local_endpoint;
+    if binding.listen_addr.is_none() && wanted.listen_addr.is_some() {
+        binding.listen_addr = wanted.listen_addr.clone();
+    }
+    if binding.listen_allow.is_empty() && !wanted.listen_allow.is_empty() {
+        binding.listen_allow = wanted.listen_allow.clone();
+    }
+    if wanted.listen_addr.is_some() {
+        binding.listen().map_err(Mismatch::Listen)?;
+    }
     grant_matches(signed, binding)
+}
+
+fn listen_mismatch(
+    file_addr: Option<&str>,
+    file_allow: &[String],
+    wanted: &ResolvedConnection,
+    unset_differs: bool,
+) -> Option<Mismatch> {
+    let signed_addr = wanted.listen_addr.as_deref();
+    match (file_addr, signed_addr) {
+        (Some(file), Some(signed)) if canonical_addr(file) != canonical_addr(signed) => {
+            return Some(field(
+                "listen_addr",
+                &canonical_addr(file),
+                &canonical_addr(signed),
+            ));
+        }
+        (Some(file), None) if !is_loopback_addr(file) => {
+            return Some(field("listen_addr", &canonical_addr(file), "none"));
+        }
+        (None, Some(signed)) if unset_differs => {
+            return Some(field("listen_addr", "none", &canonical_addr(signed)));
+        }
+        _ => {}
+    }
+    if file_allow.is_empty() {
+        if unset_differs && !wanted.listen_allow.is_empty() {
+            return Some(field(
+                "listen_allow",
+                "none",
+                &wanted.listen_allow.join(","),
+            ));
+        }
+    } else if !same_cidrs(file_allow, &wanted.listen_allow) {
+        return Some(field(
+            "listen_allow",
+            &file_allow.join(","),
+            &if wanted.listen_allow.is_empty() {
+                "none".to_string()
+            } else {
+                wanted.listen_allow.join(",")
+            },
+        ));
+    }
+    None
+}
+
+fn parse_addr(text: &str) -> Option<SocketAddr> {
+    text.parse::<SocketAddr>()
+        .ok()
+        .map(|addr| SocketAddr::new(addr.ip().to_canonical(), addr.port()))
+}
+
+fn canonical_addr(text: &str) -> String {
+    parse_addr(text).map_or_else(|| text.to_string(), |addr| addr.to_string())
+}
+
+fn is_loopback_addr(text: &str) -> bool {
+    parse_addr(text).is_some_and(|addr| addr.ip().is_loopback())
+}
+
+fn same_cidrs(left: &[String], right: &[String]) -> bool {
+    let parse = |list: &[String]| {
+        list.iter()
+            .map(|entry| entry.parse::<Cidr>())
+            .collect::<Result<Vec<_>, _>>()
+    };
+    match (parse(left), parse(right)) {
+        (Ok(left), Ok(right)) => {
+            left.iter().all(|cidr| right.contains(cidr))
+                && right.iter().all(|cidr| left.contains(cidr))
+        }
+        _ => false,
+    }
 }
 
 pub fn grant_matches(signed: &SignedGrant, binding: &ResourceBinding) -> Result<(), Mismatch> {
@@ -282,6 +383,14 @@ pub fn grant_matches(signed: &SignedGrant, binding: &ResourceBinding) -> Result<
             &running.local_endpoint.to_string(),
             &wanted.local_endpoint.to_string(),
         ));
+    }
+    if let Some(mismatch) = listen_mismatch(
+        running.listen_addr.as_deref(),
+        &running.listen_allow,
+        &wanted,
+        true,
+    ) {
+        return Err(mismatch);
     }
     Ok(())
 }

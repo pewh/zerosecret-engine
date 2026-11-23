@@ -28,6 +28,8 @@ fn signed(mode: Materialization, credential_ref: &str) -> SignedGrant {
             upstream_port: connection.upstream_port,
             upstream_tls: connection.upstream_tls,
             local_endpoint: connection.local_endpoint,
+            listen_addr: connection.listen_addr.clone(),
+            listen_allow: connection.listen_allow.clone(),
             access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })

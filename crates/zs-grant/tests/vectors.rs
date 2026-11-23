@@ -139,6 +139,10 @@ fn every_zs_grant_vector_matches() {
                 case: signed_grant,
             },
             Runner {
+                file: "grant-listen.json",
+                case: signed_grant,
+            },
+            Runner {
                 file: "grant-refusals.json",
                 case: grant_refusal,
             },

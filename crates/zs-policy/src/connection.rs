@@ -109,6 +109,10 @@ pub struct Connection {
     pub upstream_tls: UpstreamTlsMode,
     #[serde(default)]
     pub local_endpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +121,10 @@ pub struct ResolvedConnection {
     pub upstream_port: u16,
     pub upstream_tls: UpstreamTlsMode,
     pub local_endpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_allow: Vec<String>,
 }
 
 pub fn default_port(protocol: &str) -> Option<u16> {
@@ -237,6 +245,8 @@ impl Connection {
             upstream_port: self.upstream_port.unwrap_or(port),
             upstream_tls: self.upstream_tls,
             local_endpoint: self.local_endpoint,
+            listen_addr: self.listen_addr.clone(),
+            listen_allow: self.listen_allow.clone(),
         })
     }
 }

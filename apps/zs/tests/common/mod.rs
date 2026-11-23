@@ -219,6 +219,8 @@ pub fn uninterceptable_connection(host: &str) -> zs_policy::ResolvedConnection {
         upstream_port: 0,
         upstream_tls: zs_policy::UpstreamTlsMode::Default,
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     }
 }
 
@@ -532,6 +534,8 @@ pub fn loopback_connection(port: u16, plaintext: bool) -> zs_policy::ResolvedCon
             zs_policy::UpstreamTlsMode::Default
         },
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
     }
 }
 
@@ -624,6 +628,8 @@ fn write_local_setup(
                 upstream_port: connection.upstream_port,
                 upstream_tls: connection.upstream_tls,
                 local_endpoint: connection.local_endpoint,
+                listen_addr: connection.listen_addr.clone(),
+                listen_allow: connection.listen_allow.clone(),
                 access: zs_policy::Access::ReadWrite,
                 version: zs_grant::GRANT_VERSION,
             })
@@ -1347,6 +1353,8 @@ pub fn write_postgres_setup_signing(
                     upstream_port: connection.upstream_port,
                     upstream_tls: connection.upstream_tls,
                     local_endpoint: connection.local_endpoint,
+                    listen_addr: connection.listen_addr.clone(),
+                    listen_allow: connection.listen_allow.clone(),
                     access: zs_policy::Access::ReadWrite,
                     version: zs_grant::GRANT_VERSION,
                 })

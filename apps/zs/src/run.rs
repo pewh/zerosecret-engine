@@ -2217,6 +2217,8 @@ mod tests {
             upstream_port: port,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
             access,
             version,
         })

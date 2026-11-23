@@ -7,6 +7,7 @@ use zs_policy::CredentialSource;
 
 pub const GRANT_VERSION: u32 = 1;
 pub const GRANT_VERSION_ACCESS: u32 = 2;
+pub const GRANT_VERSION_LISTEN: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum GrantError {
@@ -59,6 +60,12 @@ pub fn canonical_payload(grant: &Grant) -> Vec<u8> {
     field("expires_at_ms", &grant.expires_at_ms.to_string());
     field("grant_id", &grant.grant_id);
     field("host", &grant.host);
+    if let Some(listen_addr) = &grant.listen_addr {
+        field("listen_addr", listen_addr);
+        let mut listen_allow = grant.listen_allow.clone();
+        listen_allow.sort();
+        field("listen_allow", &listen_allow.join("\u{1d}"));
+    }
     field(
         "local_endpoint",
         if grant.local_endpoint {
@@ -127,6 +134,22 @@ fn reject_separators(grant: &Grant) -> Result<(), GrantError> {
             field: "operations",
         });
     }
+    if let Some(listen_addr) = &grant.listen_addr
+        && listen_addr.contains(FORBIDDEN_ANYWHERE)
+    {
+        return Err(GrantError::Unsignable {
+            field: "listen_addr",
+        });
+    }
+    if grant
+        .listen_allow
+        .iter()
+        .any(|entry| entry.contains(FORBIDDEN_IN_OPERATIONS))
+    {
+        return Err(GrantError::Unsignable {
+            field: "listen_allow",
+        });
+    }
     Ok(())
 }
 
@@ -150,6 +173,8 @@ pub struct Grant {
     pub upstream_port: u16,
     pub upstream_tls: zs_policy::UpstreamTlsMode,
     pub local_endpoint: bool,
+    pub listen_addr: Option<String>,
+    pub listen_allow: Vec<String>,
     pub access: zs_policy::Access,
     pub version: u32,
 }
@@ -182,6 +207,10 @@ struct GrantWire {
     local_endpoint: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access: Option<zs_policy::Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    listen_allow: Vec<String>,
 }
 
 fn default_grant_version() -> u32 {
@@ -220,6 +249,8 @@ impl From<Grant> for GrantWire {
                 zs_policy::Access::ReadWrite => None,
                 access => Some(access),
             },
+            listen_addr: grant.listen_addr,
+            listen_allow: grant.listen_allow,
         }
     }
 }
@@ -258,6 +289,8 @@ impl TryFrom<GrantWire> for Grant {
                 wire.version
             },
             local_endpoint: wire.local_endpoint,
+            listen_addr: wire.listen_addr,
+            listen_allow: wire.listen_allow,
             access: wire.access.unwrap_or_default(),
         })
     }
@@ -270,6 +303,8 @@ impl Grant {
             upstream_port: self.upstream_port,
             upstream_tls: self.upstream_tls,
             local_endpoint: self.local_endpoint,
+            listen_addr: self.listen_addr.clone(),
+            listen_allow: self.listen_allow.clone(),
         }
     }
 }
@@ -374,9 +409,12 @@ impl AgentVerifier {
         let signature = Signature::from_bytes(&bytes);
         key.verify(&payload, &signature)
             .map_err(|_| GrantError::SignatureInvalid)?;
+        let has_listener = signed.grant.listen_addr.is_some();
         match (signed.grant.version, signed.grant.access) {
             (GRANT_VERSION, zs_policy::Access::ReadWrite)
-            | (GRANT_VERSION_ACCESS, zs_policy::Access::ReadOnly) => {}
+            | (GRANT_VERSION_ACCESS, zs_policy::Access::ReadOnly)
+                if !has_listener && signed.grant.listen_allow.is_empty() => {}
+            (GRANT_VERSION_LISTEN, _) if has_listener => {}
             _ => return Err(GrantError::UnsupportedVersion),
         }
         if let Some(environment) = context.environment
@@ -463,6 +501,8 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
             access: zs_policy::Access::ReadWrite,
             version: GRANT_VERSION,
         }
@@ -809,6 +849,8 @@ mod tests {
             upstream_port: 443,
             upstream_tls: zs_policy::UpstreamTlsMode::Default,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
             access: zs_policy::Access::ReadWrite,
             version: GRANT_VERSION,
         }
@@ -1269,6 +1311,270 @@ mod tests {
         let mut numeric = value;
         numeric["access"] = serde_json::json!(1);
         assert!(serde_json::from_value::<Grant>(numeric).is_err());
+    }
+
+    fn listen_grant(access: zs_policy::Access) -> Grant {
+        let mut grant = golden_grant();
+        grant.access = access;
+        grant.version = GRANT_VERSION_LISTEN;
+        grant.listen_addr = Some("172.17.0.1:5433".into());
+        grant.listen_allow = vec!["172.17.0.0/16".into(), "10.0.0.0/8".into()];
+        grant
+    }
+
+    fn listen_vector_case(index: usize) -> serde_json::Value {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../vectors/grant-listen.json")).unwrap();
+        vector["cases"][index].clone()
+    }
+
+    #[test]
+    fn a_listen_grant_is_version_three_and_signs_the_fields_between_host_and_local_endpoint() {
+        for access in [zs_policy::Access::ReadWrite, zs_policy::Access::ReadOnly] {
+            let grant = listen_grant(access);
+            let payload = String::from_utf8(canonical_payload(&grant)).unwrap();
+            assert!(payload.contains(
+                "host\u{1f}api.stripe.com\u{1e}listen_addr\u{1f}172.17.0.1:5433\u{1e}listen_allow\u{1f}10.0.0.0/8\u{1d}172.17.0.0/16\u{1e}local_endpoint\u{1f}"
+            ));
+            assert!(payload.contains("version\u{1f}3\u{1e}"));
+            assert_eq!(
+                payload.starts_with("access\u{1f}read_only\u{1e}"),
+                access == zs_policy::Access::ReadOnly
+            );
+            let keys: Vec<&str> = payload
+                .split('\u{1e}')
+                .filter(|record| !record.is_empty())
+                .map(|record| record.split('\u{1f}').next().unwrap())
+                .collect();
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            assert_eq!(keys, sorted);
+
+            let control = ControlSigningKey::generate("k1");
+            let signed = control.sign(grant).unwrap();
+            let verified = verifier_for(&control)
+                .verify(&signed, 0, &ctx("stripe-production", "GET"))
+                .unwrap();
+            assert_eq!(verified.grant().version, GRANT_VERSION_LISTEN);
+            assert_eq!(verified.grant().access, access);
+            assert_eq!(
+                verified.grant().listen_addr.as_deref(),
+                Some("172.17.0.1:5433")
+            );
+        }
+    }
+
+    #[test]
+    fn listen_allow_order_does_not_change_the_payload_and_an_empty_list_is_still_written() {
+        let grant = listen_grant(zs_policy::Access::ReadWrite);
+        let mut reversed = grant.clone();
+        reversed.listen_allow.reverse();
+        assert_eq!(canonical_payload(&grant), canonical_payload(&reversed));
+
+        let mut empty = grant;
+        empty.listen_addr = Some("127.0.0.1:5433".into());
+        empty.listen_allow.clear();
+        let payload = String::from_utf8(canonical_payload(&empty)).unwrap();
+        assert!(payload.contains("listen_allow\u{1f}\u{1e}"));
+    }
+
+    #[test]
+    fn a_grant_without_listen_addr_signs_no_listener_field() {
+        let payload = String::from_utf8(canonical_payload(&golden_grant())).unwrap();
+        assert!(!payload.contains("listen_"));
+        let mut stray = golden_grant();
+        stray.listen_allow = vec!["10.0.0.0/8".into()];
+        assert_eq!(
+            canonical_payload(&stray),
+            canonical_payload(&golden_grant())
+        );
+    }
+
+    #[test]
+    fn a_changed_listener_field_fails_the_signature() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+        let signed = control
+            .sign(listen_grant(zs_policy::Access::ReadWrite))
+            .unwrap();
+        assert!(verifier.verify(&signed, 0, &context).is_ok());
+
+        let mut widened = signed.clone();
+        widened.grant.listen_allow.push("192.168.0.0/16".into());
+        assert!(matches!(
+            verifier.verify(&widened, 0, &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+        let mut dropped = signed.clone();
+        dropped.grant.listen_allow.pop();
+        assert!(matches!(
+            verifier.verify(&dropped, 0, &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+        let mut moved = signed.clone();
+        moved.grant.listen_addr = Some("172.17.0.2:5433".into());
+        assert!(matches!(
+            verifier.verify(&moved, 0, &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+        let mut removed = signed;
+        removed.grant.listen_addr = None;
+        assert!(matches!(
+            verifier.verify(&removed, 0, &context),
+            Err(GrantError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn version_three_without_listen_addr_is_refused() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+        for access in [zs_policy::Access::ReadWrite, zs_policy::Access::ReadOnly] {
+            let mut grant = listen_grant(access);
+            let signed = control.sign(grant.clone()).unwrap();
+            assert!(
+                verifier.verify(&signed, 0, &context).is_ok(),
+                "positive control"
+            );
+            grant.listen_addr = None;
+            grant.listen_allow.clear();
+            let signed = control.sign(grant).unwrap();
+            assert!(matches!(
+                verifier.verify(&signed, 0, &context),
+                Err(GrantError::UnsupportedVersion)
+            ));
+        }
+    }
+
+    #[test]
+    fn versions_one_and_two_with_listener_fields_are_refused() {
+        let control = ControlSigningKey::generate("k1");
+        let verifier = verifier_for(&control);
+        let context = ctx("stripe-production", "GET");
+        for (version, access) in [
+            (GRANT_VERSION, zs_policy::Access::ReadWrite),
+            (GRANT_VERSION_ACCESS, zs_policy::Access::ReadOnly),
+            (GRANT_VERSION_ACCESS, zs_policy::Access::ReadWrite),
+            (GRANT_VERSION, zs_policy::Access::ReadOnly),
+        ] {
+            let mut grant = listen_grant(access);
+            grant.version = version;
+            let signed = control.sign(grant).unwrap();
+            assert!(matches!(
+                verifier.verify(&signed, 0, &context),
+                Err(GrantError::UnsupportedVersion)
+            ));
+        }
+        let mut only_allow = golden_grant();
+        only_allow.listen_allow = vec!["10.0.0.0/8".into()];
+        let signed = control.sign(only_allow).unwrap();
+        assert!(matches!(
+            verifier.verify(&signed, 0, &context),
+            Err(GrantError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn a_listener_field_with_a_reserved_separator_is_not_signable() {
+        let control = ControlSigningKey::generate("k1");
+        assert!(
+            control
+                .sign(listen_grant(zs_policy::Access::ReadWrite))
+                .is_ok()
+        );
+        for separator in ['\u{1d}', '\u{1e}', '\u{1f}'] {
+            let mut entry = listen_grant(zs_policy::Access::ReadWrite);
+            entry.listen_allow[0].push(separator);
+            assert!(matches!(
+                control.sign(entry),
+                Err(GrantError::Unsignable {
+                    field: "listen_allow"
+                })
+            ));
+        }
+        for separator in ['\u{1e}', '\u{1f}'] {
+            let mut addr = listen_grant(zs_policy::Access::ReadWrite);
+            addr.listen_addr.as_mut().unwrap().push(separator);
+            assert!(matches!(
+                control.sign(addr),
+                Err(GrantError::Unsignable {
+                    field: "listen_addr"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_listener_fields_are_on_the_wire_only_when_set() {
+        let value = serde_json::to_value(golden_grant()).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("listen_addr"));
+        assert!(!value.as_object().unwrap().contains_key("listen_allow"));
+
+        let grant = listen_grant(zs_policy::Access::ReadWrite);
+        let value = serde_json::to_value(&grant).unwrap();
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["listen_addr"], "172.17.0.1:5433");
+        assert_eq!(
+            value["listen_allow"],
+            serde_json::json!(["172.17.0.0/16", "10.0.0.0/8"])
+        );
+        let parsed: Grant = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.listen_addr, grant.listen_addr);
+        assert_eq!(parsed.listen_allow, grant.listen_allow);
+
+        let mut loopback = grant;
+        loopback.listen_allow.clear();
+        let value = serde_json::to_value(&loopback).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("listen_allow"));
+        let parsed: Grant = serde_json::from_value(value).unwrap();
+        assert!(parsed.listen_allow.is_empty());
+    }
+
+    #[test]
+    fn the_connection_of_a_listen_grant_carries_the_listener_fields() {
+        let connection = listen_grant(zs_policy::Access::ReadWrite).connection();
+        assert_eq!(connection.listen_addr.as_deref(), Some("172.17.0.1:5433"));
+        assert_eq!(connection.listen_allow.len(), 2);
+        let plain = golden_grant().connection();
+        assert_eq!(plain.listen_addr, None);
+        assert!(plain.listen_allow.is_empty());
+    }
+
+    #[test]
+    fn the_listen_vectors_verify_at_version_three_and_the_old_payload_does_not() {
+        let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let verifier = AgentVerifier::new(vec![("k1".into(), key)]);
+        for (index, access) in [
+            (0, zs_policy::Access::ReadWrite),
+            (1, zs_policy::Access::ReadOnly),
+        ] {
+            let case = listen_vector_case(index);
+            let grant: Grant = serde_json::from_value(case["input"].clone()).unwrap();
+            assert_eq!(grant.version, GRANT_VERSION_LISTEN);
+            assert_eq!(grant.access, access);
+            assert!(grant.listen_addr.is_some());
+            assert_eq!(grant.listen_allow.len(), 2);
+            let signed = SignedGrant {
+                grant: grant.clone(),
+                signature: case["expect"]["signature_b64"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                signing_key_id: "k1".into(),
+            };
+            let context = ctx("stripe-production", "GET");
+            assert!(verifier.verify(&signed, 0, &context).is_ok());
+
+            let mut without = signed;
+            without.grant.listen_addr = None;
+            without.grant.listen_allow.clear();
+            assert!(matches!(
+                verifier.verify(&without, 0, &context),
+                Err(GrantError::SignatureInvalid)
+            ));
+        }
     }
 
     #[test]

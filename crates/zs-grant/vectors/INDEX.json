@@ -4,6 +4,7 @@
     "grant-aws-ssm.json": 1,
     "grant-file.json": 2,
     "grant-json.json": 8,
+    "grant-listen.json": 2,
     "grant-refusals.json": 24
   }
 }

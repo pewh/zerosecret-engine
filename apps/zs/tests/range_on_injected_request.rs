@@ -271,6 +271,8 @@ async fn range_requests_do_not_return_an_echoed_credential_in_parts() {
             upstream_port: port,
             upstream_tls: zs_policy::UpstreamTlsMode::Plaintext,
             local_endpoint: false,
+            listen_addr: None,
+            listen_allow: Vec::new(),
             access: zs_policy::Access::ReadWrite,
             version: zs_grant::GRANT_VERSION,
         })

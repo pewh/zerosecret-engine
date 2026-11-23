@@ -58,6 +58,8 @@ fn grant(
             zs_policy::UpstreamTlsMode::Default
         },
         local_endpoint: false,
+        listen_addr: None,
+        listen_allow: Vec::new(),
         access,
         version,
     })
