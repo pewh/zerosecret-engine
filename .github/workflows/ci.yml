@@ -632,3 +632,12 @@ jobs:
           log=$(mktemp)
           cargo test --locked -p zs --test postgres_l3 -- --test-threads=1 | tee "$log"
           grep -Fq "test result: ok. 10 passed; 0 failed; 1 ignored;" "$log" || { echo "expected exactly 10 postgres_l3 tests to pass" >&2; exit 1; }
+      # Section 7 row 147: socket and network listeners refuse the config on Windows. The test is
+      # compiled only on Windows; the count check makes a filtered-out test fail the job.
+      - name: fail_closed_matrix row 147
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p zs --test fail_closed_matrix -- --exact row_147_a_socket_dir_or_a_network_listen_addr_refuses_the_run_on_windows --test-threads=1 | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed;" "$log" || { echo "expected row 147 to pass" >&2; exit 1; }
