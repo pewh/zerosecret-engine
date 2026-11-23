@@ -1,6 +1,8 @@
 pub mod cidr;
 pub mod connection;
 pub mod device;
+#[cfg(unix)]
+pub mod socket_dir;
 #[cfg(zs_test_endpoints)]
 mod test_network;
 pub mod wire_client;
