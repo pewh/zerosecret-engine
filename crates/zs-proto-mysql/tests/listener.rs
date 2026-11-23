@@ -1048,6 +1048,75 @@ mod unix_front {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn caller_refused_names_the_listener_kind() {
+        let fake = fake::start(native()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mysql.sock");
+        let (diag, log, _guard) = caller_diag();
+        let refuse: zs_protocol::CallerCheck = Arc::new(|_| false);
+        let tcp = fake::listen_gated(
+            "127.0.0.1",
+            fake.addr.port(),
+            UpstreamTls::WhenOffered,
+            fake::materialize(PASSWORD),
+            diag.clone(),
+            None,
+            Some(refuse.clone()),
+        )
+        .await;
+        unix_listen(
+            &fake,
+            &path,
+            fake::materialize(PASSWORD),
+            diag.clone(),
+            refuse,
+        )
+        .await;
+
+        let mut rest = Vec::new();
+        let mut client = tokio::net::TcpStream::connect(tcp).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut rest),
+        )
+        .await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut rest),
+        )
+        .await;
+
+        assert!(rest.is_empty(), "{rest:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        diag.close();
+        let text = std::fs::read_to_string(log).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "caller_refused")
+            .map(|e| {
+                (
+                    e["fields"]["listen"].as_str(),
+                    e["fields"]["listener"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                (Some("loopback"), Some("mysql")),
+                (Some("unix"), Some("mysql"))
+            ],
+            "{text}"
+        );
+        assert_eq!(fake.seen(|s| s.accepts), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_client_over_a_unix_socket_gets_the_brokered_session() {
         let fake = fake::start(native()).await;
         let dir = tempfile::tempdir().unwrap();

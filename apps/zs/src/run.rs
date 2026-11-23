@@ -11,6 +11,17 @@ use zs_identity::{Subject, WorkloadLabel};
 use zs_mitm::{LocalCa, ProxyServer, RunToken};
 use zs_protocol::{ACCESS_CHANGED_REASON, GRANT_REVOKED_REASON};
 
+#[cfg(unix)]
+use zs::socket_dir::{SocketGuard, prepare as prepare_socket};
+
+#[cfg(not(unix))]
+type SocketGuard = std::convert::Infallible;
+
+#[cfg(not(unix))]
+fn prepare_socket(_path: &std::path::Path) -> Result<SocketGuard, String> {
+    Err("a Unix socket listener needs a Unix host".to_string())
+}
+
 struct UnconfiguredExchange;
 
 #[async_trait::async_trait]
@@ -233,7 +244,6 @@ impl L3Audit {
         }
     }
 
-    #[allow(dead_code)]
     fn on_network(mut self) -> Self {
         self.network = true;
         self
@@ -321,7 +331,6 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
     std::sync::Arc::new(move |caller| with_grant_wake(&*audit.handler, || build(&audit, caller)))
 }
 
-#[allow(dead_code)]
 fn l3_network_refusal(audit: L3Audit) -> impl Fn(std::net::SocketAddr) + Send + Sync + 'static {
     move |peer| {
         if let Err(e) = audit.record(
@@ -395,14 +404,19 @@ fn announce_l3(
     prepared: &PreparedRun,
     kind: &'static str,
     resource: &str,
-    local: std::net::SocketAddr,
+    local: &zs_protocol::ListenSpec,
 ) {
-    stdout_line!("zs: {kind} {resource} -> 127.0.0.1:{}", local.port());
+    let addr = match local {
+        zs_protocol::ListenSpec::Tcp(addr) => addr.to_string(),
+        zs_protocol::ListenSpec::Unix(path) => path.display().to_string(),
+    };
+    stdout_line!("zs: {kind} {resource} -> {addr}");
     prepared.diag.emit(
         Event::new(Component::Agent, "listener_bound")
             .code("kind", kind)
+            .code("listen", local.kind())
             .resource(resource)
-            .token("addr", &local.to_string()),
+            .token("addr", &addr),
     );
 }
 
@@ -733,11 +747,12 @@ struct RunningServices {
     proxy_addr: std::net::SocketAddr,
     token: std::sync::Arc<RunToken>,
     http_proxy: bool,
-    postgres_addr: Option<std::net::SocketAddr>,
-    mysql_addr: Option<std::net::SocketAddr>,
-    l3: Vec<(String, std::net::SocketAddr)>,
+    postgres: Option<zs_protocol::ListenSpec>,
+    mysql: Option<zs_protocol::ListenSpec>,
+    l3: Vec<(String, zs_protocol::ListenSpec)>,
     endpoints: Vec<(String, std::net::SocketAddr)>,
     _tasks: BackgroundTasks,
+    _sockets: Vec<SocketGuard>,
 }
 
 struct PreparedRun {
@@ -796,24 +811,63 @@ fn refuse_run(diag: &DiagLog, stage: &'static str, code: i32) -> i32 {
     code
 }
 
-fn loopback_listen(
+struct Front {
+    spec: zs_protocol::ListenSpec,
+    check: zs_protocol::CallerCheck,
+    audit: L3Audit,
+    socket: Option<SocketGuard>,
+}
+
+fn listener_front(
     prepared: &PreparedRun,
     binding: &zs::ResourceBinding,
-) -> Result<std::net::SocketAddr, i32> {
-    match binding.listen() {
-        Ok(zs::Listen::Loopback(addr)) => Ok(addr),
-        Ok(_) => {
-            stderr_line!(
-                "zs: {}: listen_socket_dir and listen_addr are not supported yet",
-                binding.resource
-            );
-            Err(refuse_run(&prepared.diag, "listen", 1))
+    audit: L3Audit,
+) -> Result<Front, String> {
+    let resource = &binding.resource;
+    match binding.listen().map_err(|error| format!("zs: {error}"))? {
+        zs::Listen::Loopback(addr) => Ok(Front {
+            spec: zs_protocol::ListenSpec::Tcp(addr),
+            check: crate::peer::caller_check(),
+            audit,
+            socket: None,
+        }),
+        zs::Listen::Unix(path) => {
+            let socket =
+                prepare_socket(&path).map_err(|error| format!("zs: {resource}: {error}"))?;
+            Ok(Front {
+                spec: zs_protocol::ListenSpec::Unix(path),
+                check: crate::peer::caller_check(),
+                audit,
+                socket: Some(socket),
+            })
         }
-        Err(error) => {
-            stderr_line!("zs: {error}");
-            Err(refuse_run(&prepared.diag, "listen", 1))
+        zs::Listen::Network { addr, allow } => {
+            zs_mitm::FlowHandler::authorize_message(&*prepared.agent, resource, zs_policy::CONNECT)
+                .map_err(|_| {
+                    format!(
+                        "zs: {resource}: listen_addr {addr} needs a valid signed grant with the same listen_addr and listen_allow"
+                    )
+                })?;
+            let audit = audit.on_network();
+            Ok(Front {
+                spec: zs_protocol::ListenSpec::Tcp(addr),
+                check: crate::peer::allow_list_check(allow, l3_network_refusal(audit.clone())),
+                audit,
+                socket: None,
+            })
         }
     }
+}
+
+fn front(
+    prepared: &PreparedRun,
+    binding: &zs::ResourceBinding,
+    audit: L3Audit,
+) -> Result<Front, i32> {
+    listener_front(prepared, binding, audit).map_err(|line| {
+        stderr_line!("{line}");
+        refuse_run(&prepared.diag, "listen", 1)
+    })
 }
 
 fn run_with(args: &super::Args, diag: &DiagLog) -> i32 {
@@ -1123,6 +1177,7 @@ async fn start_services(
     prepared.diag.emit(
         Event::new(Component::Agent, "listener_bound")
             .code("kind", "proxy")
+            .code("listen", "loopback")
             .token("addr", &addr.to_string()),
     );
     tasks.push(tokio::spawn(async move {
@@ -1132,6 +1187,7 @@ async fn start_services(
     let mut pg_endpoint = None;
     let mut mysql_endpoint = None;
     let mut l3 = Vec::new();
+    let mut sockets = Vec::new();
     for binding in prepared.file.bindings.iter().filter(|b| b.is_postgres()) {
         let (upstream_host, upstream_port) = binding.upstream();
         let endpoint = match zs_proto_postgres::UpstreamEndpoint::new(upstream_host, upstream_port)
@@ -1155,9 +1211,15 @@ async fn start_services(
         let audit = L3Audit::new(prepared, &binding.resource, "postgres", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
         let cancel_authorize = l3_cancel_authorize(audit.clone());
-        let listen_addr = loopback_listen(prepared, binding)?;
+        let Front {
+            spec,
+            check,
+            audit,
+            socket,
+        } = front(prepared, binding, audit)?;
+        sockets.extend(socket);
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
-            &zs_protocol::ListenSpec::Tcp(listen_addr),
+            &spec,
             endpoint,
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
@@ -1170,25 +1232,19 @@ async fn start_services(
                 .with_refusal_audit(refusal_audit)
                 .with_cancel_authorize(cancel_authorize)
                 .with_expected_user(binding.user.clone())
-                .with_caller_check(crate::peer::caller_check()),
+                .with_caller_check(check),
             Err(e) => {
                 stderr_line!("zs: postgres listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
             }
         };
-        let zs_protocol::ListenSpec::Tcp(local) = *pg.local() else {
-            stderr_line!(
-                "zs: postgres listener for {}: no TCP address",
-                binding.resource
-            );
-            return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
-        };
-        announce_l3(prepared, "postgres", &binding.resource, local);
+        let local = pg.local().clone();
+        announce_l3(prepared, "postgres", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
             let _ = pg.serve().await;
         }));
         if pg_endpoint.is_none() {
-            pg_endpoint = Some(local);
+            pg_endpoint = Some(local.clone());
         }
         l3.push((binding.env_prefix(), local));
     }
@@ -1221,9 +1277,15 @@ async fn start_services(
         };
         let audit = L3Audit::new(prepared, &binding.resource, "mysql", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
-        let listen_addr = loopback_listen(prepared, binding)?;
+        let Front {
+            spec,
+            check,
+            audit,
+            socket,
+        } = front(prepared, binding, audit)?;
+        sockets.extend(socket);
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
-            &zs_protocol::ListenSpec::Tcp(listen_addr),
+            &spec,
             endpoint,
             tls,
             l3_materialize(audit),
@@ -1235,25 +1297,19 @@ async fn start_services(
                 .with_refusal_audit(refusal_audit)
                 .with_expected_user(binding.user.clone())
                 .with_client_auth(client_auth)
-                .with_caller_check(crate::peer::caller_check()),
+                .with_caller_check(check),
             Err(e) => {
                 stderr_line!("zs: mysql listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
             }
         };
-        let zs_protocol::ListenSpec::Tcp(local) = *mysql.local() else {
-            stderr_line!(
-                "zs: mysql listener for {}: no TCP address",
-                binding.resource
-            );
-            return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
-        };
-        announce_l3(prepared, "mysql", &binding.resource, local);
+        let local = mysql.local().clone();
+        announce_l3(prepared, "mysql", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
             let _ = mysql.serve().await;
         }));
         if mysql_endpoint.is_none() {
-            mysql_endpoint = Some(local);
+            mysql_endpoint = Some(local.clone());
         }
         l3.push((binding.env_prefix(), local));
     }
@@ -1293,9 +1349,15 @@ async fn start_services(
             },
             |line| stderr_line!("{line}"),
         );
-        let listen_addr = loopback_listen(prepared, binding)?;
+        let Front {
+            spec,
+            check,
+            audit,
+            socket,
+        } = front(prepared, binding, audit)?;
+        sockets.extend(socket);
         let mongo = match zs_proto_mongo::MongoListener::bind_endpoint(
-            &zs_protocol::ListenSpec::Tcp(listen_addr),
+            &spec,
             endpoint,
             tls,
             auth,
@@ -1306,20 +1368,14 @@ async fn start_services(
             Ok(listener) => listener
                 .with_diag(prepared.diag.clone(), &binding.resource)
                 .with_refusal_audit(refusal_audit)
-                .with_caller_check(crate::peer::caller_check()),
+                .with_caller_check(check),
             Err(e) => {
                 stderr_line!("zs: mongo listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
             }
         };
-        let zs_protocol::ListenSpec::Tcp(local) = *mongo.local() else {
-            stderr_line!(
-                "zs: mongo listener for {}: no TCP address",
-                binding.resource
-            );
-            return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
-        };
-        announce_l3(prepared, "mongo", &binding.resource, local);
+        let local = mongo.local().clone();
+        announce_l3(prepared, "mongo", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
             let _ = mongo.serve().await;
         }));
@@ -1347,9 +1403,15 @@ async fn start_services(
         };
         let audit = L3Audit::new(prepared, &binding.resource, "redis", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
-        let listen_addr = loopback_listen(prepared, binding)?;
+        let Front {
+            spec,
+            check,
+            audit,
+            socket,
+        } = front(prepared, binding, audit)?;
+        sockets.extend(socket);
         let redis = match zs_proto_redis::RedisListener::bind_endpoint(
-            &zs_protocol::ListenSpec::Tcp(listen_addr),
+            &spec,
             endpoint,
             tls,
             binding.redis_auth(),
@@ -1360,20 +1422,14 @@ async fn start_services(
             Ok(listener) => listener
                 .with_diag(prepared.diag.clone(), &binding.resource)
                 .with_refusal_audit(refusal_audit)
-                .with_caller_check(crate::peer::caller_check()),
+                .with_caller_check(check),
             Err(e) => {
                 stderr_line!("zs: redis listener for {}: {e}", binding.resource);
                 return Err(refuse_run(&prepared.diag, "redis_bind", 1));
             }
         };
-        let zs_protocol::ListenSpec::Tcp(local) = *redis.local() else {
-            stderr_line!(
-                "zs: redis listener for {}: no TCP address",
-                binding.resource
-            );
-            return Err(refuse_run(&prepared.diag, "redis_bind", 1));
-        };
-        announce_l3(prepared, "redis", &binding.resource, local);
+        let local = redis.local().clone();
+        announce_l3(prepared, "redis", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
             let _ = redis.serve().await;
         }));
@@ -1406,7 +1462,12 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "endpoint_bind", 1));
             }
         };
-        announce_l3(prepared, "endpoint", &binding.resource, local);
+        announce_l3(
+            prepared,
+            "endpoint",
+            &binding.resource,
+            &zs_protocol::ListenSpec::Tcp(local),
+        );
         tasks.push(tokio::spawn(async move {
             let _ = endpoint.serve().await;
         }));
@@ -1532,11 +1593,12 @@ async fn start_services(
         proxy_addr: addr,
         token,
         http_proxy: prepared.file.bindings.iter().any(|b| b.is_http()),
-        postgres_addr: pg_endpoint,
-        mysql_addr: mysql_endpoint,
+        postgres: pg_endpoint,
+        mysql: mysql_endpoint,
         l3,
         endpoints,
         _tasks: tasks,
+        _sockets: sockets,
     })
 }
 
@@ -1729,6 +1791,40 @@ fn no_proxy() -> String {
     }
 }
 
+fn l3_env(services: &RunningServices) -> Vec<(String, std::ffi::OsString)> {
+    use zs_protocol::ListenSpec;
+    let mut env = Vec::new();
+    match &services.postgres {
+        Some(ListenSpec::Tcp(addr)) => {
+            env.push(("PGHOST".to_string(), addr.ip().to_string().into()));
+            env.push(("PGPORT".to_string(), addr.port().to_string().into()));
+        }
+        Some(ListenSpec::Unix(path)) => {
+            env.push(("PGHOST".to_string(), path.parent().unwrap_or(path).into()));
+            env.push(("PGPORT".to_string(), "5432".into()));
+        }
+        None => {}
+    }
+    match &services.mysql {
+        Some(ListenSpec::Tcp(addr)) => {
+            env.push(("MYSQL_HOST".to_string(), addr.ip().to_string().into()));
+            env.push(("MYSQL_TCP_PORT".to_string(), addr.port().to_string().into()));
+        }
+        Some(ListenSpec::Unix(path)) => env.push(("MYSQL_UNIX_PORT".to_string(), path.into())),
+        None => {}
+    }
+    for (prefix, local) in &services.l3 {
+        match local {
+            ListenSpec::Tcp(addr) => {
+                env.push((format!("{prefix}_HOST"), addr.ip().to_string().into()));
+                env.push((format!("{prefix}_PORT"), addr.port().to_string().into()));
+            }
+            ListenSpec::Unix(path) => env.push((format!("{prefix}_SOCKET"), path.into())),
+        }
+    }
+    env
+}
+
 fn build_child(
     args: &super::Args,
     services: &RunningServices,
@@ -1793,18 +1889,7 @@ fn build_child(
             );
         }
     }
-    if let Some(pg) = services.postgres_addr {
-        cmd.env("PGHOST", pg.ip().to_string())
-            .env("PGPORT", pg.port().to_string());
-    }
-    if let Some(mysql) = services.mysql_addr {
-        cmd.env("MYSQL_HOST", mysql.ip().to_string())
-            .env("MYSQL_TCP_PORT", mysql.port().to_string());
-    }
-    for (prefix, addr) in &services.l3 {
-        cmd.env(format!("{prefix}_HOST"), addr.ip().to_string())
-            .env(format!("{prefix}_PORT"), addr.port().to_string());
-    }
+    cmd.envs(l3_env(services));
     for (prefix, addr) in &services.endpoints {
         cmd.env(
             format!("{prefix}_URL"),
@@ -1961,6 +2046,7 @@ mod tests {
     use super::*;
 
     mod access_change;
+    mod listeners;
 
     fn loopback_caller() -> zs_protocol::Caller {
         zs_protocol::Caller::Tcp {
@@ -3072,7 +3158,9 @@ mod tests {
             .block_on(start_services(&prepared, &args))
             .unwrap_or_else(|code| panic!("start_services failed with {code}"));
         let proxy = services.proxy_addr;
-        let postgres = services.postgres_addr.expect("a postgres listener");
+        let Some(zs_protocol::ListenSpec::Tcp(postgres)) = services.postgres.clone() else {
+            panic!("a postgres listener");
+        };
         assert!(std::net::TcpListener::bind(proxy).is_err());
         assert!(std::net::TcpListener::bind(postgres).is_err());
 
@@ -3120,11 +3208,12 @@ mod tests {
             proxy_addr: addr,
             token: std::sync::Arc::new(RunToken::generate()),
             http_proxy: false,
-            postgres_addr: None,
-            mysql_addr: None,
+            postgres: None,
+            mysql: None,
             l3: Vec::new(),
             endpoints: Vec::new(),
             _tasks: tasks,
+            _sockets: Vec::new(),
         };
         assert!(std::net::TcpListener::bind(addr).is_err());
         drop(services);

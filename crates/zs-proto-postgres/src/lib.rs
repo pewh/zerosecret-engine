@@ -1930,7 +1930,8 @@ impl PostgresListener {
                 self.diag.emit(
                     Event::new(Component::Postgres, "caller_refused")
                         .conn(self.diag.next_conn())
-                        .token("listener", "postgres"),
+                        .token("listener", "postgres")
+                        .code("listen", self.listener.local().kind()),
                 );
                 drop(client);
                 continue;

@@ -209,7 +209,8 @@ impl MysqlListener {
                 self.shared.diag.emit(
                     Event::new(Component::Mysql, "caller_refused")
                         .conn(self.shared.diag.next_conn())
-                        .token("listener", "mysql"),
+                        .token("listener", "mysql")
+                        .code("listen", self.listener.local().kind()),
                 );
                 drop(client);
                 continue;

@@ -1,5 +1,5 @@
 #[path = "../../../../../../crates/zs-proto-redis/tests/fake/mod.rs"]
-mod fake;
+pub(crate) mod fake;
 
 use zs_policy::Access;
 

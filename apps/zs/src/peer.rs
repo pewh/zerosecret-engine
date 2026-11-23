@@ -12,7 +12,6 @@ pub(crate) fn caller_check() -> zs_protocol::CallerCheck {
     std::sync::Arc::new(admits)
 }
 
-#[allow(dead_code)]
 pub(crate) fn allow_list_check(
     allow: Vec<Cidr>,
     refused: impl Fn(SocketAddr) + Send + Sync + 'static,

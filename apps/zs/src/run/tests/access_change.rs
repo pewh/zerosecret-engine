@@ -8,7 +8,7 @@ use super::*;
 mod mongo;
 mod mysql;
 mod postgres;
-mod redis;
+pub(super) mod redis;
 
 const ACCESS_CHANGED: &str = "access changed";
 const POOL: usize = 4;
@@ -162,7 +162,10 @@ impl Rig {
     }
 
     fn listener(&self) -> std::net::SocketAddr {
-        self.services.l3[0].1
+        let zs_protocol::ListenSpec::Tcp(addr) = &self.services.l3[0].1 else {
+            panic!("a loopback listener");
+        };
+        *addr
     }
 
     fn renew(&self, access: zs_policy::Access) -> Instant {

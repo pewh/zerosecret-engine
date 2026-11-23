@@ -40,6 +40,16 @@ pub enum ListenSpec {
     Unix(std::path::PathBuf),
 }
 
+impl ListenSpec {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Tcp(addr) if addr.ip().to_canonical().is_loopback() => "loopback",
+            Self::Tcp(_) => "network",
+            Self::Unix(_) => "unix",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     pub host: String,
@@ -465,6 +475,30 @@ mod tests {
         assert_eq!(InterceptedProtocol::Mysql.default_port(), 3306);
         assert_eq!(InterceptedProtocol::Mongo.default_port(), 27017);
         assert_eq!(InterceptedProtocol::Redis.default_port(), 6379);
+    }
+
+    #[test]
+    fn a_listen_spec_names_its_listener_kind() {
+        let tcp = |text: &str| ListenSpec::Tcp(text.parse().unwrap());
+        for loopback in [
+            "127.0.0.1:5432",
+            "127.0.0.2:5432",
+            "[::1]:5432",
+            "[::ffff:127.0.0.1]:5432",
+        ] {
+            assert_eq!(tcp(loopback).kind(), "loopback", "{loopback}");
+        }
+        for network in [
+            "172.17.0.1:5433",
+            "[fd00::1]:5433",
+            "[::ffff:172.17.0.1]:5433",
+        ] {
+            assert_eq!(tcp(network).kind(), "network", "{network}");
+        }
+        assert_eq!(
+            ListenSpec::Unix("/run/zs/.s.PGSQL.5432".into()).kind(),
+            "unix"
+        );
     }
 
     #[test]

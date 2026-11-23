@@ -154,8 +154,6 @@ impl MongoListener {
             None => None,
         };
         let listener = FrontListener::bind(local).await?;
-        // The address a replica-set reply advertises as the only host: `host:port` for TCP, the
-        // socket path for a Unix socket (drivers read a host ending in `.sock` as a socket path).
         let listener_addr = match listener.local() {
             ListenSpec::Tcp(addr) => addr.to_string(),
             ListenSpec::Unix(path) => path.display().to_string(),
@@ -211,7 +209,8 @@ impl MongoListener {
                 self.shared.diag.emit(
                     Event::new(Component::Mongo, "caller_refused")
                         .conn(self.shared.diag.next_conn())
-                        .token("listener", "mongo"),
+                        .token("listener", "mongo")
+                        .code("listen", self.listener.local().kind()),
                 );
                 drop(client);
                 continue;

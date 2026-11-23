@@ -946,6 +946,60 @@ mod unix_front {
         assert_eq!(bound, spec);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caller_refused_names_the_listener_kind() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (diag, log) = fake::open_diag(dir.path());
+        let refuse: zs_protocol::CallerCheck = Arc::new(|_| false);
+        let tcp = fake::listen_gated(
+            "127.0.0.1",
+            upstream.addr.port(),
+            UpstreamTls::WhenOffered,
+            fake::materialize(fake::PASSWORD),
+            diag.clone(),
+            Some(refuse.clone()),
+        )
+        .await;
+        let path = socket(dir.path());
+        unix_listen(
+            &upstream,
+            &path,
+            fake::materialize(fake::PASSWORD),
+            diag.clone(),
+            refuse,
+            allow_cancel(),
+        )
+        .await;
+
+        let mut rest = Vec::new();
+        let mut client = TcpStream::connect(tcp).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+
+        assert!(rest.is_empty(), "{rest:?}");
+        let events = fake::events(&diag, &log).await;
+        let refused: Vec<_> = fake::named(&events, "caller_refused")
+            .iter()
+            .map(|e| {
+                (
+                    e["fields"]["listen"].as_str(),
+                    e["fields"]["listener"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                (Some("loopback"), Some("postgres")),
+                (Some("unix"), Some("postgres"))
+            ],
+            "{events:?}"
+        );
+        assert_eq!(upstream.seen(|s| s.accepts), 0);
+    }
+
     async fn unix_cancel(path: &std::path::Path) {
         let mut client = UnixStream::connect(path).await.unwrap();
         let _ = client.write_all(&fake::cancel_packet()).await;

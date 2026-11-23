@@ -199,7 +199,8 @@ impl RedisListener {
                 self.shared.diag.emit(
                     Event::new(Component::Redis, "caller_refused")
                         .conn(self.shared.diag.next_conn())
-                        .token("listener", "redis"),
+                        .token("listener", "redis")
+                        .code("listen", self.listener.local().kind()),
                 );
                 drop(client);
                 continue;
