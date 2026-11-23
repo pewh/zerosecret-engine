@@ -28,7 +28,7 @@ async fn front(access: SessionAccess) -> (SocketAddr, fake::Refusals) {
     let materialize: zs_protocol::Materialize =
         Arc::new(move |_| Ok(fake::granted_with(password.as_bytes(), access)));
     let listener = RedisListener::bind_endpoint(
-        "127.0.0.1:0",
+        &fake::loopback(),
         endpoint(&required("ZS_TEST_REDIS_ADDR")),
         None,
         Auth::new(None),
@@ -39,7 +39,7 @@ async fn front(access: SessionAccess) -> (SocketAddr, fake::Refusals) {
     .with_diag(DiagLog::disabled(), "redis-real-read-only")
     .with_caller_check(fake::admit_all())
     .with_refusal_audit(audit);
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(listener.serve());
     (local, refusals)
 }

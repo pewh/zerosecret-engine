@@ -69,14 +69,19 @@ async fn front(real: &Real, access: SessionAccess) -> (SocketAddr, fake::Refusal
         Arc::new(move |_| Ok(fake::granted_with(password.as_bytes(), access)));
     let endpoint =
         UpstreamEndpoint::new(real.address.ip().to_string(), real.address.port()).unwrap();
-    let listener =
-        RedisListener::bind_endpoint("127.0.0.1:0", endpoint, None, Auth::new(None), materialize)
-            .await
-            .unwrap()
-            .with_diag(DiagLog::disabled(), "redis-real-read-only-clients")
-            .with_caller_check(fake::admit_all())
-            .with_refusal_audit(audit);
-    let local = listener.local_addr();
+    let listener = RedisListener::bind_endpoint(
+        &fake::loopback(),
+        endpoint,
+        None,
+        Auth::new(None),
+        materialize,
+    )
+    .await
+    .unwrap()
+    .with_diag(DiagLog::disabled(), "redis-real-read-only-clients")
+    .with_caller_check(fake::admit_all())
+    .with_refusal_audit(audit);
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(listener.serve());
     (local, refusals)
 }

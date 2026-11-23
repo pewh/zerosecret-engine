@@ -760,9 +760,12 @@ fn refuse_run(diag: &DiagLog, stage: &'static str, code: i32) -> i32 {
     code
 }
 
-fn loopback_listen(prepared: &PreparedRun, binding: &zs::ResourceBinding) -> Result<String, i32> {
+fn loopback_listen(
+    prepared: &PreparedRun,
+    binding: &zs::ResourceBinding,
+) -> Result<std::net::SocketAddr, i32> {
     match binding.listen() {
-        Ok(zs::Listen::Loopback(addr)) => Ok(addr.to_string()),
+        Ok(zs::Listen::Loopback(addr)) => Ok(addr),
         Ok(_) => {
             stderr_line!(
                 "zs: {}: listen_socket_dir and listen_addr are not supported yet",
@@ -1118,7 +1121,7 @@ async fn start_services(
         let cancel_authorize = l3_cancel_authorize(audit.clone());
         let listen_addr = loopback_listen(prepared, binding)?;
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
-            &listen_addr,
+            &listen_addr.to_string(),
             endpoint,
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
@@ -1178,7 +1181,7 @@ async fn start_services(
         let refusal_audit = l3_refusal_audit(audit.clone());
         let listen_addr = loopback_listen(prepared, binding)?;
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
-            &listen_addr,
+            &listen_addr.to_string(),
             endpoint,
             tls,
             l3_materialize(audit),
@@ -1244,7 +1247,7 @@ async fn start_services(
         );
         let listen_addr = loopback_listen(prepared, binding)?;
         let mongo = match zs_proto_mongo::MongoListener::bind_endpoint(
-            &listen_addr,
+            &listen_addr.to_string(),
             endpoint,
             tls,
             auth,
@@ -1292,7 +1295,7 @@ async fn start_services(
         let refusal_audit = l3_refusal_audit(audit.clone());
         let listen_addr = loopback_listen(prepared, binding)?;
         let redis = match zs_proto_redis::RedisListener::bind_endpoint(
-            &listen_addr,
+            &zs_protocol::ListenSpec::Tcp(listen_addr),
             endpoint,
             tls,
             binding.redis_auth(),
@@ -1309,7 +1312,13 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "redis_bind", 1));
             }
         };
-        let local = redis.local_addr();
+        let zs_protocol::ListenSpec::Tcp(local) = *redis.local() else {
+            stderr_line!(
+                "zs: redis listener for {}: no TCP address",
+                binding.resource
+            );
+            return Err(refuse_run(&prepared.diag, "redis_bind", 1));
+        };
         announce_l3(prepared, "redis", &binding.resource, local);
         tasks.push(tokio::spawn(async move {
             let _ = redis.serve().await;

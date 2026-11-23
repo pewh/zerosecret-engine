@@ -5,17 +5,15 @@ pub mod reply;
 pub mod resp;
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event};
-use zs_protocol::{Caller, SessionAccess};
+use zs_protocol::{Caller, ClientStream, FrontListener, ListenSpec, SessionAccess};
 
 use guard::EchoGuard;
 use resp::{Command, Refusal};
@@ -121,7 +119,7 @@ struct Tls {
 }
 
 pub struct RedisListener {
-    listener: TcpListener,
+    listener: FrontListener,
     shared: Shared,
     caller_check: Option<zs_protocol::CallerCheck>,
 }
@@ -140,7 +138,7 @@ struct Shared {
 
 impl RedisListener {
     pub async fn bind_endpoint(
-        local: &str,
+        local: &ListenSpec,
         upstream: UpstreamEndpoint,
         tls: Option<UpstreamTls>,
         auth: Auth,
@@ -154,7 +152,7 @@ impl RedisListener {
             None => None,
         };
         Ok(Self {
-            listener: TcpListener::bind(local).await?,
+            listener: FrontListener::bind(local).await?,
             caller_check: None,
             shared: Shared {
                 upstream,
@@ -190,16 +188,13 @@ impl RedisListener {
         self
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.listener
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
+    pub fn local(&self) -> &ListenSpec {
+        self.listener.local()
     }
 
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
-            let (client, peer) = self.listener.accept().await?;
-            let caller = Caller::tcp(peer, client.local_addr());
+            let (client, caller) = self.listener.accept().await?;
             if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Redis, "caller_refused")
@@ -281,7 +276,7 @@ impl Conn {
 
 struct Stopped(&'static str);
 
-async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
+async fn handle_connection(mut client: ClientStream, shared: Shared, caller: Caller) {
     let conn = Conn {
         id: shared.diag.next_conn(),
         shared,
@@ -301,7 +296,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller
 }
 
 async fn refuse(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     reply: &Reply,
     code: &'static str,
@@ -312,8 +307,8 @@ async fn refuse(
     Stopped("refused")
 }
 
-async fn answer_and_linger(client: &mut TcpStream, reply: Option<Reply>) {
-    let (mut read, mut write) = client.split();
+async fn answer_and_linger(client: &mut ClientStream, reply: Option<Reply>) {
+    let (mut read, mut write) = tokio::io::split(client);
     answer_then_drain(&mut read, &mut write, reply).await;
 }
 
@@ -349,7 +344,7 @@ struct Session {
 }
 
 async fn handshake(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     caller: Caller,
 ) -> Result<Session, Stopped> {
@@ -459,7 +454,7 @@ fn auth_frame(auth: &Auth, credential: &[u8]) -> Zeroizing<Vec<u8>> {
     Command::from_zeroized(args).encode()
 }
 
-async fn open(client: &mut TcpStream, conn: &Conn) -> Result<Box<dyn Io>, Stopped> {
+async fn open(client: &mut ClientStream, conn: &Conn) -> Result<Box<dyn Io>, Stopped> {
     let tcp = match conn.shared.upstream.connect().await {
         Ok(tcp) => tcp,
         Err(error) => {
@@ -949,7 +944,7 @@ where
     Ending::Server
 }
 
-async fn relay(client: TcpStream, session: Session, conn: &Conn) {
+async fn relay(client: ClientStream, session: Session, conn: &Conn) {
     let up = AtomicU64::new(0);
     let down = AtomicU64::new(0);
     let forwarded = AtomicU64::new(0);

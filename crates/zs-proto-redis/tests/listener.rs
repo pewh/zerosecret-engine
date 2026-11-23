@@ -1001,3 +1001,172 @@ async fn a_refusal_reaches_a_client_that_is_still_sending_a_large_frame() {
         "the agent drained the frame instead of resetting the connection"
     );
 }
+
+#[cfg(unix)]
+mod unix_front {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use zs_protocol::{Caller, ListenSpec, Materialize};
+
+    use super::*;
+
+    const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+    const PONG: &[u8] = b"+PONG\r\n";
+
+    fn own_uid(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    async fn unix_listen(
+        fake: &fake::Fake,
+        path: &std::path::Path,
+        materialize: Materialize,
+        diag: DiagLog,
+        check: zs_protocol::CallerCheck,
+    ) {
+        let spec = ListenSpec::Unix(path.to_path_buf());
+        let bound = fake::listen_on(
+            &spec,
+            fake.addr,
+            None,
+            fake::auth(),
+            materialize,
+            diag,
+            None,
+            None,
+            Some(check),
+        )
+        .await;
+        assert_eq!(bound, spec);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_over_a_unix_socket_gets_the_brokered_session() {
+        let fake = fake::start(fake::Script::new().with_default_reply(PONG.to_vec())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redis.sock");
+        unix_listen(
+            &fake,
+            &path,
+            fake::materialize(PASSWORD),
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(PING).await.unwrap();
+        let mut reply = vec![0u8; PONG.len()];
+        client.read_exact(&mut reply).await.unwrap();
+
+        assert_eq!(reply, PONG);
+        assert_eq!(
+            fake.auths(),
+            vec![args(&[b"AUTH", USER.as_bytes(), PASSWORD.as_bytes()])]
+        );
+        assert!(fake.authenticated());
+        assert_eq!(fake.names(), vec!["AUTH".to_string(), "PING".to_string()]);
+        assert!(!fake.saw_bytes(CLIENT_PASSWORD.as_bytes()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_unix_caller_is_closed_before_any_byte_is_read() {
+        let fake = fake::start(fake::Script::new().with_default_reply(PONG.to_vec())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redis.sock");
+        let (diag_path, diag) = fake::diag_log(dir.path());
+        let checked = Arc::new(Mutex::new(Vec::new()));
+        let record = checked.clone();
+        let refuse_unix: zs_protocol::CallerCheck = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            !matches!(caller, Caller::Unix { .. })
+        });
+        let (materialize, calls) = fake::counter();
+        unix_listen(&fake, &path, materialize, diag.clone(), refuse_unix).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let _ = client.write_all(PING).await;
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("the agent closes the refused connection");
+
+        assert!(received.is_empty(), "{received:?}");
+        assert!(
+            fake::eventually(|| checked.lock().unwrap().len() == 1).await,
+            "positive: the caller check ran for the connection"
+        );
+        assert_eq!(
+            *checked.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(fake.names().is_empty());
+        assert_eq!(fake.seen(|seen| seen.accepts), 0);
+        let (_text, events) = fake::read_diag(&diag_path, diag).await;
+        assert_eq!(fake::in_conn(&events, "caller_refused", 1).len(), 1);
+        assert!(fake::in_conn(&events, "conn_accepted", 1).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_admitted_unix_caller() {
+        let fake = fake::start(fake::Script::new().with_default_reply(PONG.to_vec())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redis.sock");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        unix_listen(
+            &fake,
+            &path,
+            materialize,
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(PING).await.unwrap();
+        let mut reply = vec![0u8; PONG.len()];
+        client.read_exact(&mut reply).await.unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_peer_address_of_a_tcp_caller() {
+        let fake = fake::start(fake::Script::new()).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        let local = fake.listen(None, materialize).await;
+
+        let mut client = fake::logged_in(local).await;
+        let source = client.stream.local_addr().unwrap();
+        assert_eq!(client.command(&[b"PING"]).await, fake::OK);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let Caller::Tcp { peer, local: to } = &seen[0] else {
+            panic!("a TCP client is a TCP caller: {:?}", seen[0]);
+        };
+        assert_eq!(*peer, source);
+        assert_eq!(*to, local);
+    }
+}

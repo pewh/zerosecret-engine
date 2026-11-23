@@ -18,6 +18,7 @@ use zs_proto_redis::resp::{self, Command};
 use zs_proto_redis::{
     AuditRefusal, Auth, Materialize, RedisListener, UpstreamEndpoint, UpstreamTls,
 };
+use zs_protocol::ListenSpec;
 
 pub const USER: &str = "zs-app";
 pub const PASSWORD: &str = "zs-test-redis-password";
@@ -449,12 +450,41 @@ pub async fn listen_with(
     budget: Option<Duration>,
     caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
+    let ListenSpec::Tcp(local) = listen_on(
+        &loopback(),
+        upstream,
+        tls,
+        auth,
+        materialize,
+        diag,
+        audit,
+        budget,
+        caller_check,
+    )
+    .await
+    else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    local
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_on(
+    spec: &ListenSpec,
+    upstream: SocketAddr,
+    tls: Option<UpstreamTls>,
+    auth: Auth,
+    materialize: Materialize,
+    diag: DiagLog,
+    audit: Option<AuditRefusal>,
+    budget: Option<Duration>,
+    caller_check: Option<zs_protocol::CallerCheck>,
+) -> ListenSpec {
     let endpoint = UpstreamEndpoint::new(upstream.ip().to_string(), upstream.port()).unwrap();
-    let mut listener =
-        RedisListener::bind_endpoint("127.0.0.1:0", endpoint, tls, auth, materialize)
-            .await
-            .unwrap()
-            .with_diag(diag, RESOURCE);
+    let mut listener = RedisListener::bind_endpoint(spec, endpoint, tls, auth, materialize)
+        .await
+        .unwrap()
+        .with_diag(diag, RESOURCE);
     if let Some(audit) = audit {
         listener = listener.with_refusal_audit(audit);
     }
@@ -464,9 +494,20 @@ pub async fn listen_with(
     if let Some(check) = caller_check {
         listener = listener.with_caller_check(check);
     }
-    let local = listener.local_addr();
+    let local = listener.local().clone();
     tokio::spawn(listener.serve());
     local
+}
+
+pub fn loopback() -> ListenSpec {
+    ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+pub fn tcp_addr(spec: &ListenSpec) -> SocketAddr {
+    let ListenSpec::Tcp(addr) = spec else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    *addr
 }
 
 pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
