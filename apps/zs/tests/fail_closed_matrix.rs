@@ -8943,6 +8943,16 @@ async fn row_148_conflicting_listener_fields_refuse_the_config() {
             resource,
             mapped.as_str(),
         ),
+        (
+            serde_json::json!({ "listen_addr": "[fe80::1%1]:6390", "listen_allow": ["fe80::/10"] }),
+            resource,
+            "listen_addr must not be a link-local IPv6 address or have a scope ID",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "[fe80::1]:6390", "listen_allow": ["fe80::/10"] }),
+            resource,
+            "listen_addr must not be a link-local IPv6 address or have a scope ID",
+        ),
     ];
     for (fields, named, reason) in cases {
         home.write(fields, grant());
@@ -8952,4 +8962,107 @@ async fn row_148_conflicting_listener_fields_refuse_the_config() {
             &format!("row 148 ({reason})"),
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ZS_OTHER_USER"]
+async fn row_149_a_network_listener_client_of_another_os_user_of_this_host_is_refused() {
+    let other = std::env::var("ZS_OTHER_USER").expect("ZS_OTHER_USER");
+    let Some(ip) = host_network::route_b_host() else {
+        return;
+    };
+    let upstream = redis_upstream().await;
+    let (served, agent, listen, _) = served_on_network("row 149", &upstream, ip).await;
+    let port = listen.parse::<std::net::SocketAddr>().unwrap().port();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let network_refusals = |events: Vec<serde_json::Value>| {
+        events
+            .into_iter()
+            .filter(|event| event["fields"]["listen"] == "network")
+            .count()
+    };
+    assert_eq!(
+        network_refusals(diag_events(served.home.path(), "caller_refused")),
+        0,
+        "row 149 positive control: the agent's own user is not refused"
+    );
+    let allowed = audit_records(&served.audit());
+    assert_eq!(allowed.len(), 1, "row 149 positive control: {allowed:?}");
+    assert_eq!(allowed[0]["decision"], "allow", "row 149 positive control");
+    assert_eq!(
+        allowed[0]["source_addr"],
+        ip.to_string(),
+        "row 149 positive control: the agent's own client sends from the host address"
+    );
+    let materialized = allowed_connects(&served.audit());
+    let accepts = upstream.seen(|seen| seen.accepts);
+    assert!(
+        accepts >= 1,
+        "row 149 positive control: the upstream was reached"
+    );
+
+    let own_uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    let other_uid = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "id", "-u"])
+        .output()
+        .expect("sudo");
+    assert!(
+        other_uid.status.success() && !other_uid.stdout.is_empty(),
+        "row 149 needs a working `sudo -n -u {other}`: {other_uid:?}"
+    );
+    assert_ne!(
+        other_uid.stdout, own_uid.stdout,
+        "row 149: ZS_OTHER_USER must be another OS user"
+    );
+
+    let connect = format!("exec 3<>/dev/tcp/{ip}/{port}; cat <&3");
+    let refused = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "bash", "-c", &connect])
+        .output()
+        .expect("sudo");
+    assert!(
+        refused.status.success() && refused.stderr.is_empty(),
+        "row 149: the other user's client must connect and see EOF: {refused:?}"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "row 149: another user must read nothing: {refused:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let records = audit_records(&served.audit());
+    let refusals = network_refusals(diag_events(served.home.path(), "caller_refused"));
+    let materialized_after = allowed_connects(&served.audit());
+    stop_agent(agent);
+
+    assert_eq!(
+        records.len(),
+        2,
+        "row 149: one new audit record: {records:?}"
+    );
+    assert_eq!(records[1]["operation"], "connect", "row 149");
+    assert_eq!(records[1]["decision"], "deny", "row 149");
+    assert_eq!(records[1]["reason"], "caller_refused", "row 149");
+    assert_eq!(
+        records[1]["source_addr"],
+        ip.to_string(),
+        "row 149: the other user's client sent from the host address inside listen_allow"
+    );
+    assert!(
+        zs_audit::verify_chain(served.audit()).is_ok(),
+        "row 149: the hash chain verifies"
+    );
+    assert_eq!(
+        refusals, 1,
+        "row 149: the peer socket lookup refused the other user once"
+    );
+    assert_eq!(
+        materialized_after, materialized,
+        "row 149: no allow record and no materialization"
+    );
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        accepts,
+        "row 149: no new upstream contact"
+    );
 }

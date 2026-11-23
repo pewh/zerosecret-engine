@@ -412,11 +412,24 @@ impl ResourceBinding {
             }
             Listen::Unix(dir.components().collect::<PathBuf>().join(name))
         } else if let Some(text) = &self.listen_addr {
+            let link_local = || {
+                format!(
+                    "{resource}: listen_addr must not be a link-local IPv6 address or have a scope ID"
+                )
+            };
+            if text.contains('%') {
+                return Err(link_local());
+            }
             let addr: SocketAddr = text.parse().map_err(|_| {
                 format!(
                     "{resource}: listen_addr must be an IP address and a port, such as 172.17.0.1:5433"
                 )
             })?;
+            if let std::net::IpAddr::V6(ip) = addr.ip()
+                && ip.is_unicast_link_local()
+            {
+                return Err(link_local());
+            }
             let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
             if addr.port() == 0 {
                 return Err(format!("{resource}: listen_addr port must be 1 to 65535"));
@@ -2342,6 +2355,29 @@ mod listen_tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn a_link_local_or_scoped_ipv6_listen_addr_is_refused_by_name() {
+        assert!(
+            binding(json!({ "listen_addr": "[fd00::1]:5433", "listen_allow": ["fd00::/8"] }))
+                .listen()
+                .is_ok()
+                || cfg!(windows)
+        );
+        for addr in [
+            "[fe80::1%1]:5433",
+            "[fe80::1%en0]:5433",
+            "[fe80::1]:5433",
+            "[febf::1]:5433",
+            "[fd00::1%2]:5433",
+        ] {
+            assert_eq!(
+                refusal_one(json!({ "listen_addr": addr, "listen_allow": ["fe80::/10"] })),
+                "policy: db: listen_addr must not be a link-local IPv6 address or have a scope ID",
+                "{addr}"
+            );
+        }
     }
 
     #[test]

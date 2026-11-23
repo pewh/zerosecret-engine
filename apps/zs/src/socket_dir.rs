@@ -82,6 +82,40 @@ fn check_directory(dir: &Path, expected_uid: u32) -> Result<(), String> {
             dir.display()
         ));
     }
+    check_ancestors(dir, expected_uid)
+}
+
+fn check_ancestors(dir: &Path, expected_uid: u32) -> Result<(), String> {
+    let real = fs::canonicalize(dir)
+        .map_err(|e| format!("{}: cannot resolve socket directory: {e}", dir.display()))?;
+    for ancestor in dir.ancestors().skip(1).chain(real.ancestors().skip(1)) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = fs::metadata(ancestor).map_err(|e| {
+            format!(
+                "{}: cannot inspect a parent of the socket directory: {e}",
+                ancestor.display()
+            )
+        })?;
+        check_ancestor(ancestor, meta.mode(), meta.uid(), expected_uid)?;
+    }
+    Ok(())
+}
+
+fn check_ancestor(path: &Path, mode: u32, owner: u32, expected_uid: u32) -> Result<(), String> {
+    if owner != 0 && owner != expected_uid {
+        return Err(format!(
+            "{}: a parent of the socket directory is owned by a user other than root or the agent's user",
+            path.display()
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(format!(
+            "{}: a parent of the socket directory is group- or world-writable without the sticky bit",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -329,6 +363,64 @@ mod tests {
         let (_server, _) = theirs.accept().unwrap();
         drop(client);
         drop(ours);
+    }
+
+    #[test]
+    fn an_ancestor_writable_by_others_without_the_sticky_bit_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        set_mode(&open, 0o755);
+        let name = open.join("run").join("pg.sock");
+        assert!(prepare(&name).is_ok());
+        for mode in [0o777, 0o775, 0o757] {
+            set_mode(&open, mode);
+            let err = prepare(&name).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "{}: a parent of the socket directory is group- or world-writable without the sticky bit",
+                    open.display()
+                )),
+                "{mode:o}: {err}"
+            );
+            assert!(!err.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn a_sticky_ancestor_writable_by_others_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        set_mode(&open, 0o777);
+        let name = open.join("run").join("pg.sock");
+        assert!(prepare(&name).is_err());
+        set_mode(&open, 0o1777);
+        assert!(prepare(&name).is_ok(), "{:?}", prepare(&name).err());
+    }
+
+    #[test]
+    fn a_socket_directory_under_tmp_is_accepted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("zs-socket-dir-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let guard = prepare(&tmp.path().join("run").join("pg.sock"));
+        assert!(guard.is_ok(), "{:?}", guard.err());
+    }
+
+    #[test]
+    fn an_ancestor_of_another_owner_is_refused_unless_it_is_root() {
+        let path = Path::new("/srv/shared");
+        let uid = 501;
+        assert!(check_ancestor(path, 0o40755, uid, uid).is_ok());
+        assert!(check_ancestor(path, 0o40755, 0, uid).is_ok());
+        let err = check_ancestor(path, 0o40755, uid + 1, uid).unwrap_err();
+        assert_eq!(
+            err,
+            "/srv/shared: a parent of the socket directory is owned by a user other than root or the agent's user"
+        );
+        assert!(check_ancestor(path, 0o41777, uid + 1, uid).is_err());
     }
 
     #[test]

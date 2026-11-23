@@ -1838,6 +1838,9 @@ fn l3_env(services: &RunningServices) -> Vec<(String, std::ffi::OsString)> {
 fn l3_env_removed(services: &RunningServices) -> Vec<String> {
     use zs_protocol::ListenSpec;
     let mut removed = Vec::new();
+    if services.postgres.is_some() {
+        removed.push("PGHOSTADDR".to_string());
+    }
     if let Some(ListenSpec::Unix(_)) = &services.mysql {
         removed.extend(["MYSQL_HOST".to_string(), "MYSQL_TCP_PORT".to_string()]);
     }

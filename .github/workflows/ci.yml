@@ -103,9 +103,10 @@ jobs:
           log=$(mktemp)
           cargo test --locked -p zs-materializer --test aws_ssm -- --ignored | tee "$log"
           grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored;" "$log" || { echo "expected exactly 1 ignored SSM test to pass" >&2; exit 1; }
-      # Rows 102 and 146 need a second OS account: the agent closes a database client whose user
-      # differs from its own before it reads a byte, on TCP and on a Unix socket. They run in their
-      # own Secret Service session because the agent needs a native credential store.
+      # Rows 102, 146 and 149 need a second OS account: the agent closes a database client whose
+      # user differs from its own before it reads a byte, on loopback TCP, on a Unix socket and on a
+      # non-loopback listener reached from the host's own address. They run in their own Secret
+      # Service session because the agent needs a native credential store.
       - name: A database client of another OS user is refused
         run: |
           set -euo pipefail
@@ -117,8 +118,8 @@ jobs:
           dbus-run-session -- bash -c '
             set -euo pipefail
             openssl rand -hex 16 | gnome-keyring-daemon --unlock --components=secrets > /dev/null
-            ZS_OTHER_USER=zs-other cargo test --locked -p zs --test fail_closed_matrix -- --ignored --exact row_102_a_database_client_of_another_os_user_is_refused row_146_a_unix_socket_client_of_another_os_user_is_refused | tee /tmp/zs-other-user.log
-            grep -Fq "test result: ok. 2 passed" /tmp/zs-other-user.log
+            ZS_REQUIRE_NETWORK=1 ZS_OTHER_USER=zs-other cargo test --locked -p zs --test fail_closed_matrix -- --ignored --exact row_102_a_database_client_of_another_os_user_is_refused row_146_a_unix_socket_client_of_another_os_user_is_refused row_149_a_network_listener_client_of_another_os_user_of_this_host_is_refused | tee /tmp/zs-other-user.log
+            grep -Fq "test result: ok. 3 passed" /tmp/zs-other-user.log
           '
       - run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo deny check -D advisory-not-detected
@@ -227,16 +228,17 @@ jobs:
         env:
           ZS_TEST_NODE: node
           ZS_BUILD_TEST_ENDPOINTS: "1"
-      # Rows 102 and 146 on macOS: the process walk sees only the agent user's processes, and the
-      # socket peer is another uid, so a client of another account is closed before a byte is read.
+      # Rows 102, 146 and 149 on macOS: the process walk sees only the agent user's processes, and
+      # the socket peer is another uid, so a client of another account is closed before a byte is
+      # read.
       - name: A database client of another OS user is refused
         env:
           ZS_BUILD_TEST_ENDPOINTS: "1"
         run: |
           set -euo pipefail
           sudo sysadminctl -addUser zs-other -password "$(openssl rand -hex 16)"
-          ZS_OTHER_USER=zs-other cargo test --locked -p zs --test fail_closed_matrix -- --ignored --exact row_102_a_database_client_of_another_os_user_is_refused row_146_a_unix_socket_client_of_another_os_user_is_refused | tee "$RUNNER_TEMP/zs-other-user.log"
-          grep -Fq "test result: ok. 2 passed" "$RUNNER_TEMP/zs-other-user.log"
+          ZS_OTHER_USER=zs-other cargo test --locked -p zs --test fail_closed_matrix -- --ignored --exact row_102_a_database_client_of_another_os_user_is_refused row_146_a_unix_socket_client_of_another_os_user_is_refused row_149_a_network_listener_client_of_another_os_user_of_this_host_is_refused | tee "$RUNNER_TEMP/zs-other-user.log"
+          grep -Fq "test result: ok. 3 passed" "$RUNNER_TEMP/zs-other-user.log"
       # Positive control for the release refusal below: the same check sees the names here.
       - run: strings target/debug/zs | grep -q ZS_TEST_AWS_RESOLVE
       # Build the release binaries first, as their own step. The budget tests measure

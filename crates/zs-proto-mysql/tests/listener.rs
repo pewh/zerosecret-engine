@@ -1148,6 +1148,7 @@ mod unix_front {
             fake.seen(|s| s.commands.clone()),
             vec![b"\x03SELECT 1".to_vec()]
         );
+        assert!(fake.saw_bytes(b"SELECT 1"));
         assert!(!fake.saw_bytes(b"client-auth-data-ignored"));
     }
 

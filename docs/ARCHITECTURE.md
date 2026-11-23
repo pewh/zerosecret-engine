@@ -607,7 +607,9 @@ TCP is the default: `127.0.0.1` with `listen_port`, or a loopback `listen_addr`.
 `listen_socket_dir` gives a Unix socket in that directory, `.s.PGSQL.5432` for PostgreSQL and
 `<resource>.sock` for the other protocols. Before the bind, `apps/zs/src/socket_dir.rs` makes a
 missing directory with mode `0700` and refuses a directory that is a symbolic link, has another
-owner or is group- or world-writable. At the socket name it refuses a symbolic link, a file that
+owner or is group- or world-writable, and a directory with a parent (on the path as written or
+after symbolic links are resolved) that is group- or world-writable without the sticky bit or
+has an owner other than root or the agent's user. At the socket name it refuses a symbolic link, a file that
 is not a socket and a live socket, and it removes a stale socket only after a connect to it is
 refused. The socket gets mode `0600`, and at exit the agent removes it when the name still holds
 the socket that it bound. A non-loopback `listen_addr` gives a TCP listener on that address; the
@@ -615,14 +617,17 @@ agent binds it only when the run holds a valid grant with the same `listen_addr`
 `listen_allow`. The caller check runs for each connection before a byte is read: the peer socket
 lookup on loopback, the peer user ID on a Unix socket (both `peer::caller_check`), and the signed
 `listen_allow` on a network listener (`peer::allow_list_check`), which audits a refused source
-with `source_addr`. The line `zs: <protocol> <resource> -> <address or socket path>` and the
+with `source_addr`. When the source of a network connection is an address of this host (a
+loopback address, the listener's own address or an address of an interface, read with
+`getifaddrs` for each connection), `peer::allow_list_check` also needs the peer socket lookup of
+the loopback listener; a lookup that fails or finds no socket of the agent's user refuses. The line `zs: <protocol> <resource> -> <address or socket path>` and the
 diag event `listener_bound` name the listener; `listener_bound` and `caller_refused` carry the
 kind in `listen` (`loopback`, `unix`, `network`). The child environment follows the kind:
 
 | Kind | PostgreSQL | MySQL | Each database binding |
 |---|---|---|---|
-| Loopback or network TCP | `PGHOST=<ip>`, `PGPORT=<port>` | `MYSQL_HOST=<ip>`, `MYSQL_TCP_PORT=<port>` | `ZS_<RESOURCE>_HOST=<ip>`, `ZS_<RESOURCE>_PORT=<port>` |
-| Unix socket | `PGHOST=<directory>`, `PGPORT=5432` | `MYSQL_UNIX_PORT=<socket path>`; an inherited `MYSQL_HOST` and `MYSQL_TCP_PORT` are removed | `ZS_<RESOURCE>_SOCKET=<socket path>`; an inherited `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT` are removed |
+| Loopback or network TCP | `PGHOST=<ip>`, `PGPORT=<port>`; an inherited `PGHOSTADDR` is removed | `MYSQL_HOST=<ip>`, `MYSQL_TCP_PORT=<port>` | `ZS_<RESOURCE>_HOST=<ip>`, `ZS_<RESOURCE>_PORT=<port>` |
+| Unix socket | `PGHOST=<directory>`, `PGPORT=5432`; an inherited `PGHOSTADDR` is removed | `MYSQL_UNIX_PORT=<socket path>`; an inherited `MYSQL_HOST` and `MYSQL_TCP_PORT` are removed | `ZS_<RESOURCE>_SOCKET=<socket path>`; an inherited `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT` are removed |
 
 The `PG*` and `MYSQL_*` variables come from the first binding of that protocol.
 

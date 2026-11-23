@@ -11,23 +11,34 @@
 - Route A: `listen_socket_dir` serves the binding on `.s.PGSQL.5432` (PostgreSQL) or
   `<resource>.sock` in that directory, with mode `0600`. The agent makes a missing directory
   with mode `0700`. It refuses the run when the directory is a symbolic link, has another owner
-  or is group- or world-writable, when the socket name is a symbolic link, a file that is not a
-  socket or a live socket, and when a stale socket cannot be removed. It removes its own socket
+  or is group- or world-writable, when a parent of the directory is group- or world-writable
+  without the sticky bit or has an owner other than root or the agent's user, when the socket
+  name is a symbolic link, a file that is not a socket or a live socket, and when a stale socket
+  cannot be removed. It removes its own socket
   at exit. A client whose peer user ID is not the agent's is closed before a byte is read.
 - Route A child environment: `ZS_<RESOURCE>_SOCKET=<socket path>`; PostgreSQL also gets
   `PGHOST=<directory>` and `PGPORT=5432`, MySQL `MYSQL_UNIX_PORT=<socket path>`. The agent
   removes an inherited `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT`, and for MySQL
   `MYSQL_HOST` and `MYSQL_TCP_PORT`. A MongoDB client connects with
   `mongodb://<percent-encoded socket path>/?directConnection=true`.
+- A `postgres` binding, on every listener kind, removes an inherited `PGHOSTADDR` from the
+  child environment. libpq prefers it to `PGHOST`, so the client could connect past the agent,
+  without a credential.
 - Route B: `listen_addr` is an IP address of this host and a port. A loopback address works as
   `listen_port` does. A non-loopback address needs `listen_allow`, a list of source CIDRs, and a
   valid signed grant with the same two values. A connection from a source outside the list is
   closed before a byte is read and audited `deny` `connect`, reason `caller_refused`. The leg
   from the client to the agent stays plaintext (SECURITY §3).
+- Route B refuses other OS users of the agent's host as loopback does. When the source address
+  is an address of this host (a loopback address, the listener's address or an interface
+  address), the agent also runs the peer socket lookup of ADR-0052. A client socket of another
+  user, a failed lookup or a missing socket closes the connection before a byte is read, with
+  the same `caller_refused` record. A container with its own network and a remote host are
+  checked by address only.
 - Refused at load: a listener field on a binding of another protocol, conflicting listener
-  fields, a relative `listen_socket_dir` or one with `..`, `0.0.0.0`, `::`, port 0, a missing
-  or empty `listen_allow`, `0.0.0.0/0`, `::/0`, an entry with host bits set and an IPv4-mapped
-  IPv6 entry.
+  fields, a relative `listen_socket_dir` or one with `..`, `0.0.0.0`, `::`, port 0, a
+  link-local IPv6 `listen_addr` or one with a scope ID, a missing or empty `listen_allow`,
+  `0.0.0.0/0`, `::/0`, an entry with host bits set and an IPv4-mapped IPv6 entry.
 - Fail closed: a route-B binding without a valid signed grant that carries its `listen_addr` and
   `listen_allow` stops the whole run before the child, also when the control plane refused the
   mint at startup. The line names the reason. A binding without a non-loopback `listen_addr`
@@ -41,20 +52,20 @@
 - Audit: on a route-B listener, the materialization and caller-refusal `connect` records carry
   `source_addr`, the peer IP address without the port. Later refusals in a session (a user
   mismatch, a read-only refusal, a revocation) do not. It is part of the hash chain and is
-  shipped in `AuditIngestRecord`. Other records keep their bytes. An agent from 0.8.0 or older fails `Journal::open` with
-  `ChainBroken` on a journal that has such a record, so a downgrade fails closed, as it does
-  for a journal with `reason` or `credential_ref`.
+  shipped in `AuditIngestRecord`. Other records keep their bytes. An agent from 0.8.0 or older
+  fails `Journal::open` with `ChainBroken` on a journal that has such a record, so a downgrade
+  fails closed, as it does for a journal with `reason` or `credential_ref`.
 - Diagnostics: the line `zs: <protocol> <resource> -> ...` prints the bound address or the
   socket path. `listener_bound` and `caller_refused` carry `listen` (`loopback`, `unix`,
   `network`); `kind` and `listener` keep the protocol.
 - Windows refuses `listen_socket_dir` and a non-loopback `listen_addr` at load.
-- SECURITY §7 gains rows 138-148.
+- SECURITY §7 gains rows 138-149.
 
 ### Development
 
 - On Linux CI, `ZS_REQUIRE_NETWORK=1` makes a route-B test fail instead of skip when the runner
   has no routed address that receives inbound data. The other-OS-user steps also run row 146,
-  which needs `netcat-openbsd` on Linux.
+  which needs `netcat-openbsd` on Linux, and row 149.
 
 ## [0.8.0] - 2026-11-21
 

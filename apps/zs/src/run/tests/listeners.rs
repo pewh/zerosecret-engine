@@ -709,6 +709,38 @@ fn a_unix_binding_removes_an_inherited_host_and_port_from_the_child() {
 }
 
 #[test]
+fn a_postgres_binding_removes_an_inherited_pghostaddr_from_the_child() {
+    for pg in [
+        ListenSpec::Unix("/run/zs/pg/.s.PGSQL.5432".into()),
+        ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 54_320))),
+        ListenSpec::Tcp(SocketAddr::from(([172, 17, 0, 1], 5_433))),
+    ] {
+        let env = child_env(&services_with(
+            Some(pg.clone()),
+            None,
+            &[("ZS_ORDERS_DB", pg.clone())],
+        ));
+        assert!(
+            matches!(env.get("PGHOST"), Some(Some(_))),
+            "{pg:?}: PGHOST is set"
+        );
+        assert_eq!(env.get("PGHOSTADDR"), Some(&None), "{pg:?}");
+    }
+    let mysql = ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 33_060)));
+    let env = child_env(&services_with(
+        None,
+        Some(mysql.clone()),
+        &[("ZS_ORDERS_MYSQL", mysql)],
+    ));
+    assert_eq!(env.get("MYSQL_TCP_PORT"), Some(&Some("33060".to_string())));
+    assert_eq!(
+        env.get("PGHOSTADDR"),
+        None,
+        "a run without a postgres binding leaves PGHOSTADDR alone"
+    );
+}
+
+#[test]
 fn a_tcp_binding_gives_the_child_its_host_and_port_as_before() {
     let pg = ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 54_320)));
     let mysql = ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 33_060)));

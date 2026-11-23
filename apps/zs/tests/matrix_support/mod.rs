@@ -664,7 +664,7 @@ impl FakeControl {
 }
 
 /// The data rows of the SECURITY §7 table, in order (row 1 first). Panics unless there are
-/// exactly one hundred and forty-eight.
+/// exactly one hundred and forty-nine.
 pub fn security_7_rows() -> Vec<String> {
     let security = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SECURITY.md"),
@@ -688,8 +688,8 @@ pub fn security_7_rows() -> Vec<String> {
 
     assert_eq!(
         rows.len(),
-        148,
-        "SECURITY §7 must have one hundred and forty-eight rows; found {}:\n{}",
+        149,
+        "SECURITY §7 must have one hundred and forty-nine rows; found {}:\n{}",
         rows.len(),
         rows.join("\n")
     );

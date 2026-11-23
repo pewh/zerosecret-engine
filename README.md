@@ -488,13 +488,15 @@ A database binding listens on `127.0.0.1`. A container on a Linux bridge network
 the host's loopback. Such a workload uses a Unix socket (route A) or a signed network address
 (route B) (ADR-0065). Both work on Linux and macOS. On Windows, `zs run` refuses them at load.
 The container examples below are for Docker on Linux without user-namespace remapping. Docker
-Desktop on macOS does not pass a host Unix socket into a container. With rootless Docker or
+Desktop on macOS may not pass a host Unix socket into a container. With rootless Docker or
 userns-remap, the peer user ID that the agent sees is not your user ID, and the agent refuses the
 client.
 
 **Route A, a Unix socket (preferred).** Set `listen_socket_dir` to an absolute directory. The
 agent makes a missing directory with mode `0700` and refuses a directory that another user owns
-or can write. The socket is `.s.PGSQL.5432` for PostgreSQL, so a directory holds one PostgreSQL
+or can write. It also refuses the directory when a parent of it is owned by a user other than
+root or you, or is group- or world-writable without the sticky bit, because another user could
+then replace the directory. `/tmp` is sticky, so a directory in it is accepted. The socket is `.s.PGSQL.5432` for PostgreSQL, so a directory holds one PostgreSQL
 binding, and `<resource>.sock` for MySQL, MongoDB and Redis. The socket has mode `0600`.
 
 ```json
@@ -549,8 +551,13 @@ leaves both out and gets no grant at startup listens on loopback, and its connec
 
 - The agent closes a connection from a source outside `listen_allow` before it reads a byte. It
   audits `deny` `connect`, reason `caller_refused`, with the source IP address in `source_addr`.
-- `zs run` refuses `0.0.0.0` and `::`, port 0, a missing or empty `listen_allow`, `0.0.0.0/0`,
-  `::/0`, and an entry with host bits set (`10.0.0.1/8`).
+- A process on this host that connects to `172.17.0.1:5433` sends from an address of the host,
+  which is inside `172.17.0.0/16`. For such a source the agent also checks the OS user of the
+  client socket, as on loopback, and closes the connection of another user with the same audit
+  record. A container with its own network and a remote host are checked by address only.
+- `zs run` refuses `0.0.0.0` and `::`, port 0, a link-local IPv6 address or one with a scope ID,
+  a missing or empty `listen_allow`, `0.0.0.0/0`, `::/0`, and an entry with host bits set
+  (`10.0.0.1/8`).
 - When the file sets a non-loopback `listen_addr`, `zs run` stops before it starts your command
   if it holds no valid grant with the same `listen_addr` and `listen_allow`, also when the control
   plane refused the grant at startup:
