@@ -5274,6 +5274,7 @@ async fn row_102_a_database_client_of_another_os_user_is_refused() {
     let _ = agent.child.wait();
 }
 
+#[cfg(unix)]
 fn rotation_request() -> zs_wire::GrantMintRequest {
     zs_wire::GrantMintRequest {
         device_id: "dev-fake".into(),
@@ -5284,6 +5285,7 @@ fn rotation_request() -> zs_wire::GrantMintRequest {
     }
 }
 
+#[cfg(unix)]
 fn rotation_client(
     control: &FakeControl,
     environment: Option<&str>,
@@ -5320,6 +5322,7 @@ fn rotation_client(
         .expect("a wire client")
 }
 
+#[cfg(unix)]
 #[test]
 fn row_103_a_grant_with_an_unknown_version_is_refused_by_name() {
     let control = FakeControl::start();
@@ -5358,6 +5361,7 @@ fn row_103_a_grant_with_an_unknown_version_is_refused_by_name() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn row_104_a_grant_for_another_environment_is_refused() {
     let control = FakeControl::start();
@@ -5381,6 +5385,7 @@ fn row_104_a_grant_for_another_environment_is_refused() {
     );
 }
 
+#[cfg(unix)]
 fn tls_rotation_client(url: &str, pin: &str) -> zs::wire_client::WireClient {
     let tls_key = rcgen::KeyPair::generate().unwrap();
     let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -5413,6 +5418,7 @@ fn tls_rotation_client(url: &str, pin: &str) -> zs::wire_client::WireClient {
     zs::wire_client::WireClient::from_identity(pin, &enrolment, &secrets).expect("a wire client")
 }
 
+#[cfg(unix)]
 #[test]
 fn row_105_a_wire_server_certificate_from_a_ca_outside_the_set_is_refused() {
     let first = common::test_ca::TestCa::generate("control-1").unwrap();
@@ -5457,6 +5463,7 @@ fn row_105_a_wire_server_certificate_from_a_ca_outside_the_set_is_refused() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn row_109_a_retired_control_ca_no_longer_authenticates_the_wire() {
     let first = common::test_ca::TestCa::generate("control-1").unwrap();
