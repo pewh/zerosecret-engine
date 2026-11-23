@@ -7,12 +7,28 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct SocketGuard {
     path: PathBuf,
+    bound: Option<(u64, u64)>,
+}
+
+impl SocketGuard {
+    pub fn bound(&mut self) {
+        self.bound = socket_identity(&self.path);
+    }
 }
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.bound.is_some() && socket_identity(&self.path) == self.bound {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_socket())
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 pub fn prepare(path: &Path) -> Result<SocketGuard, String> {
@@ -24,6 +40,7 @@ pub fn prepare(path: &Path) -> Result<SocketGuard, String> {
     clear_name(path)?;
     Ok(SocketGuard {
         path: path.to_path_buf(),
+        bound: None,
     })
 }
 
@@ -272,13 +289,46 @@ mod tests {
     fn socket_file_is_gone_after_guard_drops() {
         let tmp = tempfile::tempdir().unwrap();
         let name = tmp.path().join("pg.sock");
-        let guard = prepare(&name).unwrap();
+        let mut guard = prepare(&name).unwrap();
         let listener = UnixListener::bind(&name).unwrap();
+        guard.bound();
         assert!(name.exists());
         drop(guard);
         assert!(!name.exists());
         assert!(tmp.path().is_dir());
         drop(listener);
+    }
+
+    #[test]
+    fn a_guard_whose_bind_failed_keeps_the_socket_of_the_listener_that_won() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = tmp.path().join("pg.sock");
+        let guard = prepare(&name).unwrap();
+        let theirs = UnixListener::bind(&name).unwrap();
+        assert!(UnixListener::bind(&name).is_err());
+        drop(guard);
+        assert!(fs::symlink_metadata(&name).unwrap().file_type().is_socket());
+        let client = UnixStream::connect(&name).unwrap();
+        let (_server, _) = theirs.accept().unwrap();
+        drop(client);
+    }
+
+    #[test]
+    fn a_guard_whose_path_now_holds_another_socket_file_does_not_remove_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = tmp.path().join("pg.sock");
+        let mut guard = prepare(&name).unwrap();
+        let ours = UnixListener::bind(&name).unwrap();
+        guard.bound();
+        let other = tmp.path().join("other.sock");
+        let theirs = UnixListener::bind(&other).unwrap();
+        fs::rename(&other, &name).unwrap();
+        drop(guard);
+        assert!(fs::symlink_metadata(&name).unwrap().file_type().is_socket());
+        let client = UnixStream::connect(&name).unwrap();
+        let (_server, _) = theirs.accept().unwrap();
+        drop(client);
+        drop(ours);
     }
 
     #[test]

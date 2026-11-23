@@ -8,19 +8,33 @@ use zs_protocol::ListenSpec;
 use super::access_change::redis::fake;
 use super::*;
 
-const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 #[cfg(unix)]
-const OTHER_NETWORK: &str = "192.0.2.0/24";
+#[path = "../../../tests/host_network/mod.rs"]
+mod host_network;
+
+const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 fn grant(
     key: &zs_grant::ControlSigningKey,
     upstream_port: u16,
     listen: Option<(&str, &[&str])>,
 ) -> zs_grant::SignedGrant {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    grant_until(key, upstream_port, listen, now_ms() + 600_000)
+}
+
+fn grant_until(
+    key: &zs_grant::ControlSigningKey,
+    upstream_port: u16,
+    listen: Option<(&str, &[&str])>,
+    expires_at_ms: u64,
+) -> zs_grant::SignedGrant {
     key.sign(zs_grant::Grant {
         subject: "alice".into(),
         workload: "default".into(),
@@ -30,7 +44,7 @@ fn grant(
         source: zs_policy::CredentialSource::file(fake::RESOURCE),
         operations: vec!["connect".into()],
         environment: "development".into(),
-        expires_at_ms: now + 600_000,
+        expires_at_ms,
         grant_id: "g-1".into(),
         materialization: zs_policy::Materialization::Retrieve,
         upstream_host: "127.0.0.1".into(),
@@ -213,43 +227,6 @@ async fn ping<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn host_ip() -> Option<IpAddr> {
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    probe.connect("192.0.2.1:9").ok()?;
-    let ip = probe.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
-}
-
-#[cfg(unix)]
-fn delivers_inbound(ip: IpAddr) -> bool {
-    use std::io::{Read, Write};
-
-    let Ok(listener) = std::net::TcpListener::bind((ip, 0)) else {
-        return false;
-    };
-    let (Ok(addr), Ok(())) = (listener.local_addr(), listener.set_nonblocking(true)) else {
-        return false;
-    };
-    let Ok(mut client) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
-        return false;
-    };
-    if client.write_all(b"z").is_err() {
-        return false;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if let Ok((mut server, _)) = listener.accept() {
-            let _ = server.set_nonblocking(false);
-            let _ = server.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut byte = [0u8; 1];
-            return matches!(server.read(&mut byte), Ok(1));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-#[cfg(unix)]
 fn free_port(ip: IpAddr) -> u16 {
     std::net::TcpListener::bind((ip, 0))
         .unwrap()
@@ -413,6 +390,9 @@ fn a_group_writable_socket_directory_refuses_the_run() {
     );
     assert!(!line.contains('\n'));
     assert!(matches!(run.start(), Err(1)));
+    let stages = run.events("run_refused");
+    assert_eq!(stages.len(), 1, "{stages:?}");
+    assert_eq!(stages[0]["fields"]["stage"], "listen");
     let path = shared.path().join(format!("{}.sock", fake::RESOURCE));
     assert!(std::fs::symlink_metadata(&path).is_err());
 
@@ -448,21 +428,9 @@ fn network_run(ip: IpAddr, allow: &str) -> (fake::Fake, Run, SocketAddr) {
 #[cfg(unix)]
 #[test]
 fn a_network_listener_admits_only_a_source_in_its_signed_allow_list() {
-    let Some(ip) = host_ip() else {
-        eprintln!("skipped: this host has no non-loopback IPv4 address with a route");
+    let Some(ip) = host_network::route_b_host() else {
         return;
     };
-    let other: zs::cidr::Cidr = OTHER_NETWORK.parse().unwrap();
-    if other.contains(ip) {
-        eprintln!("skipped: the host address {ip} is inside {OTHER_NETWORK}");
-        return;
-    }
-    if !delivers_inbound(ip) {
-        eprintln!(
-            "skipped: a plain listener of this test binary on {ip} gets no byte from a client of the same process (a host firewall holds inbound data)"
-        );
-        return;
-    }
 
     let (upstream, run, addr) = network_run(ip, &format!("{ip}/32"));
     let services = run.started();
@@ -499,7 +467,7 @@ fn a_network_listener_admits_only_a_source_in_its_signed_allow_list() {
     assert_eq!(bound["fields"]["addr"], addr.to_string(), "{bound}");
     drop(services);
 
-    let (upstream, run, addr) = network_run(ip, OTHER_NETWORK);
+    let (upstream, run, addr) = network_run(ip, host_network::OTHER_NETWORK);
     let services = run.started();
     let stream = run.block_on(tokio::net::TcpStream::connect(addr)).unwrap();
     assert_eq!(stream.local_addr().unwrap().ip(), ip);
@@ -533,10 +501,12 @@ fn a_non_loopback_listen_addr_without_a_signed_grant_that_carries_it_refuses_the
     let fields = json!({ "listen_addr": listen, "listen_allow": allow });
     let key = zs_grant::ControlSigningKey::generate("k1");
     let stranger = zs_grant::ControlSigningKey::generate("k1");
-    let refused = format!(
-        "zs: {}: listen_addr {addr} needs a valid signed grant with the same listen_addr and listen_allow",
-        fake::RESOURCE
-    );
+    let refused = |reason: &str| {
+        format!(
+            "zs: {}: listen_addr {addr} needs a valid signed grant with the same listen_addr and listen_allow ({reason})",
+            fake::RESOURCE
+        )
+    };
 
     let (runtime, upstream) = upstream();
     let port = upstream.addr.port();
@@ -554,19 +524,45 @@ fn a_non_loopback_listen_addr_without_a_signed_grant_that_carries_it_refuses_the
     );
 
     let other_allow: &[&str] = &["10.1.0.0/16"];
-    for (case, grants) in [
-        ("no grant", Vec::new()),
+    let no_grant = format!("no grant for {}", fake::RESOURCE);
+    let other_addr = format!("{}: listen_addr differs from the grant", fake::RESOURCE);
+    let other_list = format!("{}: listen_allow differs from the grant", fake::RESOURCE);
+    for (case, grants, revoked, reason) in [
+        ("no grant", Vec::new(), false, no_grant.as_str()),
         (
             "a grant without listener fields",
             vec![grant(&key, port, None)],
+            false,
+            other_addr.as_str(),
         ),
         (
             "a grant with another allow-list",
             vec![grant(&key, port, Some((listen.as_str(), other_allow)))],
+            false,
+            other_list.as_str(),
         ),
         (
             "a grant signed by a key this run does not trust",
             vec![grant(&stranger, port, Some((listen.as_str(), allow)))],
+            false,
+            "grant signature invalid",
+        ),
+        (
+            "an expired grant",
+            vec![grant_until(
+                &key,
+                port,
+                Some((listen.as_str(), allow)),
+                now_ms() - 1_000,
+            )],
+            false,
+            "grant expired",
+        ),
+        (
+            "a revoked grant",
+            vec![grant(&key, port, Some((listen.as_str(), allow)))],
+            true,
+            "grant g-1 is revoked",
         ),
     ] {
         let run = Run::new(
@@ -576,12 +572,18 @@ fn a_non_loopback_listen_addr_without_a_signed_grant_that_carries_it_refuses_the
             grants,
             &key,
         );
-        assert_eq!(
-            run.front_line().as_deref(),
-            Some(refused.as_str()),
-            "{case}"
-        );
+        if revoked {
+            run.prepared.agent.apply_revocations(&["g-1".to_string()]);
+        }
+        let line = run.front_line();
+        assert_eq!(line.as_deref(), Some(refused(reason).as_str()), "{case}");
+        let line = line.unwrap();
+        assert!(!line.contains('\n'), "{case}");
+        assert!(!line.contains(fake::PASSWORD), "{case}");
         assert!(matches!(run.start(), Err(1)), "{case}");
+        let stages = run.events("run_refused");
+        assert_eq!(stages.len(), 1, "{case}: {stages:?}");
+        assert_eq!(stages[0]["fields"]["stage"], "listen", "{case}");
     }
 }
 
@@ -630,6 +632,79 @@ fn a_unix_binding_gives_the_child_its_socket_and_no_host_or_port() {
             ("ZS_ORDERS_MYSQL_SOCKET", "/run/zs/db/orders-mysql.sock"),
             ("ZS_ORDERS_REDIS_SOCKET", "/run/zs/db/orders-redis.sock"),
         ])
+    );
+}
+
+fn child_env(services: &RunningServices) -> std::collections::BTreeMap<String, Option<String>> {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".zs-ca")).unwrap();
+    let command = build_child(
+        &args_listening(home.path(), "127.0.0.1:0"),
+        services,
+        &home.path().join(".zs-ca").join("ca.crt"),
+    );
+    command
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_unix_binding_removes_an_inherited_host_and_port_from_the_child() {
+    let pg = ListenSpec::Unix("/run/zs/pg/.s.PGSQL.5432".into());
+    let mysql = ListenSpec::Unix("/run/zs/db/orders-mysql.sock".into());
+    let redis = ListenSpec::Unix("/run/zs/db/orders-redis.sock".into());
+    let unix = child_env(&services_with(
+        Some(pg.clone()),
+        Some(mysql.clone()),
+        &[
+            ("ZS_ORDERS_DB", pg),
+            ("ZS_ORDERS_MYSQL", mysql),
+            ("ZS_ORDERS_REDIS", redis),
+        ],
+    ));
+    for name in [
+        "MYSQL_HOST",
+        "MYSQL_TCP_PORT",
+        "ZS_ORDERS_DB_HOST",
+        "ZS_ORDERS_DB_PORT",
+        "ZS_ORDERS_MYSQL_HOST",
+        "ZS_ORDERS_MYSQL_PORT",
+        "ZS_ORDERS_REDIS_HOST",
+        "ZS_ORDERS_REDIS_PORT",
+    ] {
+        assert_eq!(unix.get(name), Some(&None), "{name} is not removed");
+    }
+    for (name, value) in [
+        ("PGHOST", "/run/zs/pg"),
+        ("PGPORT", "5432"),
+        ("MYSQL_UNIX_PORT", "/run/zs/db/orders-mysql.sock"),
+        ("ZS_ORDERS_REDIS_SOCKET", "/run/zs/db/orders-redis.sock"),
+    ] {
+        assert_eq!(unix.get(name), Some(&Some(value.to_string())), "{name}");
+    }
+
+    let mysql = ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 33_060)));
+    let redis = ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 6_380)));
+    let tcp = child_env(&services_with(
+        None,
+        Some(mysql.clone()),
+        &[("ZS_ORDERS_MYSQL", mysql), ("ZS_ORDERS_REDIS", redis)],
+    ));
+    assert_eq!(
+        tcp.get("ZS_ORDERS_REDIS_HOST"),
+        Some(&Some("127.0.0.1".to_string()))
+    );
+    assert_eq!(tcp.get("MYSQL_TCP_PORT"), Some(&Some("33060".to_string())));
+    let removed: Vec<_> = tcp.iter().filter(|(_, value)| value.is_none()).collect();
+    assert!(
+        removed.is_empty(),
+        "a TCP binding removes no variable: {removed:?}"
     );
 }
 

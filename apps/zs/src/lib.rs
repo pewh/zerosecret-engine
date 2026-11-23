@@ -1455,6 +1455,13 @@ impl AgentHandler {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
+    pub fn grant_refusal(&self, resource: &str, operation: &str) -> Option<String> {
+        let Some(binding) = self.bindings.get(resource) else {
+            return Some("unknown resource".to_string());
+        };
+        self.authorized(binding, operation).err()
+    }
+
     fn authorized(
         &self,
         binding: &ResourceBinding,

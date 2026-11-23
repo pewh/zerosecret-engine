@@ -15,7 +15,14 @@ use zs_protocol::{ACCESS_CHANGED_REASON, GRANT_REVOKED_REASON};
 use zs::socket_dir::{SocketGuard, prepare as prepare_socket};
 
 #[cfg(not(unix))]
-type SocketGuard = std::convert::Infallible;
+enum SocketGuard {}
+
+#[cfg(not(unix))]
+impl SocketGuard {
+    fn bound(&mut self) {
+        match *self {}
+    }
+}
 
 #[cfg(not(unix))]
 fn prepare_socket(_path: &std::path::Path) -> Result<SocketGuard, String> {
@@ -842,12 +849,11 @@ fn listener_front(
             })
         }
         zs::Listen::Network { addr, allow } => {
-            zs_mitm::FlowHandler::authorize_message(&*prepared.agent, resource, zs_policy::CONNECT)
-                .map_err(|_| {
-                    format!(
-                        "zs: {resource}: listen_addr {addr} needs a valid signed grant with the same listen_addr and listen_allow"
-                    )
-                })?;
+            if let Some(reason) = prepared.agent.grant_refusal(resource, zs_policy::CONNECT) {
+                return Err(format!(
+                    "zs: {resource}: listen_addr {addr} needs a valid signed grant with the same listen_addr and listen_allow ({reason})"
+                ));
+            }
             let audit = audit.on_network();
             Ok(Front {
                 spec: zs_protocol::ListenSpec::Tcp(addr),
@@ -1215,9 +1221,8 @@ async fn start_services(
             spec,
             check,
             audit,
-            socket,
+            mut socket,
         } = front(prepared, binding, audit)?;
-        sockets.extend(socket);
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
             &spec,
             endpoint,
@@ -1238,6 +1243,8 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
             }
         };
+        socket.iter_mut().for_each(SocketGuard::bound);
+        sockets.extend(socket);
         let local = pg.local().clone();
         announce_l3(prepared, "postgres", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
@@ -1281,9 +1288,8 @@ async fn start_services(
             spec,
             check,
             audit,
-            socket,
+            mut socket,
         } = front(prepared, binding, audit)?;
-        sockets.extend(socket);
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
             &spec,
             endpoint,
@@ -1303,6 +1309,8 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
             }
         };
+        socket.iter_mut().for_each(SocketGuard::bound);
+        sockets.extend(socket);
         let local = mysql.local().clone();
         announce_l3(prepared, "mysql", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
@@ -1353,9 +1361,8 @@ async fn start_services(
             spec,
             check,
             audit,
-            socket,
+            mut socket,
         } = front(prepared, binding, audit)?;
-        sockets.extend(socket);
         let mongo = match zs_proto_mongo::MongoListener::bind_endpoint(
             &spec,
             endpoint,
@@ -1374,6 +1381,8 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
             }
         };
+        socket.iter_mut().for_each(SocketGuard::bound);
+        sockets.extend(socket);
         let local = mongo.local().clone();
         announce_l3(prepared, "mongo", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
@@ -1407,9 +1416,8 @@ async fn start_services(
             spec,
             check,
             audit,
-            socket,
+            mut socket,
         } = front(prepared, binding, audit)?;
-        sockets.extend(socket);
         let redis = match zs_proto_redis::RedisListener::bind_endpoint(
             &spec,
             endpoint,
@@ -1428,6 +1436,8 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "redis_bind", 1));
             }
         };
+        socket.iter_mut().for_each(SocketGuard::bound);
+        sockets.extend(socket);
         let local = redis.local().clone();
         announce_l3(prepared, "redis", &binding.resource, &local);
         tasks.push(tokio::spawn(async move {
@@ -1825,6 +1835,20 @@ fn l3_env(services: &RunningServices) -> Vec<(String, std::ffi::OsString)> {
     env
 }
 
+fn l3_env_removed(services: &RunningServices) -> Vec<String> {
+    use zs_protocol::ListenSpec;
+    let mut removed = Vec::new();
+    if let Some(ListenSpec::Unix(_)) = &services.mysql {
+        removed.extend(["MYSQL_HOST".to_string(), "MYSQL_TCP_PORT".to_string()]);
+    }
+    for (prefix, local) in &services.l3 {
+        if let ListenSpec::Unix(_) = local {
+            removed.extend([format!("{prefix}_HOST"), format!("{prefix}_PORT")]);
+        }
+    }
+    removed
+}
+
 fn build_child(
     args: &super::Args,
     services: &RunningServices,
@@ -1888,6 +1912,9 @@ fn build_child(
                 "zs: could not write the node preload ({e}); Node's global fetch will not be intercepted"
             );
         }
+    }
+    for name in l3_env_removed(services) {
+        cmd.env_remove(name);
     }
     cmd.envs(l3_env(services));
     for (prefix, addr) in &services.endpoints {

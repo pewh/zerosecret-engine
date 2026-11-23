@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
+#[cfg(unix)]
+mod host_network;
 mod matrix_support;
 mod ws_fake;
 
@@ -7702,4 +7704,1252 @@ fn a_changing_cursor_is_polled_at_most_once_a_second() {
         requests <= 6,
         "a cursor that changed on every answer was polled {requests} times in 5 s"
     );
+}
+
+const LISTEN_HOST: &str = "orders-redis.internal";
+const CHILD_RAN: &str = "ZS_TEST_CHILD_ACTION=env";
+
+fn listener_grant(
+    upstream_port: u16,
+    listen: Option<(&str, &[&str])>,
+    expires_at_ms: u64,
+) -> Grant {
+    let connection = common::loopback_connection(upstream_port, true);
+    let listen_addr = listen.map(|(addr, _)| addr.to_string());
+    let listen_allow: Vec<String> = listen.map_or_else(Vec::new, |(_, allow)| {
+        allow.iter().map(|entry| entry.to_string()).collect()
+    });
+    let version = if listen_addr.is_some() {
+        zs_grant::GRANT_VERSION_LISTEN
+    } else {
+        zs_grant::GRANT_VERSION
+    };
+    Grant {
+        subject: common::default_subject(),
+        workload: "default".into(),
+        resource: redis_fake::RESOURCE.into(),
+        host: LISTEN_HOST.into(),
+        protocol: "redis".into(),
+        source: zs_policy::CredentialSource::file(redis_fake::RESOURCE),
+        operations: vec!["connect".into()],
+        environment: "development".into(),
+        expires_at_ms,
+        grant_id: "g-listen".into(),
+        materialization: zs_policy::Materialization::Retrieve,
+        upstream_host: connection.upstream_host,
+        upstream_port: connection.upstream_port,
+        upstream_tls: connection.upstream_tls,
+        local_endpoint: connection.local_endpoint,
+        listen_addr,
+        listen_allow,
+        access: zs_policy::Access::ReadWrite,
+        version,
+    }
+}
+
+struct ListenerHome {
+    home: common::TestHome,
+    upstream_port: u16,
+}
+
+impl ListenerHome {
+    fn new(upstream_port: u16, fields: serde_json::Value, grants: Vec<Grant>) -> Self {
+        let home = Self {
+            home: common::TestHome::new(".zs-ca"),
+            upstream_port,
+        };
+        std::fs::create_dir_all(home.creds()).unwrap();
+        std::fs::create_dir_all(home.audit().parent().unwrap()).unwrap();
+        std::fs::write(
+            home.creds().join(redis_fake::RESOURCE),
+            redis_fake::PASSWORD,
+        )
+        .unwrap();
+        home.write(fields, grants);
+        home
+    }
+
+    fn policy(&self) -> std::path::PathBuf {
+        self.home.path().join("zs-policy.json")
+    }
+
+    fn creds(&self) -> std::path::PathBuf {
+        self.home.path().join(".zs-credentials")
+    }
+
+    fn audit(&self) -> std::path::PathBuf {
+        self.home.path().join(".zs-audit").join("audit.jsonl")
+    }
+
+    fn ca_dir(&self) -> std::path::PathBuf {
+        self.home.path().join(".zs-ca")
+    }
+
+    fn write(&self, fields: serde_json::Value, grants: Vec<Grant>) {
+        self.write_signed(fields, grants, true);
+    }
+
+    fn write_signed(&self, fields: serde_json::Value, grants: Vec<Grant>, trusted: bool) {
+        let key = ControlSigningKey::generate("test-k1");
+        let stranger = ControlSigningKey::generate("test-k1");
+        let signer = if trusted { &key } else { &stranger };
+        let verifying: String = key
+            .verifying_key_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut binding = serde_json::json!({
+            "resource": redis_fake::RESOURCE,
+            "host": LISTEN_HOST,
+            "protocol": "redis",
+            "upstream_host": "127.0.0.1",
+            "upstream_port": self.upstream_port,
+            "upstream_plaintext": true,
+            "user": redis_fake::USER,
+        });
+        for (name, value) in fields.as_object().unwrap() {
+            if value.is_null() {
+                binding.as_object_mut().unwrap().remove(name);
+            } else {
+                binding[name] = value.clone();
+            }
+        }
+        let grants: Vec<SignedGrant> = grants
+            .into_iter()
+            .map(|grant| signer.sign(grant).unwrap())
+            .collect();
+        let policy = serde_json::json!({
+            "bindings": [binding],
+            "signing_keys": [{"key_id": "test-k1", "verifying_key_hex": verifying}],
+            "grants": grants,
+        });
+        std::fs::write(self.policy(), policy.to_string()).unwrap();
+    }
+
+    fn spawn(&self) -> common::AgentProcess {
+        let child = common::child(common::ChildAction::Sleep(20));
+        common::spawn_agent_with_env(
+            common::bin_path().as_path(),
+            &self.policy(),
+            &self.creds(),
+            &self.audit(),
+            &self.ca_dir(),
+            &child.args,
+            true,
+            &child.env(),
+        )
+        .expect("the agent starts")
+    }
+
+    fn run(&self) -> (i32, String) {
+        let child = common::child(common::ChildAction::PrintEnv);
+        let output = std::process::Command::new(common::bin_path())
+            .arg("run")
+            .arg("--policy")
+            .arg(self.policy())
+            .arg("--credentials-dir")
+            .arg(self.creds())
+            .arg("--audit")
+            .arg(self.audit())
+            .arg("--ca-dir")
+            .arg(self.ca_dir())
+            .args(["--as", "default", "--"])
+            .args(&child.args)
+            .env("ZS_HOME", self.home.path())
+            .envs(child.env())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("zs runs");
+        (
+            output.status.code().unwrap_or(-1),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    }
+
+    fn refused(&self, line: &str, stage: &str, row: &str) {
+        let (code, output) = self.run();
+        assert_refused_output(code, &output, line, row);
+        assert!(
+            !output.contains(CHILD_RAN),
+            "{row}: the child must not start:\n{output}"
+        );
+        let stages: Vec<_> = latest_run_events(self.home.path(), "run_refused")
+            .into_iter()
+            .map(|event| event["fields"]["stage"].clone())
+            .collect();
+        assert_eq!(stages, vec![serde_json::json!(stage)], "{row}: the stage");
+    }
+}
+
+fn assert_refused_output(code: i32, output: &str, line: &str, row: &str) {
+    assert_eq!(code, 1, "{row}:\n{output}");
+    assert!(
+        output.lines().any(|seen| seen == line),
+        "{row}: expected the line {line:?}:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("zs: redis {} -> ", redis_fake::RESOURCE)),
+        "{row}: no database listener may open:\n{output}"
+    );
+    assert!(
+        !output.contains(redis_fake::PASSWORD),
+        "{row}: the output holds the credential"
+    );
+}
+
+fn latest_run_events(home: &std::path::Path, name: &str) -> Vec<serde_json::Value> {
+    let latest = std::fs::read_dir(home.join(".zs-log"))
+        .expect("a diagnostic log directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|file| file.to_string_lossy().starts_with("run-"))
+        })
+        .max()
+        .expect("a diagnostic log");
+    std::fs::read_to_string(latest)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == name)
+        .collect()
+}
+
+#[cfg(unix)]
+fn diag_events(home: &std::path::Path, name: &str) -> Vec<serde_json::Value> {
+    diag_records(home)
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == name)
+        .collect()
+}
+
+#[cfg(unix)]
+fn audit_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    records(path)
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+fn allowed_connects(path: &std::path::Path) -> usize {
+    audit_records(path)
+        .iter()
+        .filter(|record| record["operation"] == "connect" && record["decision"] == "allow")
+        .count()
+}
+
+fn announced(agent: &common::AgentProcess) -> String {
+    let prefix = format!("zs: redis {} -> ", redis_fake::RESOURCE);
+    agent
+        .startup_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "the agent must announce its redis listener:\n{}",
+                agent.startup_stdout
+            )
+        })
+        .to_string()
+}
+
+async fn redis_ping<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = stream.write_all(b"*1\r\n$4\r\nPING\r\n").await;
+    let mut reply = Vec::new();
+    let mut buffer = [0u8; 64];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !reply.ends_with(b"\r\n") {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => reply.extend_from_slice(&buffer[..read]),
+            }
+        }
+    })
+    .await;
+    reply
+}
+
+async fn redis_upstream() -> redis_fake::Fake {
+    redis_fake::start(redis_fake::Script::accepting(
+        redis_fake::USER,
+        redis_fake::PASSWORD,
+    ))
+    .await
+}
+
+fn stop_agent(mut agent: common::AgentProcess) {
+    let _ = agent.child.kill();
+    let _ = agent.child.wait();
+}
+
+#[cfg(unix)]
+fn dir_with_mode(path: std::path::PathBuf, mode: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[cfg(unix)]
+fn socket_home(upstream_port: u16, dir: &std::path::Path) -> ListenerHome {
+    ListenerHome::new(
+        upstream_port,
+        serde_json::json!({ "listen_socket_dir": dir }),
+        vec![listener_grant(upstream_port, None, now_ms() + 3_600_000)],
+    )
+}
+
+#[cfg(unix)]
+async fn served_on_socket(
+    row: &str,
+    upstream: &redis_fake::Fake,
+    dir: &std::path::Path,
+) -> (ListenerHome, common::AgentProcess) {
+    let home = socket_home(upstream.addr.port(), dir);
+    let agent = home.spawn();
+    let path = dir.join(format!("{}.sock", redis_fake::RESOURCE));
+    assert_eq!(
+        announced(&agent),
+        path.display().to_string(),
+        "{row} positive control: the agent listens on the socket"
+    );
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    assert_eq!(
+        redis_ping(stream).await,
+        redis_fake::OK,
+        "{row} positive control: a client of the agent's user is served over the socket"
+    );
+    assert!(
+        upstream.authenticated(),
+        "{row} positive control: the upstream saw the brokered credential"
+    );
+    assert!(
+        allowed_connects(&home.audit()) >= 1,
+        "{row} positive control: the served client has an allow connect record"
+    );
+    (home, agent)
+}
+
+#[cfg(unix)]
+fn free_port_on(ip: std::net::IpAddr) -> u16 {
+    std::net::TcpListener::bind((ip, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[cfg(unix)]
+async fn served_on_network(
+    row: &str,
+    upstream: &redis_fake::Fake,
+    ip: std::net::IpAddr,
+) -> (ListenerHome, common::AgentProcess, String, String) {
+    let listen = std::net::SocketAddr::new(ip, free_port_on(ip)).to_string();
+    let allow = format!("{ip}/32");
+    let allowed = [allow.as_str()];
+    let port = upstream.addr.port();
+    let home = ListenerHome::new(
+        port,
+        serde_json::json!({ "listen_addr": listen, "listen_allow": allowed }),
+        vec![listener_grant(
+            port,
+            Some((listen.as_str(), &allowed[..])),
+            now_ms() + 3_600_000,
+        )],
+    );
+    let agent = home.spawn();
+    assert_eq!(
+        announced(&agent),
+        listen,
+        "{row} positive control: the run starts and listens on the signed address"
+    );
+    if host_network::delivers_inbound(ip) {
+        let stream = tokio::net::TcpStream::connect(&listen).await.unwrap();
+        assert_eq!(stream.local_addr().unwrap().ip(), ip);
+        assert_eq!(
+            redis_ping(stream).await,
+            redis_fake::OK,
+            "{row} positive control: a source inside the signed list is served"
+        );
+        assert!(
+            upstream.authenticated(),
+            "{row} positive control: the upstream saw the brokered credential"
+        );
+        assert!(
+            allowed_connects(&home.audit()) >= 1,
+            "{row} positive control: the served source has an allow connect record"
+        );
+    } else {
+        host_network::cannot_run_here(&format!(
+            "{row} positive control: a listener on {ip} gets no inbound data on this host, so no client is relayed"
+        ));
+    }
+    (home, agent, listen, allow)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_138_a_group_or_world_writable_socket_directory_refuses_the_run() {
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::tempdir().unwrap();
+    let private = sockets.path().join("private");
+    let (_served, agent) = served_on_socket("row 138", &upstream, &private).await;
+    assert_eq!(
+        mode_of(&private),
+        0o700,
+        "row 138 positive control: a missing directory gets mode 0700"
+    );
+    assert_eq!(
+        mode_of(&private.join(format!("{}.sock", redis_fake::RESOURCE))),
+        0o600,
+        "row 138 positive control: the socket gets mode 0600"
+    );
+    stop_agent(agent);
+
+    for mode in [0o770, 0o707] {
+        let shared = dir_with_mode(sockets.path().join(format!("shared-{mode:o}")), mode);
+        socket_home(upstream.addr.port(), &shared).refused(
+            &format!(
+                "zs: {}: {}: socket directory is group- or world-writable",
+                redis_fake::RESOURCE,
+                shared.display()
+            ),
+            "listen",
+            &format!("row 138 ({mode:o})"),
+        );
+        assert!(
+            std::fs::read_dir(&shared).unwrap().next().is_none(),
+            "row 138 ({mode:o}): the agent made no socket"
+        );
+    }
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        1,
+        "row 138: no upstream contact"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_139_a_socket_directory_of_another_owner_refuses_the_run() {
+    use std::os::unix::fs::MetadataExt;
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::tempdir().unwrap();
+    let (served, agent) = served_on_socket("row 139", &upstream, &sockets.path().join("own")).await;
+    stop_agent(agent);
+
+    let own_uid = std::fs::metadata(served.home.path()).unwrap().uid();
+    let foreign = if own_uid == 0 {
+        let dir = dir_with_mode(sockets.path().join("foreign"), 0o755);
+        std::os::unix::fs::chown(&dir, Some(65_534), None).unwrap();
+        dir
+    } else {
+        std::path::PathBuf::from("/usr")
+    };
+    let meta = std::fs::symlink_metadata(&foreign).unwrap();
+    assert!(
+        meta.is_dir() && meta.uid() != own_uid && meta.mode() & 0o022 == 0,
+        "row 139 setup: {} must be a directory of another owner that is not group- or world-writable",
+        foreign.display()
+    );
+    socket_home(upstream.addr.port(), &foreign).refused(
+        &format!(
+            "zs: {}: {}: socket directory is not owned by the agent's user",
+            redis_fake::RESOURCE,
+            foreign.display()
+        ),
+        "listen",
+        "row 139",
+    );
+    assert!(
+        std::fs::symlink_metadata(foreign.join(format!("{}.sock", redis_fake::RESOURCE))).is_err(),
+        "row 139: the agent made no socket"
+    );
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        1,
+        "row 139: no upstream contact"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_140_a_symbolic_link_as_socket_directory_or_socket_name_refuses_the_run() {
+    use std::os::unix::fs::symlink;
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::tempdir().unwrap();
+    let (_served, agent) =
+        served_on_socket("row 140", &upstream, &sockets.path().join("own")).await;
+    stop_agent(agent);
+
+    let real = dir_with_mode(sockets.path().join("real"), 0o700);
+    let link = sockets.path().join("link");
+    symlink(&real, &link).unwrap();
+    socket_home(upstream.addr.port(), &link).refused(
+        &format!(
+            "zs: {}: {}: socket directory is a symbolic link",
+            redis_fake::RESOURCE,
+            link.display()
+        ),
+        "listen",
+        "row 140 (directory)",
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "row 140: the directory link stays"
+    );
+    assert!(
+        std::fs::read_dir(&real).unwrap().next().is_none(),
+        "row 140: the agent made nothing in the link target"
+    );
+
+    let named = dir_with_mode(sockets.path().join("named"), 0o700);
+    let target = sockets.path().join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    let name = named.join(format!("{}.sock", redis_fake::RESOURCE));
+    symlink(&target, &name).unwrap();
+    socket_home(upstream.addr.port(), &named).refused(
+        &format!(
+            "zs: {}: {}: socket path is a symbolic link",
+            redis_fake::RESOURCE,
+            name.display()
+        ),
+        "listen",
+        "row 140 (socket name)",
+    );
+    assert!(
+        std::fs::symlink_metadata(&name)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "row 140: the socket name link stays"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"keep",
+        "row 140: the link target is not touched"
+    );
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        1,
+        "row 140: no upstream contact"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_141_a_live_socket_or_another_file_at_the_socket_name_refuses_the_run() {
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::tempdir().unwrap();
+    let live = sockets.path().join("live");
+    let (_first, agent) = served_on_socket("row 141", &upstream, &live).await;
+    let path = live.join(format!("{}.sock", redis_fake::RESOURCE));
+    socket_home(upstream.addr.port(), &live).refused(
+        &format!(
+            "zs: {}: {}: another listener is live on this socket path",
+            redis_fake::RESOURCE,
+            path.display()
+        ),
+        "listen",
+        "row 141 (live socket)",
+    );
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    assert_eq!(
+        redis_ping(stream).await,
+        redis_fake::OK,
+        "row 141: the first listener still answers"
+    );
+    stop_agent(agent);
+
+    let held = dir_with_mode(sockets.path().join("file"), 0o700);
+    let name = held.join(format!("{}.sock", redis_fake::RESOURCE));
+    std::fs::write(&name, b"keep").unwrap();
+    socket_home(upstream.addr.port(), &held).refused(
+        &format!(
+            "zs: {}: {}: socket path exists and is not a socket",
+            redis_fake::RESOURCE,
+            name.display()
+        ),
+        "listen",
+        "row 141 (file)",
+    );
+    assert_eq!(
+        std::fs::read(&name).unwrap(),
+        b"keep",
+        "row 141: the file at the name is kept"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_142_a_stale_socket_that_cannot_be_removed_refuses_the_run() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::tempdir().unwrap();
+    let stale = |dir: &std::path::Path| {
+        let path = dir.join(format!("{}.sock", redis_fake::RESOURCE));
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_err(),
+            "row 142 setup: the socket must be stale"
+        );
+        path
+    };
+    let removable = dir_with_mode(sockets.path().join("removable"), 0o700);
+    stale(&removable);
+    let (_served, agent) = served_on_socket("row 142", &upstream, &removable).await;
+    stop_agent(agent);
+
+    let kept = dir_with_mode(sockets.path().join("kept"), 0o700);
+    let path = stale(&kept);
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let Err(error) = std::fs::remove_file(&path) else {
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!(
+            "skipped: this user removes a file from a read-only directory (root), so no stale socket here is unremovable"
+        );
+        return;
+    };
+    socket_home(upstream.addr.port(), &kept).refused(
+        &format!(
+            "zs: {}: {}: cannot remove stale socket: {error}",
+            redis_fake::RESOURCE,
+            path.display()
+        ),
+        "listen",
+        "row 142",
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket(),
+        "row 142: the stale socket stays"
+    );
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_143_a_network_listener_without_an_allow_list_refuses_the_config() {
+    let Some(ip) = host_network::routed_ip() else {
+        return;
+    };
+    let upstream = redis_upstream().await;
+    let port = upstream.addr.port();
+    let (_served, agent, listen, allow) = served_on_network("row 143", &upstream, ip).await;
+    stop_agent(agent);
+
+    let allowed = [allow.as_str()];
+    let needs = "a non-loopback listen_addr needs listen_allow";
+    let every = "listen_allow must not admit every address";
+    for (case, fields, reason) in [
+        (
+            "no listen_allow",
+            serde_json::json!({ "listen_addr": listen }),
+            needs,
+        ),
+        (
+            "an empty listen_allow",
+            serde_json::json!({ "listen_addr": listen, "listen_allow": [] }),
+            needs,
+        ),
+        (
+            "0.0.0.0/0",
+            serde_json::json!({ "listen_addr": listen, "listen_allow": ["0.0.0.0/0"] }),
+            every,
+        ),
+        (
+            "::/0",
+            serde_json::json!({ "listen_addr": listen, "listen_allow": ["::/0"] }),
+            every,
+        ),
+    ] {
+        ListenerHome::new(
+            port,
+            fields,
+            vec![listener_grant(
+                port,
+                Some((listen.as_str(), &allowed[..])),
+                now_ms() + 3_600_000,
+            )],
+        )
+        .refused(
+            &format!("zs: policy: {}: {reason}", redis_fake::RESOURCE),
+            "config",
+            &format!("row 143 ({case})"),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_144_a_network_listener_value_that_the_signed_grant_does_not_carry_refuses_the_run() {
+    let Some(ip) = host_network::routed_ip() else {
+        return;
+    };
+    let upstream = redis_upstream().await;
+    let port = upstream.addr.port();
+    let (served, agent, listen, allow) = served_on_network("row 144", &upstream, ip).await;
+    stop_agent(agent);
+
+    let allowed = [allow.as_str()];
+    let other = [host_network::OTHER_NETWORK];
+    let fields = serde_json::json!({ "listen_addr": listen, "listen_allow": allowed });
+    let refused = |reason: &str| {
+        format!(
+            "zs: {}: listen_addr {listen} needs a valid signed grant with the same listen_addr and listen_allow ({reason})",
+            redis_fake::RESOURCE
+        )
+    };
+    let valid = now_ms() + 3_600_000;
+    for (case, grants, trusted, reason) in [
+        (
+            "no grant",
+            Vec::new(),
+            true,
+            format!("no grant for {}", redis_fake::RESOURCE),
+        ),
+        (
+            "a grant with another allow-list",
+            vec![listener_grant(
+                port,
+                Some((listen.as_str(), &other[..])),
+                valid,
+            )],
+            true,
+            format!(
+                "{}: listen_allow differs from the grant",
+                redis_fake::RESOURCE
+            ),
+        ),
+        (
+            "a grant without listener fields",
+            vec![listener_grant(port, None, valid)],
+            true,
+            format!(
+                "{}: listen_addr differs from the grant",
+                redis_fake::RESOURCE
+            ),
+        ),
+        (
+            "an expired grant",
+            vec![listener_grant(
+                port,
+                Some((listen.as_str(), &allowed[..])),
+                now_ms() - 1_000,
+            )],
+            true,
+            "grant expired".to_string(),
+        ),
+        (
+            "a grant of an unknown signing key",
+            vec![listener_grant(
+                port,
+                Some((listen.as_str(), &allowed[..])),
+                valid,
+            )],
+            false,
+            "grant signature invalid".to_string(),
+        ),
+    ] {
+        served.write_signed(fields.clone(), grants, trusted);
+        served.refused(&refused(&reason), "listen", &format!("row 144 ({case})"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn row_144_a_mint_that_does_not_carry_the_file_value_refuses_the_run() {
+    let Some(ip) = host_network::routed_ip() else {
+        return;
+    };
+    let port = 6379;
+    let listen = std::net::SocketAddr::new(ip, free_port_on(ip)).to_string();
+    let allow = format!("{ip}/32");
+    let refused = |reason: &str| {
+        format!(
+            "zs: {}: listen_addr {listen} needs a valid signed grant with the same listen_addr and listen_allow ({reason})",
+            redis_fake::RESOURCE
+        )
+    };
+    let control = |listen_fields: Option<(&str, &str)>| zs_policy::ResolvedConnection {
+        listen_addr: listen_fields.map(|(addr, _)| addr.to_string()),
+        listen_allow: listen_fields.map_or_else(Vec::new, |(_, allow)| vec![allow.to_string()]),
+        ..common::loopback_connection(port, true)
+    };
+    let binding = |allow: &str| {
+        serde_json::json!({
+            "resource": redis_fake::RESOURCE,
+            "host": LISTEN_HOST,
+            "protocol": "redis",
+            "upstream_host": "127.0.0.1",
+            "upstream_port": port,
+            "upstream_plaintext": true,
+            "user": redis_fake::USER,
+            "listen_addr": listen,
+            "listen_allow": [allow],
+        })
+    };
+    let fake = FakeControl::start();
+    fake.set_minted_version(zs_grant::GRANT_VERSION_LISTEN);
+    fake.answer(FakeGrant::Signed(
+        LISTEN_HOST,
+        "redis",
+        control(Some((listen.as_str(), allow.as_str()))),
+    ));
+    let home = fake.token_home_with(binding(&allow));
+    let (code, output) = fake.token_run(&home);
+    assert_eq!(
+        code, 0,
+        "row 144 positive control: a file value equal to the signed one starts the run:\n{output}"
+    );
+    assert!(
+        home.marker().exists(),
+        "row 144 positive control:\n{output}"
+    );
+    assert!(
+        output
+            .lines()
+            .any(|line| line == format!("zs: redis {} -> {listen}", redis_fake::RESOURCE)),
+        "row 144 positive control: the listener opens on the signed address:\n{output}"
+    );
+
+    let other_list = field_line(
+        redis_fake::RESOURCE,
+        "listen_allow",
+        host_network::OTHER_NETWORK,
+        &allow,
+    );
+    let unsigned_addr = field_line(redis_fake::RESOURCE, "listen_addr", &listen, "none");
+    let no_grant = refused(&format!("no grant for {}", redis_fake::RESOURCE));
+    for (case, allow_in_file, signed, refusal, line, stage) in [
+        (
+            "a file listen_allow that differs from the signed one",
+            host_network::OTHER_NETWORK,
+            true,
+            None,
+            &other_list,
+            "control",
+        ),
+        (
+            "a signed grant without listen_addr",
+            allow.as_str(),
+            false,
+            None,
+            &unsigned_addr,
+            "control",
+        ),
+        (
+            "a refused mint",
+            allow.as_str(),
+            true,
+            Some(403),
+            &no_grant,
+            "listen",
+        ),
+    ] {
+        let row = format!("row 144 ({case})");
+        if signed {
+            fake.set_minted_version(zs_grant::GRANT_VERSION_LISTEN);
+            fake.answer(FakeGrant::Signed(
+                LISTEN_HOST,
+                "redis",
+                control(Some((listen.as_str(), allow.as_str()))),
+            ));
+        } else {
+            fake.set_minted_version(zs_grant::GRANT_VERSION);
+            fake.answer(FakeGrant::Signed(LISTEN_HOST, "redis", control(None)));
+        }
+        fake.set_mint_refusal(refusal);
+        home.write_policy(&fake.url, binding(allow_in_file));
+        let (code, output) = fake.token_run(&home);
+        home.assert_refused(code, &output, line, &row);
+        assert_refused_output(code, &output, line, &row);
+        let stages: Vec<_> = latest_run_events(home.home.path(), "run_refused")
+            .into_iter()
+            .map(|event| event["fields"]["stage"].clone())
+            .collect();
+        assert_eq!(stages, vec![serde_json::json!(stage)], "{row}: the stage");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_145_a_network_listener_closes_a_source_outside_its_allow_list_before_any_byte() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(ip) = host_network::route_b_host() else {
+        return;
+    };
+    let upstream = redis_upstream().await;
+    let port = upstream.addr.port();
+    let (served, agent, _, _) = served_on_network("row 145", &upstream, ip).await;
+    let allowed = audit_records(&served.audit());
+    stop_agent(agent);
+    assert_eq!(allowed.len(), 1, "row 145 positive control: {allowed:?}");
+    assert_eq!(allowed[0]["decision"], "allow", "row 145 positive control");
+    assert_eq!(
+        allowed[0]["source_addr"],
+        ip.to_string(),
+        "row 145 positive control: an allowed source is audited with its address"
+    );
+    assert_eq!(
+        allowed_connects(&served.audit()),
+        1,
+        "row 145 positive control: the allowed source counts as one materialization"
+    );
+    let accepts = upstream.seen(|seen| seen.accepts);
+
+    let listen = std::net::SocketAddr::new(ip, free_port_on(ip)).to_string();
+    let other = [host_network::OTHER_NETWORK];
+    let home = ListenerHome::new(
+        port,
+        serde_json::json!({ "listen_addr": listen, "listen_allow": other }),
+        vec![listener_grant(
+            port,
+            Some((listen.as_str(), &other[..])),
+            now_ms() + 3_600_000,
+        )],
+    );
+    let agent = home.spawn();
+    assert_eq!(announced(&agent), listen, "row 145: the listener opens");
+    let mut client = tokio::net::TcpStream::connect(&listen).await.unwrap();
+    assert_eq!(
+        client.local_addr().unwrap().ip(),
+        ip,
+        "row 145: the source is the host address"
+    );
+    let _ = client.write_all(b"*1\r\n$4\r\nPING\r\n").await;
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .expect("row 145: the refusal is prompt");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "row 145: the client reads no byte: {read:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let records = audit_records(&home.audit());
+    let refusals = diag_events(home.home.path(), "caller_refused");
+    let materialized = allowed_connects(&home.audit());
+    stop_agent(agent);
+
+    assert_eq!(records.len(), 1, "row 145: one audit record: {records:?}");
+    assert_eq!(records[0]["operation"], "connect", "row 145");
+    assert_eq!(records[0]["decision"], "deny", "row 145");
+    assert_eq!(records[0]["reason"], "caller_refused", "row 145");
+    assert_eq!(records[0]["source_addr"], ip.to_string(), "row 145");
+    assert!(
+        zs_audit::verify_chain(home.audit()).is_ok(),
+        "row 145: the hash chain verifies"
+    );
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        accepts,
+        "row 145: no upstream contact"
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "row 145: one caller_refused: {refusals:?}"
+    );
+    assert_eq!(refusals[0]["fields"]["listen"], "network", "row 145");
+    assert_eq!(refusals[0]["fields"]["listener"], "redis", "row 145");
+    assert_eq!(materialized, 0, "row 145: no materialization");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ZS_OTHER_USER"]
+async fn row_146_a_unix_socket_client_of_another_os_user_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let other = std::env::var("ZS_OTHER_USER").expect("ZS_OTHER_USER");
+    let upstream = redis_upstream().await;
+    let sockets = tempfile::Builder::new()
+        .prefix("zs-row-146-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let dir = sockets.path().join("run");
+    let (served, agent) = served_on_socket("row 146", &upstream, &dir).await;
+    let path = dir.join(format!("{}.sock", redis_fake::RESOURCE));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let unix_refusals = |events: Vec<serde_json::Value>| {
+        events
+            .into_iter()
+            .filter(|event| event["fields"]["listen"] == "unix")
+            .count()
+    };
+    assert_eq!(
+        unix_refusals(diag_events(served.home.path(), "caller_refused")),
+        0,
+        "row 146 positive control: the agent's own user is not refused"
+    );
+    let materialized = allowed_connects(&served.audit());
+    assert!(
+        materialized >= 1,
+        "row 146 positive control: the agent's own client has an allow connect record"
+    );
+
+    let own_uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    let other_uid = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "id", "-u"])
+        .output()
+        .expect("sudo");
+    assert!(
+        other_uid.status.success() && !other_uid.stdout.is_empty(),
+        "row 146 needs a working `sudo -n -u {other}`: {other_uid:?}"
+    );
+    assert_ne!(
+        other_uid.stdout, own_uid.stdout,
+        "row 146: ZS_OTHER_USER must be another OS user"
+    );
+    let netcat = std::process::Command::new("sudo")
+        .args(["-n", "-u", &other, "sh", "-c", "command -v nc"])
+        .output()
+        .expect("sudo");
+    assert!(
+        netcat.status.success(),
+        "row 146 needs nc for {other}: {netcat:?}"
+    );
+    let connect = || {
+        std::process::Command::new("sudo")
+            .args(["-n", "-u", &other, "nc", "-U"])
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("sudo")
+    };
+
+    let blocked = connect();
+    assert!(
+        !blocked.status.success() && blocked.stdout.is_empty(),
+        "row 146: the 0600 socket in a 0700 directory keeps another user out: {blocked:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        unix_refusals(diag_events(served.home.path(), "caller_refused")),
+        0,
+        "row 146: the other user's client never reached the agent"
+    );
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let refused = connect();
+    assert!(
+        refused.stdout.is_empty(),
+        "row 146: another user must read nothing: {refused:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let refusals = unix_refusals(diag_events(served.home.path(), "caller_refused"));
+    let materialized_after = allowed_connects(&served.audit());
+    stop_agent(agent);
+    assert_eq!(
+        refusals, 1,
+        "row 146: the peer credential check refused the other user once"
+    );
+    assert_eq!(
+        materialized_after, materialized,
+        "row 146: no materialization"
+    );
+    assert_eq!(
+        upstream.seen(|seen| seen.accepts),
+        1,
+        "row 146: no new upstream contact"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn row_147_a_socket_dir_or_a_network_listen_addr_refuses_the_run_on_windows() {
+    let upstream = redis_upstream().await;
+    let port = upstream.addr.port();
+    let listen = format!("127.0.0.1:{}", common::free_port());
+    let grant = || vec![listener_grant(port, None, now_ms() + 3_600_000)];
+    let home = ListenerHome::new(port, serde_json::json!({ "listen_addr": listen }), grant());
+    let agent = home.spawn();
+    assert_eq!(
+        announced(&agent),
+        listen,
+        "row 147 positive control: a loopback listen_addr listens there"
+    );
+    let stream = tokio::net::TcpStream::connect(&listen).await.unwrap();
+    assert_eq!(
+        redis_ping(stream).await,
+        redis_fake::OK,
+        "row 147 positive control: the client is served"
+    );
+    stop_agent(agent);
+
+    for (case, fields) in [
+        (
+            "listen_socket_dir",
+            serde_json::json!({ "listen_socket_dir": std::env::temp_dir().join("zs-row-147") }),
+        ),
+        (
+            "a non-loopback listen_addr",
+            serde_json::json!({ "listen_addr": "192.0.2.10:6390", "listen_allow": ["192.0.2.0/24"] }),
+        ),
+    ] {
+        home.write(fields, grant());
+        home.refused(
+            &format!(
+                "zs: policy: {}: listen_socket_dir and listen_addr are not supported on Windows",
+                redis_fake::RESOURCE
+            ),
+            "config",
+            &format!("row 147 ({case})"),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_148_conflicting_listener_fields_refuse_the_config() {
+    let upstream = redis_upstream().await;
+    let port = upstream.addr.port();
+    let listen = format!("127.0.0.1:{}", common::free_port());
+    let grant = || vec![listener_grant(port, None, now_ms() + 3_600_000)];
+    let home = ListenerHome::new(port, serde_json::json!({ "listen_addr": listen }), grant());
+    let agent = home.spawn();
+    assert_eq!(
+        announced(&agent),
+        listen,
+        "row 148 positive control: a loopback listen_addr listens there"
+    );
+    let stream = tokio::net::TcpStream::connect(&listen).await.unwrap();
+    assert_eq!(
+        redis_ping(stream).await,
+        redis_fake::OK,
+        "row 148 positive control: the client is served"
+    );
+    stop_agent(agent);
+
+    let dir = std::env::temp_dir().join("zs-row-148");
+    let dotted = dir.join("..").join("zs");
+    let resource = redis_fake::RESOURCE;
+    let not_cidr = format!("listen_allow entry {:?} is not a CIDR", "10.0.0.0");
+    let host_bits = format!("listen_allow entry {:?} has host bits set", "10.0.0.1/8");
+    let mapped = format!(
+        "listen_allow entry {:?} is an IPv4-mapped IPv6 address; write it as IPv4",
+        "::ffff:10.0.0.0/104"
+    );
+    let cases: Vec<(serde_json::Value, &str, &str)> = vec![
+        (
+            serde_json::json!({ "protocol": "https", "user": null, "upstream_plaintext": null, "listen_addr": listen }),
+            resource,
+            "listen_socket_dir, listen_addr and listen_allow are allowed only on a mysql, postgres, mongo or redis binding",
+        ),
+        (
+            serde_json::json!({ "listen_port": 6390, "listen_socket_dir": dir }),
+            resource,
+            "listen_port cannot be set with listen_socket_dir",
+        ),
+        (
+            serde_json::json!({ "listen_addr": listen, "listen_port": 6390 }),
+            resource,
+            "listen_addr cannot be set with listen_port or listen_socket_dir",
+        ),
+        (
+            serde_json::json!({ "listen_addr": listen, "listen_socket_dir": dir }),
+            resource,
+            "listen_addr cannot be set with listen_port or listen_socket_dir",
+        ),
+        (
+            serde_json::json!({ "listen_addr": listen, "listen_allow": ["10.0.0.0/8"] }),
+            resource,
+            "listen_allow needs a non-loopback listen_addr",
+        ),
+        (
+            serde_json::json!({ "listen_socket_dir": dir, "listen_allow": ["10.0.0.0/8"] }),
+            resource,
+            "listen_allow needs a non-loopback listen_addr",
+        ),
+        (
+            serde_json::json!({ "listen_allow": ["10.0.0.0/8"] }),
+            resource,
+            "listen_allow needs a non-loopback listen_addr",
+        ),
+        (
+            serde_json::json!({ "listen_socket_dir": "run/zs" }),
+            resource,
+            "listen_socket_dir must be an absolute path",
+        ),
+        (
+            serde_json::json!({ "listen_socket_dir": dotted }),
+            resource,
+            "listen_socket_dir must not contain ..",
+        ),
+        (
+            serde_json::json!({ "resource": "a/b", "listen_socket_dir": dir }),
+            "a/b",
+            "a resource with listen_socket_dir must be a plain file name",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "localhost:6390" }),
+            resource,
+            "listen_addr must be an IP address and a port, such as 172.17.0.1:5433",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "192.0.2.10:0", "listen_allow": ["192.0.2.0/24"] }),
+            resource,
+            "listen_addr port must be 1 to 65535",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "0.0.0.0:6390", "listen_allow": ["10.0.0.0/8"] }),
+            resource,
+            "listen_addr must not be 0.0.0.0 or ::",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "[::]:6390", "listen_allow": ["10.0.0.0/8"] }),
+            resource,
+            "listen_addr must not be 0.0.0.0 or ::",
+        ),
+        (
+            serde_json::json!({ "listen_addr": "192.0.2.10:6390", "listen_allow": ["10.0.0.0"] }),
+            resource,
+            not_cidr.as_str(),
+        ),
+        (
+            serde_json::json!({ "listen_addr": "192.0.2.10:6390", "listen_allow": ["10.0.0.1/8"] }),
+            resource,
+            host_bits.as_str(),
+        ),
+        (
+            serde_json::json!({ "listen_addr": "192.0.2.10:6390", "listen_allow": ["::ffff:10.0.0.0/104"] }),
+            resource,
+            mapped.as_str(),
+        ),
+    ];
+    for (fields, named, reason) in cases {
+        home.write(fields, grant());
+        home.refused(
+            &format!("zs: policy: {named}: {reason}"),
+            "config",
+            &format!("row 148 ({reason})"),
+        );
+    }
 }
