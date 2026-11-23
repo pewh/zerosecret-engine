@@ -64,7 +64,7 @@ fn parse_url(url: &str) -> Option<Database> {
 type Refusals = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
 
 async fn listen(db: &Database, access: SessionAccess) -> (SocketAddr, Refusals) {
-    let materialize: Materialize = Arc::new(move || {
+    let materialize: Materialize = Arc::new(move |_| {
         Ok(Materialized::new(
             Credential::from_bytes(ROLE_PASSWORD.as_bytes().to_vec()).unwrap(),
             access,

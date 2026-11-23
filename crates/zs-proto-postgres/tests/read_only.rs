@@ -53,7 +53,7 @@ async fn listen_as(port: u16, access: SessionAccess) -> Session {
         Some(7)
     });
     let materialize: Materialize =
-        Arc::new(move || Ok(fake::granted_as(fake::PASSWORD.as_bytes(), access)));
+        Arc::new(move |_| Ok(fake::granted_as(fake::PASSWORD.as_bytes(), access)));
     let home = tempfile::tempdir().unwrap();
     let (diag, log) = fake::open_diag(home.path());
     let listener = PostgresListener::bind_endpoint(

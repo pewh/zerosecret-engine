@@ -914,7 +914,10 @@ async fn a_caller_the_check_admits_is_relayed() {
     let (diag, _log, _dir) = caller_diag();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let record = seen.clone();
-    let check: zs_protocol::CallerCheck = std::sync::Arc::new(move |peer, local| {
+    let check: zs_protocol::CallerCheck = std::sync::Arc::new(move |caller| {
+        let zs_protocol::Caller::Tcp { peer, local } = *caller else {
+            return false;
+        };
         record.lock().unwrap().push((peer, local));
         true
     });
@@ -951,7 +954,7 @@ async fn a_failed_peer_lookup_denies() {
         diag.clone(),
         None,
         None,
-        Some(std::sync::Arc::new(|_, _| false)),
+        Some(std::sync::Arc::new(|_| false)),
     )
     .await;
 

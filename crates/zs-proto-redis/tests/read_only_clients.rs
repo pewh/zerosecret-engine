@@ -66,7 +66,7 @@ async fn front(real: &Real, access: SessionAccess) -> (SocketAddr, fake::Refusal
     let password = real.password.clone();
     let (audit, refusals) = fake::audit_recorder();
     let materialize: zs_protocol::Materialize =
-        Arc::new(move || Ok(fake::granted_with(password.as_bytes(), access)));
+        Arc::new(move |_| Ok(fake::granted_with(password.as_bytes(), access)));
     let endpoint =
         UpstreamEndpoint::new(real.address.ip().to_string(), real.address.port()).unwrap();
     let listener =

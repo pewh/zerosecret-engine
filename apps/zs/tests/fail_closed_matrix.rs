@@ -5522,7 +5522,7 @@ async fn row_123_an_open_database_session_closes_when_its_grant_is_revoked() {
     const REVOKED: &str = "grant revoked";
     let granted = Arc::new(AtomicBool::new(true));
     let state = granted.clone();
-    let materialize: zs_protocol::Materialize = Arc::new(move || {
+    let materialize: zs_protocol::Materialize = Arc::new(move |_| {
         if !state.load(Ordering::SeqCst) {
             return Err(zs_protocol::Denied::new(REVOKED));
         }
@@ -5788,7 +5788,7 @@ async fn pg_access_listener(
 ) -> (std::net::SocketAddr, fake::Refusals) {
     let (audit, refusals) = fake::audit_recorder();
     let materialize: zs_proto_postgres::Materialize =
-        Arc::new(move || Ok(pg_fake::granted_as(pg_fake::PASSWORD.as_bytes(), access)));
+        Arc::new(move |_| Ok(pg_fake::granted_as(pg_fake::PASSWORD.as_bytes(), access)));
     let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
         "127.0.0.1:0",
         zs_proto_postgres::UpstreamEndpoint::new("127.0.0.1", upstream.port()).unwrap(),
@@ -6604,7 +6604,7 @@ async fn row_131_an_open_database_session_closes_when_the_access_of_its_grant_ch
             SessionAccess::ReadWrite
         }
     };
-    let materialize: zs_protocol::Materialize = Arc::new(move || {
+    let materialize: zs_protocol::Materialize = Arc::new(move |_| {
         let access = access_of(state.load(Ordering::SeqCst));
         let state = state.clone();
         let check: zs_protocol::SessionCheck = Arc::new(move || {
@@ -7443,7 +7443,7 @@ async fn row_137_an_open_session_ends_at_once_on_revocation() {
     ));
     let materialize: zs_protocol::Materialize = {
         let handler = handler.clone();
-        Arc::new(move || {
+        Arc::new(move |_| {
             let handler = handler.clone();
             let wake = handler.grant_changes();
             let check: zs_protocol::SessionCheck = Arc::new(move || {

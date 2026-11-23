@@ -330,7 +330,7 @@ async fn a_materialize_denial_answers_after_the_client_handshake() {
     assert_eq!(fake.seen(|s| s.accepts), 1);
 
     let denied: zs_proto_mysql::Materialize =
-        Arc::new(|| Err(zs_protocol::Denied::new("no grant for orders-mysql")));
+        Arc::new(|_| Err(zs_protocol::Denied::new("no grant for orders-mysql")));
     let local = fake.listen(UpstreamTls::WhenOffered, denied).await;
     let session = fake::login(local, CLIENT_CAPS).await;
     assert_eq!(
@@ -919,7 +919,10 @@ async fn a_caller_the_check_admits_is_relayed() {
     let (diag, _log, _dir) = caller_diag();
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let record = seen.clone();
-    let check: zs_protocol::CallerCheck = Arc::new(move |peer, local| {
+    let check: zs_protocol::CallerCheck = Arc::new(move |caller| {
+        let zs_protocol::Caller::Tcp { peer, local } = *caller else {
+            return false;
+        };
         record.lock().unwrap().push((peer, local));
         true
     });
@@ -955,7 +958,7 @@ async fn a_failed_peer_lookup_denies() {
         fake::materialize(PASSWORD),
         diag.clone(),
         None,
-        Some(Arc::new(|_, _| false)),
+        Some(Arc::new(|_| false)),
     )
     .await;
 

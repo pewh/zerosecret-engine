@@ -684,7 +684,7 @@ fn through_listener(up: &Upstream, tls_fields: &str) -> TlsRun {
             zs_proto_postgres::UpstreamEndpoint::new(host, port).unwrap(),
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
-            std::sync::Arc::new(|| {
+            std::sync::Arc::new(|_| {
                 Ok(zs_protocol::Materialized::new(
                     zs_credential::Credential::from_bytes(UPSTREAM_PASSWORD.as_bytes().to_vec())
                         .unwrap(),
@@ -696,7 +696,7 @@ fn through_listener(up: &Upstream, tls_fields: &str) -> TlsRun {
         .await
         .unwrap()
         .with_diag(diag.clone(), "appdb")
-        .with_caller_check(std::sync::Arc::new(|_, _| true));
+        .with_caller_check(std::sync::Arc::new(|_| true));
         let local = listener.local_addr();
         tokio::spawn(listener.serve());
         local

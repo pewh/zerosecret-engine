@@ -697,7 +697,7 @@ pub fn auth() -> Auth {
 }
 
 pub fn admit_all() -> zs_protocol::CallerCheck {
-    Arc::new(|_, _| true)
+    Arc::new(|_| true)
 }
 
 pub async fn listen(
@@ -777,15 +777,15 @@ pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
 }
 
 pub fn materialize(password: &'static str) -> Materialize {
-    Arc::new(move || Ok(granted(password.as_bytes())))
+    Arc::new(move |_| Ok(granted(password.as_bytes())))
 }
 
 pub fn materialize_with(password: &'static str, access: zs_protocol::SessionAccess) -> Materialize {
-    Arc::new(move || Ok(granted_with(password.as_bytes(), access)))
+    Arc::new(move |_| Ok(granted_with(password.as_bytes(), access)))
 }
 
 pub fn denied() -> Materialize {
-    Arc::new(|| Err(zs_protocol::Denied::new("no grant for orders-mongo")))
+    Arc::new(|_| Err(zs_protocol::Denied::new("no grant for orders-mongo")))
 }
 
 pub type Refusals = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
@@ -988,7 +988,7 @@ pub async fn eventually(check: impl Fn() -> bool) -> bool {
 pub fn counter() -> (Materialize, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let materialize: Materialize = Arc::new(move || {
+    let materialize: Materialize = Arc::new(move |_| {
         count.fetch_add(1, Ordering::SeqCst);
         Ok(granted(PASSWORD.as_bytes()))
     });

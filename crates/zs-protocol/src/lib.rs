@@ -1,8 +1,44 @@
 use zs_credential::Credential;
 use zs_identity::{Subject, WorkloadLabel};
 
-pub type CallerCheck =
-    std::sync::Arc<dyn Fn(std::net::SocketAddr, std::net::SocketAddr) -> bool + Send + Sync>;
+#[cfg(feature = "session")]
+mod front;
+
+#[cfg(feature = "session")]
+pub use front::{ClientReadHalf, ClientStream, ClientWriteHalf, FrontListener};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caller {
+    Tcp {
+        peer: std::net::SocketAddr,
+        local: std::net::SocketAddr,
+    },
+    Unix {
+        uid: Option<u32>,
+    },
+}
+
+const UNKNOWN_LOCAL: std::net::SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::UNSPECIFIED,
+    0,
+));
+
+impl Caller {
+    pub fn tcp(peer: std::net::SocketAddr, local: std::io::Result<std::net::SocketAddr>) -> Self {
+        Self::Tcp {
+            peer,
+            local: local.unwrap_or(UNKNOWN_LOCAL),
+        }
+    }
+}
+
+pub type CallerCheck = std::sync::Arc<dyn Fn(&Caller) -> bool + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListenSpec {
+    Tcp(std::net::SocketAddr),
+    Unix(std::path::PathBuf),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
@@ -142,22 +178,20 @@ impl SessionWatch {
     }
 }
 
-pub type Materialize = std::sync::Arc<dyn Fn() -> Result<Materialized, Denied> + Send + Sync>;
+pub type Materialize =
+    std::sync::Arc<dyn Fn(&Caller) -> Result<Materialized, Denied> + Send + Sync>;
 
 pub type AuditRefusal =
     std::sync::Arc<dyn Fn(&'static str, &'static str) -> Option<u64> + Send + Sync>;
 
 #[cfg(feature = "session")]
-pub async fn admitted(
-    check: Option<&CallerCheck>,
-    client: &tokio::net::TcpStream,
-    peer: std::net::SocketAddr,
-) -> bool {
-    let (Some(check), Ok(local)) = (check, client.local_addr()) else {
+pub async fn admitted(check: Option<&CallerCheck>, caller: &Caller) -> bool {
+    let unknown = matches!(caller, Caller::Tcp { local, .. } if *local == UNKNOWN_LOCAL);
+    let (Some(check), false) = (check, unknown) else {
         return false;
     };
-    let check = check.clone();
-    tokio::task::spawn_blocking(move || check(peer, local))
+    let (check, caller) = (check.clone(), *caller);
+    tokio::task::spawn_blocking(move || check(&caller))
         .await
         .unwrap_or(false)
 }
@@ -584,13 +618,52 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
             let (accepted, peer) = listener.accept().await.unwrap();
-            let allow: CallerCheck = Arc::new(|_, _| true);
-            let refuse: CallerCheck = Arc::new(|_, _| false);
-            let panics: CallerCheck = Arc::new(|_, _| panic!("the caller check panicked"));
-            assert!(admitted(Some(&allow), &accepted, peer).await);
-            assert!(!admitted(None, &accepted, peer).await);
-            assert!(!admitted(Some(&refuse), &accepted, peer).await);
-            assert!(!admitted(Some(&panics), &accepted, peer).await);
+            let caller = Caller::tcp(peer, accepted.local_addr());
+            let allow: CallerCheck = Arc::new(|_| true);
+            let refuse: CallerCheck = Arc::new(|_| false);
+            let panics: CallerCheck = Arc::new(|_| panic!("the caller check panicked"));
+            assert!(admitted(Some(&allow), &caller).await);
+            assert!(!admitted(None, &caller).await);
+            assert!(!admitted(Some(&refuse), &caller).await);
+            assert!(!admitted(Some(&panics), &caller).await);
+        }
+
+        #[tokio::test]
+        async fn the_check_gets_the_caller() {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = seen.clone();
+            let check: CallerCheck = Arc::new(move |caller| {
+                record.lock().unwrap().push(*caller);
+                true
+            });
+            let tcp = Caller::Tcp {
+                peer: "127.0.0.1:40001".parse().unwrap(),
+                local: "127.0.0.1:5432".parse().unwrap(),
+            };
+            let unix = Caller::Unix { uid: Some(501) };
+            assert!(admitted(Some(&check), &tcp).await);
+            assert!(admitted(Some(&check), &unix).await);
+            assert_eq!(*seen.lock().unwrap(), vec![tcp, unix]);
+        }
+
+        #[tokio::test]
+        async fn a_tcp_caller_without_a_local_address_is_refused_before_the_check() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let allow: CallerCheck = Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            let peer: std::net::SocketAddr = "127.0.0.1:40001".parse().unwrap();
+            let known = Caller::tcp(peer, Ok("127.0.0.1:5432".parse().unwrap()));
+            assert!(admitted(Some(&allow), &known).await);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let unknown = Caller::tcp(
+                peer,
+                Err(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+            );
+            assert!(!admitted(Some(&allow), &unknown).await);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }
 }

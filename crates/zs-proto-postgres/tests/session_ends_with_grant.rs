@@ -25,7 +25,7 @@ type Refusals = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
 fn grant_state() -> (Materialize, Arc<AtomicBool>) {
     let granted = Arc::new(AtomicBool::new(true));
     let state = granted.clone();
-    let materialize: Materialize = Arc::new(move || {
+    let materialize: Materialize = Arc::new(move |_| {
         if !state.load(Ordering::SeqCst) {
             return Err(zs_protocol::Denied::new(REVOKED));
         }

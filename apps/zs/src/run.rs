@@ -300,7 +300,7 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
         });
         Ok(zs_protocol::Materialized::new(credential, access, check))
     };
-    std::sync::Arc::new(move || with_grant_wake(&*audit.handler, || build(&audit)))
+    std::sync::Arc::new(move |_| with_grant_wake(&*audit.handler, || build(&audit)))
 }
 
 // Subscribes to grant changes before `build` reads the grant, so a change that lands while the
@@ -1899,6 +1899,13 @@ mod tests {
 
     mod access_change;
 
+    fn loopback_caller() -> zs_protocol::Caller {
+        zs_protocol::Caller::Tcp {
+            peer: std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            local: std::net::SocketAddr::from(([127, 0, 0, 1], 5432)),
+        }
+    }
+
     #[test]
     fn the_read_only_audit_reasons_of_the_four_relays_are_the_pinned_strings() {
         let reasons = [
@@ -2043,7 +2050,7 @@ mod tests {
             "postgres",
             std::sync::Arc::new(DenyingHandler),
         ));
-        let Err(denied) = materialize() else {
+        let Err(denied) = materialize(&loopback_caller()) else {
             panic!("materialize must be denied");
         };
         assert_eq!(denied.reason, "credential reference x not resolvable");
@@ -2274,7 +2281,8 @@ mod tests {
         let materialized = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async move {
-                materialize().unwrap_or_else(|denied| panic!("positive control: {}", denied.reason))
+                materialize(&loopback_caller())
+                    .unwrap_or_else(|denied| panic!("positive control: {}", denied.reason))
             });
         let access = materialized.access();
         let (_, watch) = materialized.into_parts();

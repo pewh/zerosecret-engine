@@ -24,8 +24,8 @@ use topology::{Discovery, Hello, Role};
 use wire::{OpMsg, OpQuery};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
-use zs_protocol::SessionAccess;
 pub use zs_protocol::{AuditRefusal, Materialize};
+use zs_protocol::{Caller, SessionAccess};
 
 pub const AUTHENTICATE_REFUSED_REASON: &str = "client authentication commands are refused";
 
@@ -204,7 +204,8 @@ impl MongoListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
+            let caller = Caller::tcp(peer, client.local_addr());
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mongo, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -214,7 +215,7 @@ impl MongoListener {
                 continue;
             }
             let shared = self.shared.clone();
-            tokio::spawn(async move { handle_connection(client, shared).await });
+            tokio::spawn(async move { handle_connection(client, shared, caller).await });
         }
     }
 }
@@ -313,7 +314,7 @@ impl Conn {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, shared: Shared) {
+async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
     let budget = shared.budget;
     let conn = Conn {
         id: shared.diag.next_conn(),
@@ -323,7 +324,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
         next_id: AtomicI32::new(1),
     };
     conn.emit(conn.event("conn_accepted"));
-    match tokio::time::timeout(budget, handshake(&mut client, &conn)).await {
+    match tokio::time::timeout(budget, handshake(&mut client, &conn, caller)).await {
         Ok(Ok(session)) => relay(client, session, &conn).await,
         Ok(Err(Stopped(by))) => conn.closed(0, 0, by),
         Err(_) => {
@@ -416,9 +417,13 @@ struct Found {
     pinned: Option<String>,
 }
 
-async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
+async fn handshake(
+    client: &mut TcpStream,
+    conn: &Conn,
+    caller: Caller,
+) -> Result<Session, Stopped> {
     let first = read_first(client, conn).await?;
-    let (password, watch, read_only) = match (conn.shared.materialize)() {
+    let (password, watch, read_only) = match (conn.shared.materialize)(&caller) {
         Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
             let read_only = materialized.access() == SessionAccess::ReadOnly;

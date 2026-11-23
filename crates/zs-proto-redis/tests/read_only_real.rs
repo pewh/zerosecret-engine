@@ -26,7 +26,7 @@ async fn front(access: SessionAccess) -> (SocketAddr, fake::Refusals) {
     let password = required("ZS_TEST_REDIS_PASSWORD");
     let (audit, refusals) = fake::audit_recorder();
     let materialize: zs_protocol::Materialize =
-        Arc::new(move || Ok(fake::granted_with(password.as_bytes(), access)));
+        Arc::new(move |_| Ok(fake::granted_with(password.as_bytes(), access)));
     let listener = RedisListener::bind_endpoint(
         "127.0.0.1:0",
         endpoint(&required("ZS_TEST_REDIS_ADDR")),

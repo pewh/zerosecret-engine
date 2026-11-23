@@ -435,7 +435,7 @@ pub fn pki(san: &str) -> Pki {
 }
 
 pub fn admit_all() -> zs_protocol::CallerCheck {
-    Arc::new(|_, _| true)
+    Arc::new(|_| true)
 }
 
 pub async fn listen(
@@ -493,13 +493,13 @@ pub fn granted_as(
 }
 
 pub fn materialize(password: &'static str) -> Materialize {
-    Arc::new(move || Ok(granted(password.as_bytes())))
+    Arc::new(move |_| Ok(granted(password.as_bytes())))
 }
 
 pub fn counted(password: &'static str) -> (Materialize, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let materialize: Materialize = Arc::new(move || {
+    let materialize: Materialize = Arc::new(move |_| {
         count.fetch_add(1, Ordering::SeqCst);
         Ok(granted(password.as_bytes()))
     });

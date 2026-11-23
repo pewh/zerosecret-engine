@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event};
-use zs_protocol::SessionAccess;
+use zs_protocol::{Caller, SessionAccess};
 
 use guard::EchoGuard;
 use resp::{Command, Refusal};
@@ -199,7 +199,8 @@ impl RedisListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
+            let caller = Caller::tcp(peer, client.local_addr());
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Redis, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -209,7 +210,7 @@ impl RedisListener {
                 continue;
             }
             let shared = self.shared.clone();
-            tokio::spawn(async move { handle_connection(client, shared).await });
+            tokio::spawn(async move { handle_connection(client, shared, caller).await });
         }
     }
 }
@@ -280,14 +281,14 @@ impl Conn {
 
 struct Stopped(&'static str);
 
-async fn handle_connection(mut client: TcpStream, shared: Shared) {
+async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
     let conn = Conn {
         id: shared.diag.next_conn(),
         shared,
         started: Instant::now(),
     };
     conn.emit(conn.event("conn_accepted"));
-    match tokio::time::timeout(conn.shared.budget, handshake(&mut client, &conn)).await {
+    match tokio::time::timeout(conn.shared.budget, handshake(&mut client, &conn, caller)).await {
         Ok(Ok(session)) => relay(client, session, &conn).await,
         Ok(Err(Stopped(by))) => conn.closed(0, 0, by),
         Err(_) => {
@@ -347,9 +348,13 @@ struct Session {
     read_only: bool,
 }
 
-async fn handshake(client: &mut TcpStream, conn: &Conn) -> Result<Session, Stopped> {
+async fn handshake(
+    client: &mut TcpStream,
+    conn: &Conn,
+    caller: Caller,
+) -> Result<Session, Stopped> {
     let materialize = conn.shared.materialize.clone();
-    let materialized = tokio::task::spawn_blocking(move || materialize()).await;
+    let materialized = tokio::task::spawn_blocking(move || materialize(&caller)).await;
     let (credential, watch, read_only) = match materialized {
         Ok(Ok(materialized)) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));

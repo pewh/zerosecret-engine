@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 
+use zs_protocol::Caller;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -21,11 +23,43 @@ pub(crate) fn same_user(peer: SocketAddr, local: SocketAddr) -> std::io::Result<
     }
 }
 
-fn admits(peer: SocketAddr, local: SocketAddr) -> bool {
-    #[cfg(zs_test_endpoints)]
-    if std::env::var_os("ZS_TEST_PEER_LOOKUP").is_some_and(|value| value == "fail") {
+fn admits(caller: &Caller) -> bool {
+    admits_with(caller, lookup_fails())
+}
+
+#[cfg(zs_test_endpoints)]
+fn lookup_fails() -> bool {
+    std::env::var_os("ZS_TEST_PEER_LOOKUP").is_some_and(|value| value == "fail")
+}
+
+#[cfg(not(zs_test_endpoints))]
+fn lookup_fails() -> bool {
+    false
+}
+
+fn admits_with(caller: &Caller, lookup_fails: bool) -> bool {
+    if lookup_fails {
         return false;
     }
+    match *caller {
+        Caller::Tcp { peer, local } => tcp_admits(peer, local),
+        Caller::Unix { uid } => unix_admits(uid),
+    }
+}
+
+fn unix_admits(uid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        uid == Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        false
+    }
+}
+
+fn tcp_admits(peer: SocketAddr, local: SocketAddr) -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         same_user(peer, local).unwrap_or(false)
@@ -77,9 +111,63 @@ mod tests {
         drop(listener);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
-            !admits(client_addr, addr),
+            !admits(&Caller::Tcp {
+                peer: client_addr,
+                local: addr
+            }),
             "a closed socket must not be admitted"
         );
+    }
+
+    fn agent_uid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    #[test]
+    fn a_unix_caller_of_the_agent_user_is_admitted() {
+        assert!(admits_with(
+            &Caller::Unix {
+                uid: Some(agent_uid())
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn a_unix_caller_of_another_user_is_refused() {
+        assert!(admits_with(
+            &Caller::Unix {
+                uid: Some(agent_uid())
+            },
+            false
+        ));
+        for other in [agent_uid().wrapping_add(1), agent_uid().wrapping_sub(1)] {
+            assert!(
+                !admits_with(&Caller::Unix { uid: Some(other) }, false),
+                "uid {other} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unix_caller_without_a_user_id_is_refused() {
+        assert!(!admits_with(&Caller::Unix { uid: None }, false));
+    }
+
+    #[test]
+    fn a_failed_lookup_refuses_unix_and_tcp_callers() {
+        let (_listener, client, _peer, addr) = connected("127.0.0.1:0");
+        let tcp = Caller::Tcp {
+            peer: client.local_addr().unwrap(),
+            local: addr,
+        };
+        let unix = Caller::Unix {
+            uid: Some(agent_uid()),
+        };
+        assert!(admits_with(&tcp, false));
+        assert!(admits_with(&unix, false));
+        assert!(!admits_with(&tcp, true));
+        assert!(!admits_with(&unix, true));
     }
 
     #[test]

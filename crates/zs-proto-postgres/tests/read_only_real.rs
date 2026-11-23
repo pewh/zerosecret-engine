@@ -60,7 +60,7 @@ type Refusals = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
 
 async fn listen(db: &Database, password: &str, access: SessionAccess) -> (SocketAddr, Refusals) {
     let password = password.as_bytes().to_vec();
-    let materialize: Materialize = Arc::new(move || {
+    let materialize: Materialize = Arc::new(move |_| {
         Ok(Materialized::new(
             Credential::from_bytes(password.clone()).unwrap(),
             access,

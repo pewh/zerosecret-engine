@@ -203,7 +203,14 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     fn admit_all() -> zs_protocol::CallerCheck {
-        Arc::new(|_, _| true)
+        Arc::new(|_| true)
+    }
+
+    fn loopback_caller() -> Caller {
+        Caller::Tcp {
+            peer: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            local: SocketAddr::from(([127, 0, 0, 1], 5432)),
+        }
     }
 
     use std::collections::VecDeque;
@@ -475,7 +482,7 @@ mod tests {
     }
 
     fn materialize_password(password: &'static str) -> Materialize {
-        Arc::new(move || Ok(granted(password.as_bytes())))
+        Arc::new(move |_| Ok(granted(password.as_bytes())))
     }
 
     async fn serve_scripted<C, F>(connect: C, materialize: Materialize) -> SocketAddr
@@ -574,7 +581,7 @@ mod tests {
         let live = fake_postgres(None, 0).await;
         let (connect, asked) = scripted(vec![vec![live.addr]]);
         let materialize: Materialize =
-            Arc::new(|| Err(zs_protocol::Denied::new("audit sink unavailable")));
+            Arc::new(|_| Err(zs_protocol::Denied::new("audit sink unavailable")));
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = front.local_addr().unwrap();
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
@@ -588,6 +595,7 @@ mod tests {
                 connect,
                 HANDSHAKE_BUDGET,
                 &Trace::disabled(),
+                loopback_caller(),
             )
             .await
         });
@@ -619,7 +627,7 @@ mod tests {
         let (connect, asked) = scripted(vec![vec![closed]]);
         let materialized = Arc::new(AtomicUsize::new(0));
         let count = materialized.clone();
-        let materialize: Materialize = Arc::new(move || {
+        let materialize: Materialize = Arc::new(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             Ok(granted(SENTINEL.as_bytes()))
         });
@@ -636,6 +644,7 @@ mod tests {
                 connect,
                 HANDSHAKE_BUDGET,
                 &Trace::disabled(),
+                loopback_caller(),
             )
             .await
         });
@@ -763,6 +772,7 @@ mod tests {
                 connect,
                 Duration::from_millis(200),
                 &Trace::disabled(),
+                loopback_caller(),
             )
             .await
         });
@@ -807,6 +817,7 @@ mod tests {
                 connect,
                 Duration::from_millis(200),
                 &Trace::disabled(),
+                loopback_caller(),
             )
             .await
         });
@@ -948,7 +959,7 @@ mod tests {
         let (connect, asked) = scripted(vec![vec![upstream]]);
         let materialized = Arc::new(AtomicUsize::new(0));
         let count = materialized.clone();
-        let materialize: Materialize = Arc::new(move || {
+        let materialize: Materialize = Arc::new(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             Ok(granted(PASSWORD.as_bytes()))
         });
@@ -1048,6 +1059,7 @@ mod tests {
                 connect,
                 Duration::from_millis(200),
                 &trace,
+                loopback_caller(),
             )
             .await
         });
@@ -1131,7 +1143,7 @@ mod tests {
         let (connect, asked) = scripted(vec![]);
         let materialized = Arc::new(AtomicUsize::new(0));
         let count = materialized.clone();
-        let materialize: Materialize = Arc::new(move || {
+        let materialize: Materialize = Arc::new(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             Ok(granted(PASSWORD.as_bytes()))
         });
@@ -1146,6 +1158,7 @@ mod tests {
                 connect,
                 Duration::from_millis(200),
                 &Trace::disabled(),
+                loopback_caller(),
             )
             .await
         });
@@ -1494,7 +1507,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zs_credential::Credential;
-use zs_protocol::SessionAccess;
+use zs_protocol::{Caller, SessionAccess};
 
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
@@ -1897,7 +1910,8 @@ impl PostgresListener {
     {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
+            let caller = Caller::tcp(peer, client.local_addr());
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.diag.emit(
                     Event::new(Component::Postgres, "caller_refused")
                         .conn(self.diag.next_conn())
@@ -1930,6 +1944,7 @@ impl PostgresListener {
                     connect,
                     HANDSHAKE_BUDGET,
                     &trace,
+                    caller,
                 )
                 .await
                 {
@@ -1952,6 +1967,7 @@ fn at(stage: &'static str) -> impl FnOnce(std::io::Error) -> Staged {
     move |error| (stage, error)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<C, F>(
     mut client: TcpStream,
     target: Upstream,
@@ -1960,6 +1976,7 @@ async fn handle_connection<C, F>(
     connect: C,
     budget: std::time::Duration,
     trace: &Trace,
+    caller: Caller,
 ) -> std::result::Result<(), Staged>
 where
     C: FnOnce(UpstreamEndpoint) -> F,
@@ -2002,7 +2019,7 @@ where
         return Ok(());
     }
 
-    let (access, (credential, watch)) = match materialize() {
+    let (access, (credential, watch)) = match materialize(&caller) {
         Ok(materialized) => {
             trace
                 .diag

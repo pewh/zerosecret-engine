@@ -23,7 +23,7 @@ use packet::{
 };
 use read_only::{Kind, Refused};
 pub use read_only::{MAX_SCREENED_COMMAND, READ_ONLY_REASON, REFUSAL, SESSION_START, scan};
-use zs_protocol::SessionAccess;
+use zs_protocol::{Caller, SessionAccess};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
 pub use zs_protocol::{AuditRefusal, Materialize};
@@ -208,7 +208,8 @@ impl MysqlListener {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (client, peer) = self.listener.accept().await?;
-            if !zs_protocol::admitted(self.caller_check.as_ref(), &client, peer).await {
+            let caller = Caller::tcp(peer, client.local_addr());
+            if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mysql, "caller_refused")
                         .conn(self.shared.diag.next_conn())
@@ -218,7 +219,7 @@ impl MysqlListener {
                 continue;
             }
             let shared = self.shared.clone();
-            tokio::spawn(async move { handle_connection(client, shared).await });
+            tokio::spawn(async move { handle_connection(client, shared, caller).await });
         }
     }
 }
@@ -315,7 +316,7 @@ impl Conn {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, shared: Shared) {
+async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
     let conn = Conn {
         id: shared.diag.next_conn(),
         shared,
@@ -323,7 +324,8 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
         client_seq: AtomicU8::new(0),
     };
     conn.emit(conn.event("conn_accepted"));
-    let outcome = tokio::time::timeout(HANDSHAKE_BUDGET, handshake(&mut client, &conn)).await;
+    let outcome =
+        tokio::time::timeout(HANDSHAKE_BUDGET, handshake(&mut client, &conn, caller)).await;
     match outcome {
         Ok(Ok((upstream, watch, screen))) => relay(client, upstream, watch, screen, &conn).await,
         Ok(Err(Stopped(by))) => conn.closed(0, 0, by),
@@ -338,6 +340,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared) {
 async fn handshake(
     client: &mut TcpStream,
     conn: &Conn,
+    caller: Caller,
 ) -> Result<(Box<dyn Io>, zs_protocol::SessionWatch, Option<Screen>), Stopped> {
     let (tcp, greeting) = open_upstream(client, conn).await?;
     if greeting.scramble.len() != SCRAMBLE_LEN {
@@ -366,7 +369,7 @@ async fn handshake(
         conn.refuse(client, &USER_REFUSED).await;
         return Err(Stopped("refused"));
     }
-    let (password, watch, access) = materialize(client, conn).await?;
+    let (password, watch, access) = materialize(client, conn, caller).await?;
     let screened = access == SessionAccess::ReadOnly;
     if screened && read_only::names_mariadb(&greeting.server_version) {
         return Err(conn.refuse_read_only(client, "mariadb").await);
@@ -441,8 +444,9 @@ async fn start_read_only(upstream: &mut Box<dyn Io>, screen: Screen) -> bool {
 async fn materialize(
     client: &mut TcpStream,
     conn: &Conn,
+    caller: Caller,
 ) -> Result<(Zeroizing<Vec<u8>>, zs_protocol::SessionWatch, SessionAccess), Stopped> {
-    match (conn.shared.materialize)() {
+    match (conn.shared.materialize)(&caller) {
         Ok(materialized) => {
             conn.emit(conn.event("materialized").code("decision", "allow"));
             let access = materialized.access();

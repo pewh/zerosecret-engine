@@ -190,7 +190,7 @@ async fn client_authenticates_through_the_listener_without_a_password() {
         "127.0.0.1:0",
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
-        Arc::new(|| Ok(credential())),
+        Arc::new(|_| Ok(credential())),
     )
     .await
     .expect("listener must bind")
@@ -236,7 +236,7 @@ async fn sslrequest_is_explicitly_refused_on_loopback() {
         "127.0.0.1:0",
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
-        Arc::new(|| Ok(credential())),
+        Arc::new(|_| Ok(credential())),
     )
     .await
     .unwrap()
@@ -270,7 +270,7 @@ async fn materialization_failure_denies_the_connection() {
         "127.0.0.1:0",
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
-        Arc::new(|| Err(zs_protocol::Denied::new("vault unavailable"))),
+        Arc::new(|_| Err(zs_protocol::Denied::new("vault unavailable"))),
     )
     .await
     .unwrap()
@@ -308,7 +308,7 @@ async fn binding_does_not_probe_upstream() {
         endpoint,
         SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
-        Arc::new(|| Ok(credential())),
+        Arc::new(|_| Ok(credential())),
     )
     .await
     .unwrap()
@@ -806,7 +806,10 @@ async fn a_caller_the_check_admits_is_relayed() {
     let (diag, _log) = fake::open_diag(home.path());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let record = seen.clone();
-    let check: zs_protocol::CallerCheck = Arc::new(move |peer, local| {
+    let check: zs_protocol::CallerCheck = Arc::new(move |caller| {
+        let zs_protocol::Caller::Tcp { peer, local } = *caller else {
+            return false;
+        };
         record.lock().unwrap().push((peer, local));
         true
     });
@@ -844,7 +847,7 @@ async fn a_failed_peer_lookup_denies() {
         UpstreamTls::WhenOffered,
         fake::materialize(fake::PASSWORD),
         diag.clone(),
-        Some(Arc::new(|_, _| false)),
+        Some(Arc::new(|_| false)),
     )
     .await;
 

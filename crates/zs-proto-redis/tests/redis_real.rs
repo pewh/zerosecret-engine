@@ -29,7 +29,7 @@ fn required(name: &str) -> String {
 }
 
 fn materialize(password: String) -> zs_protocol::Materialize {
-    Arc::new(move || Ok(fake::granted(password.as_bytes())))
+    Arc::new(move |_| Ok(fake::granted(password.as_bytes())))
 }
 
 fn endpoint(addr: &str) -> UpstreamEndpoint {

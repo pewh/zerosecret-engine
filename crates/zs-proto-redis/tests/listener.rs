@@ -708,7 +708,7 @@ async fn the_handshake_budget_bounds_a_silent_upstream() {
 async fn a_slow_materializer_is_bounded_by_the_handshake_budget() {
     let fake = fake::start(fake::Script::new()).await;
     let (audit, refusals) = fake::audit_recorder();
-    let slow: zs_protocol::Materialize = std::sync::Arc::new(|| {
+    let slow: zs_protocol::Materialize = std::sync::Arc::new(|_| {
         std::thread::sleep(Duration::from_secs(2));
         Ok(fake::granted(PASSWORD.as_bytes()))
     });
@@ -743,7 +743,7 @@ async fn a_panicking_materializer_denies_with_the_fixed_text() {
     let fake = fake::start(fake::Script::new()).await;
     let (audit, refusals) = fake::audit_recorder();
     let panicking: zs_protocol::Materialize =
-        std::sync::Arc::new(|| panic!("the materializer panicked"));
+        std::sync::Arc::new(|_| panic!("the materializer panicked"));
     let local = fake::listen_with(
         fake.addr,
         None,
