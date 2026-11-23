@@ -61,7 +61,7 @@
   socket path. `listener_bound` and `caller_refused` carry `listen` (`loopback`, `unix`,
   `network`); `kind` and `listener` keep the protocol.
 - Windows refuses `listen_socket_dir` and a non-loopback `listen_addr` at load.
-- SECURITY §7 gains rows 138-149.
+- SECURITY §7 gains rows 138-152 (rows 150-152 run in the commercial suite).
 
 ### Development
 
