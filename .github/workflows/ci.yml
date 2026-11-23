@@ -223,17 +223,21 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+      # With ZS_REQUIRE_NETWORK set, a test of a non-loopback database listener fails instead of
+      # skipping when the runner has no routed address that gets inbound data.
       - name: Workspace tests on a disposable keychain
         run: cargo build --locked -p zs && cargo test --workspace --locked
         env:
           ZS_TEST_NODE: node
           ZS_BUILD_TEST_ENDPOINTS: "1"
+          ZS_REQUIRE_NETWORK: "1"
       # Rows 102, 146 and 149 on macOS: the process walk sees only the agent user's processes, and
       # the socket peer is another uid, so a client of another account is closed before a byte is
       # read.
       - name: A database client of another OS user is refused
         env:
           ZS_BUILD_TEST_ENDPOINTS: "1"
+          ZS_REQUIRE_NETWORK: "1"
         run: |
           set -euo pipefail
           sudo sysadminctl -addUser zs-other -password "$(openssl rand -hex 16)"
