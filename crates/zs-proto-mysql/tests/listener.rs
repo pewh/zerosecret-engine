@@ -562,7 +562,7 @@ async fn the_greeting_names_the_configured_client_plugin_and_both_log_in() {
     ] {
         let endpoint = UpstreamEndpoint::new("127.0.0.1", fake.addr.port()).unwrap();
         let listener = MysqlListener::bind_endpoint(
-            "127.0.0.1:0",
+            &fake::loopback(),
             endpoint,
             UpstreamTls::WhenOffered,
             fake::materialize(PASSWORD),
@@ -571,7 +571,7 @@ async fn the_greeting_names_the_configured_client_plugin_and_both_log_in() {
         .unwrap()
         .with_caller_check(fake::admit_all())
         .with_client_auth(auth);
-        let local = listener.local_addr();
+        let local = fake::tcp_addr(listener.local());
         tokio::spawn(listener.serve());
         let session = fake::login(local, CLIENT_CAPS).await;
         assert_eq!(session.greeting.plugin, plugin, "{auth:?}");
@@ -1008,4 +1008,176 @@ async fn a_listener_without_a_caller_check_refuses() {
     assert_eq!(fake.seen(|s| s.accepts), 0);
     let text = std::fs::read_to_string(log).unwrap();
     assert!(text.contains("\"listener\":\"mysql\""), "{text}");
+}
+
+#[cfg(unix)]
+mod unix_front {
+    use std::sync::Mutex;
+
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixStream;
+    use zs_protocol::{Caller, ListenSpec, Materialize};
+
+    use super::*;
+
+    fn own_uid(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    async fn unix_listen(
+        fake: &fake::Fake,
+        path: &std::path::Path,
+        materialize: Materialize,
+        diag: DiagLog,
+        check: zs_protocol::CallerCheck,
+    ) {
+        let spec = ListenSpec::Unix(path.to_path_buf());
+        let bound = fake::listen_on(
+            &spec,
+            "127.0.0.1",
+            fake.addr.port(),
+            UpstreamTls::WhenOffered,
+            materialize,
+            diag,
+            None,
+            Some(check),
+        )
+        .await;
+        assert_eq!(bound, spec);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_over_a_unix_socket_gets_the_brokered_session() {
+        let fake = fake::start(native()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mysql.sock");
+        unix_listen(
+            &fake,
+            &path,
+            fake::materialize(PASSWORD),
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let (greeting, reply) = fake::login_over(&mut client, CLIENT_CAPS).await;
+        assert_eq!(reply.payload.first(), Some(&packet::OK_HEADER));
+        packet::write_packet(&mut client, 0, b"\x03SELECT 1")
+            .await
+            .unwrap();
+        let answer = packet::read_packet(&mut client, 1 << 24).await.unwrap();
+
+        assert!(answer.payload.ends_with(fake::OK_INFO));
+        assert_eq!(greeting.plugin, packet::CACHING_SHA2_PASSWORD);
+        assert_eq!(
+            fake.seen(|s| s.auth_packets[0].clone()),
+            scramble::native(PASSWORD.as_bytes(), &fake::salt(1))
+        );
+        assert_eq!(
+            fake.seen(|s| s.commands.clone()),
+            vec![b"\x03SELECT 1".to_vec()]
+        );
+        assert!(!fake.saw_bytes(b"client-auth-data-ignored"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_unix_caller_is_closed_before_any_byte_is_read() {
+        let fake = fake::start(native()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mysql.sock");
+        let (diag, log, _guard) = caller_diag();
+        let checked = Arc::new(Mutex::new(Vec::new()));
+        let record = checked.clone();
+        let refuse_unix: zs_protocol::CallerCheck = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            !matches!(caller, Caller::Unix { .. })
+        });
+        let (materialize, calls) = fake::counted(PASSWORD);
+        unix_listen(&fake, &path, materialize, diag.clone(), refuse_unix).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut received),
+        )
+        .await
+        .expect("the agent closes the refused connection");
+
+        assert!(received.is_empty(), "{received:?}");
+        assert!(
+            fake::eventually(|| checked.lock().unwrap().len() == 1).await,
+            "positive: the caller check ran for the connection"
+        );
+        assert_eq!(
+            *checked.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.seen(|s| s.accepts), 0);
+        diag.close();
+        let text = std::fs::read_to_string(log).unwrap();
+        assert_eq!(text.matches("\"caller_refused\"").count(), 1, "{text}");
+        assert!(!text.contains("conn_accepted"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_admitted_unix_caller() {
+        let fake = fake::start(native()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mysql.sock");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        unix_listen(
+            &fake,
+            &path,
+            materialize,
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let (_, reply) = fake::login_over(&mut client, CLIENT_CAPS).await;
+        assert_eq!(reply.payload.first(), Some(&packet::OK_HEADER));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_peer_address_of_a_tcp_caller() {
+        let fake = fake::start(native()).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        let local = fake.listen(UpstreamTls::WhenOffered, materialize).await;
+
+        let session = fake::login(local, CLIENT_CAPS).await;
+        let source = session.stream.local_addr().unwrap();
+        assert_eq!(session.reply.payload.first(), Some(&packet::OK_HEADER));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let Caller::Tcp { peer, local: to } = &seen[0] else {
+            panic!("a TCP client is a TCP caller: {:?}", seen[0]);
+        };
+        assert_eq!(*peer, source);
+        assert_eq!(*to, local);
+    }
 }

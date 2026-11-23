@@ -6,13 +6,11 @@ pub mod topology;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event, ServerText};
 
@@ -25,7 +23,9 @@ use wire::{OpMsg, OpQuery};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
 pub use zs_protocol::{AuditRefusal, Materialize};
-use zs_protocol::{Caller, SessionAccess};
+use zs_protocol::{
+    Caller, ClientStream, ClientWriteHalf, FrontListener, ListenSpec, SessionAccess,
+};
 
 pub const AUTHENTICATE_REFUSED_REASON: &str = "client authentication commands are refused";
 
@@ -118,7 +118,7 @@ struct Tls {
 }
 
 pub struct MongoListener {
-    listener: TcpListener,
+    listener: FrontListener,
     shared: Shared,
     caller_check: Option<zs_protocol::CallerCheck>,
 }
@@ -140,7 +140,7 @@ struct Shared {
 
 impl MongoListener {
     pub async fn bind_endpoint(
-        local: &str,
+        local: &ListenSpec,
         seed: UpstreamEndpoint,
         tls: Option<UpstreamTls>,
         auth: Auth,
@@ -153,8 +153,13 @@ impl MongoListener {
             }),
             None => None,
         };
-        let listener = TcpListener::bind(local).await?;
-        let listener_addr = listener.local_addr()?.to_string();
+        let listener = FrontListener::bind(local).await?;
+        // The address a replica-set reply advertises as the only host: `host:port` for TCP, the
+        // socket path for a Unix socket (drivers read a host ending in `.sock` as a socket path).
+        let listener_addr = match listener.local() {
+            ListenSpec::Tcp(addr) => addr.to_string(),
+            ListenSpec::Unix(path) => path.display().to_string(),
+        };
         Ok(Self {
             listener,
             caller_check: None,
@@ -190,10 +195,8 @@ impl MongoListener {
         self
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.listener
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
+    pub fn local(&self) -> &ListenSpec {
+        self.listener.local()
     }
 
     pub fn with_caller_check(mut self, check: zs_protocol::CallerCheck) -> Self {
@@ -203,8 +206,7 @@ impl MongoListener {
 
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
-            let (client, peer) = self.listener.accept().await?;
-            let caller = Caller::tcp(peer, client.local_addr());
+            let (client, caller) = self.listener.accept().await?;
             if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mongo, "caller_refused")
@@ -303,7 +305,7 @@ impl Conn {
 
     async fn fail(
         &self,
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         stage: &'static str,
         kind: &'static str,
         reply: &Reply,
@@ -314,7 +316,7 @@ impl Conn {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
+async fn handle_connection(mut client: ClientStream, shared: Shared, caller: Caller) {
     let budget = shared.budget;
     let conn = Conn {
         id: shared.diag.next_conn(),
@@ -347,7 +349,7 @@ fn refuse(conn: &Conn, reason: &'static str) -> Stopped {
     Stopped("refused")
 }
 
-async fn read_first(client: &mut TcpStream, conn: &Conn) -> Result<First, Stopped> {
+async fn read_first(client: &mut ClientStream, conn: &Conn) -> Result<First, Stopped> {
     let Ok(header) = wire::read_header(client).await else {
         return Err(Stopped("client"));
     };
@@ -418,7 +420,7 @@ struct Found {
 }
 
 async fn handshake(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     caller: Caller,
 ) -> Result<Session, Stopped> {
@@ -515,7 +517,7 @@ async fn try_cached(conn: &Conn, hello: &Doc) -> Option<Found> {
     })
 }
 
-async fn discover(client: &mut TcpStream, conn: &Conn, hello: &Doc) -> Result<Found, Stopped> {
+async fn discover(client: &mut ClientStream, conn: &Conn, hello: &Doc) -> Result<Found, Stopped> {
     if let Some(found) = try_cached(conn, hello).await {
         return Ok(found);
     }
@@ -547,7 +549,7 @@ async fn discover(client: &mut TcpStream, conn: &Conn, hello: &Doc) -> Result<Fo
 }
 
 async fn redirect(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     hello: &Doc,
     seed: &Hello,
@@ -610,7 +612,7 @@ async fn open(
 }
 
 async fn connect_and_hello(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     endpoint: &UpstreamEndpoint,
     hello: &Doc,
@@ -668,7 +670,7 @@ enum AuthStop {
 }
 
 async fn authenticate(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     upstream: &mut Box<dyn Io>,
     hello: &Hello,
@@ -830,7 +832,7 @@ struct Relay {
     limit: usize,
     pinned: Option<String>,
     read_only: bool,
-    client: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    client: tokio::sync::Mutex<ClientWriteHalf>,
 }
 
 impl Relay {
@@ -1108,7 +1110,7 @@ async fn watch_primary(conn: &Conn, pinned: Option<String>) -> &'static str {
     }
 }
 
-async fn relay(client: TcpStream, session: Session, conn: &Conn) {
+async fn relay(client: ClientStream, session: Session, conn: &Conn) {
     let (mut client_read, client_write) = client.into_split();
     let state = Relay {
         tracked: Mutex::new(HashSet::new()),

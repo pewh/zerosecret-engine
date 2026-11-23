@@ -2,14 +2,13 @@ pub mod packet;
 mod read_only;
 pub mod scramble;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 use zs_diag::{Component, DiagLog, Event, ServerText};
 
@@ -23,7 +22,7 @@ use packet::{
 };
 use read_only::{Kind, Refused};
 pub use read_only::{MAX_SCREENED_COMMAND, READ_ONLY_REASON, REFUSAL, SESSION_START, scan};
-use zs_protocol::{Caller, SessionAccess};
+use zs_protocol::{Caller, ClientStream, FrontListener, ListenSpec, SessionAccess};
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
 pub use zs_protocol::{AuditRefusal, Materialize};
@@ -126,7 +125,7 @@ trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 pub struct MysqlListener {
-    listener: TcpListener,
+    listener: FrontListener,
     shared: Shared,
     caller_check: Option<zs_protocol::CallerCheck>,
 }
@@ -148,14 +147,14 @@ struct Shared {
 
 impl MysqlListener {
     pub async fn bind_endpoint(
-        local: &str,
+        local: &ListenSpec,
         upstream: UpstreamEndpoint,
         tls: UpstreamTls,
         materialize: Materialize,
     ) -> std::io::Result<Self> {
         let config = zs_upstream::client_config(&tls).map_err(std::io::Error::other)?;
         Ok(Self {
-            listener: TcpListener::bind(local).await?,
+            listener: FrontListener::bind(local).await?,
             caller_check: None,
             shared: Shared {
                 upstream,
@@ -194,10 +193,8 @@ impl MysqlListener {
         self
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.listener
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
+    pub fn local(&self) -> &ListenSpec {
+        self.listener.local()
     }
 
     pub fn with_caller_check(mut self, check: zs_protocol::CallerCheck) -> Self {
@@ -207,8 +204,7 @@ impl MysqlListener {
 
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
-            let (client, peer) = self.listener.accept().await?;
-            let caller = Caller::tcp(peer, client.local_addr());
+            let (client, caller) = self.listener.accept().await?;
             if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.shared.diag.emit(
                     Event::new(Component::Mysql, "caller_refused")
@@ -239,7 +235,7 @@ struct Screen {
 }
 
 impl Conn {
-    async fn refuse_read_only(&self, client: &mut TcpStream, stage: &'static str) -> Stopped {
+    async fn refuse_read_only(&self, client: &mut ClientStream, stage: &'static str) -> Stopped {
         let mut event = self
             .event("client_refused")
             .warn()
@@ -279,14 +275,14 @@ impl Conn {
         self.shared.diag.emit(event);
     }
 
-    async fn refuse(&self, client: &mut TcpStream, reply: &Reply) {
+    async fn refuse(&self, client: &mut ClientStream, reply: &Reply) {
         let seq = self.client_seq.load(Ordering::SeqCst);
         let _ = write_packet(client, seq, &reply.packet()).await;
     }
 
     async fn fail(
         &self,
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         stage: &'static str,
         kind: &'static str,
         reply: &Reply,
@@ -316,7 +312,7 @@ impl Conn {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller) {
+async fn handle_connection(mut client: ClientStream, shared: Shared, caller: Caller) {
     let conn = Conn {
         id: shared.diag.next_conn(),
         shared,
@@ -338,7 +334,7 @@ async fn handle_connection(mut client: TcpStream, shared: Shared, caller: Caller
 }
 
 async fn handshake(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     caller: Caller,
 ) -> Result<(Box<dyn Io>, zs_protocol::SessionWatch, Option<Screen>), Stopped> {
@@ -442,7 +438,7 @@ async fn start_read_only(upstream: &mut Box<dyn Io>, screen: Screen) -> bool {
 }
 
 async fn materialize(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     caller: Caller,
 ) -> Result<(Zeroizing<Vec<u8>>, zs_protocol::SessionWatch, SessionAccess), Stopped> {
@@ -467,7 +463,7 @@ async fn materialize(
 }
 
 async fn open_upstream(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
 ) -> Result<(TcpStream, Greeting), Stopped> {
     let mut tcp = match conn.shared.upstream.connect().await {
@@ -554,7 +550,7 @@ fn fresh_scramble() -> Vec<u8> {
 }
 
 async fn greet_client(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     greeting: &Greeting,
     offered: u32,
@@ -604,7 +600,7 @@ async fn greet_client(
 }
 
 async fn secure_upstream(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     conn: &Conn,
     mut tcp: TcpStream,
     tls: bool,
@@ -1006,7 +1002,7 @@ where
 }
 
 async fn relay(
-    client: TcpStream,
+    client: ClientStream,
     upstream: Box<dyn Io>,
     watch: zs_protocol::SessionWatch,
     screen: Option<Screen>,

@@ -54,7 +54,7 @@ impl Real {
         let endpoint = UpstreamEndpoint::new(self.server.0.clone(), self.server.1).unwrap();
         let tls = UpstreamTls::from_config(Some(&self.certs.join("ca.pem")), None).unwrap();
         let listener = MongoListener::bind_endpoint(
-            "127.0.0.1:0",
+            &fake::loopback(),
             endpoint,
             Some(tls),
             Auth::new(USER, SOURCE),
@@ -64,7 +64,7 @@ impl Real {
         .unwrap()
         .with_caller_check(fake::admit_all())
         .with_diag(DiagLog::disabled(), "real-mongo-read-only");
-        let local = listener.local_addr();
+        let local = fake::tcp_addr(listener.local());
         tokio::spawn(listener.serve());
         local
     }

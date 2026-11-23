@@ -295,7 +295,7 @@ const CLIENT_IMAGES: [&str; 4] = ["mysql:5.7", "mysql:8.0", "mysql:8.4", "mysql:
 async fn listen_with(server: &Server, auth: ClientAuth, tls: UpstreamTls) -> SocketAddr {
     let endpoint = UpstreamEndpoint::new(server.0.as_str(), server.1).unwrap();
     let listener = MysqlListener::bind_endpoint(
-        "127.0.0.1:0",
+        &fake::loopback(),
         endpoint,
         tls,
         fake::materialize(NATIVE_PASSWORD),
@@ -304,7 +304,7 @@ async fn listen_with(server: &Server, auth: ClientAuth, tls: UpstreamTls) -> Soc
     .unwrap()
     .with_client_auth(auth)
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(listener.serve());
     local
 }

@@ -421,8 +421,45 @@ pub async fn listen_gated(
     audit: Option<AuditRefusal>,
     caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
+    tcp_addr(
+        &listen_on(
+            &loopback(),
+            host,
+            port,
+            tls,
+            materialize,
+            diag,
+            audit,
+            caller_check,
+        )
+        .await,
+    )
+}
+
+pub fn loopback() -> zs_protocol::ListenSpec {
+    zs_protocol::ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+pub fn tcp_addr(spec: &zs_protocol::ListenSpec) -> SocketAddr {
+    let zs_protocol::ListenSpec::Tcp(addr) = spec else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    *addr
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_on(
+    spec: &zs_protocol::ListenSpec,
+    host: &str,
+    port: u16,
+    tls: UpstreamTls,
+    materialize: Materialize,
+    diag: DiagLog,
+    audit: Option<AuditRefusal>,
+    caller_check: Option<zs_protocol::CallerCheck>,
+) -> zs_protocol::ListenSpec {
     let endpoint = UpstreamEndpoint::new(host, port).unwrap();
-    let mut listener = MysqlListener::bind_endpoint("127.0.0.1:0", endpoint, tls, materialize)
+    let mut listener = MysqlListener::bind_endpoint(spec, endpoint, tls, materialize)
         .await
         .unwrap()
         .with_diag(diag, RESOURCE);
@@ -433,7 +470,7 @@ pub async fn listen_gated(
         Some(check) => listener.with_caller_check(check),
         None => listener,
     };
-    let local = listener.local_addr();
+    let local = listener.local().clone();
     tokio::spawn(listener.serve());
     local
 }
@@ -574,6 +611,24 @@ pub async fn login_as(
         greeting,
         reply,
     }
+}
+
+pub async fn login_over<S>(stream: &mut S, capabilities: u32) -> (Greeting, Packet)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello = packet::read_packet(stream, packet::HANDSHAKE_LIMIT)
+        .await
+        .unwrap();
+    let greeting = Greeting::parse(&hello.payload).unwrap();
+    let response = client_response(capabilities, b"alice", Some(b"appdb"));
+    packet::write_packet(stream, 1, &response.encode())
+        .await
+        .unwrap();
+    let reply = packet::read_packet(stream, packet::HANDSHAKE_LIMIT)
+        .await
+        .unwrap();
+    (greeting, reply)
 }
 
 pub async fn send_raw(addr: SocketAddr, payload: &[u8]) -> Packet {

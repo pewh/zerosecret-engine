@@ -71,7 +71,7 @@ impl Real {
     ) -> SocketAddr {
         let endpoint = UpstreamEndpoint::new(self.server.0.clone(), self.server.1).unwrap();
         let listener = MongoListener::bind_endpoint(
-            "127.0.0.1:0",
+            &fake::loopback(),
             endpoint,
             tls,
             Auth::new(user, source),
@@ -81,7 +81,7 @@ impl Real {
         .unwrap()
         .with_caller_check(fake::admit_all())
         .with_diag(diag, "real-mongo");
-        let local = listener.local_addr();
+        let local = fake::tcp_addr(listener.local());
         tokio::spawn(listener.serve());
         local
     }

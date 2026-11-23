@@ -1005,3 +1005,197 @@ async fn a_listener_without_a_caller_check_refuses() {
     let text = std::fs::read_to_string(log).unwrap();
     assert!(text.contains("\"listener\":\"mongo\""), "{text}");
 }
+
+#[cfg(unix)]
+mod unix_front {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use zs_protocol::{Caller, ListenSpec, Materialize};
+
+    use super::*;
+
+    fn own_uid(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    async fn unix_listen(
+        set: &fake::FakeSet,
+        path: &std::path::Path,
+        materialize: Materialize,
+        diag: DiagLog,
+        check: zs_protocol::CallerCheck,
+    ) {
+        let spec = ListenSpec::Unix(path.to_path_buf());
+        let bound = fake::listen_on(
+            &spec,
+            set.seed(),
+            None,
+            materialize,
+            diag,
+            None,
+            None,
+            Some(check),
+        )
+        .await;
+        assert_eq!(bound, spec);
+    }
+
+    async fn read_doc(stream: &mut UnixStream) -> (Header, Doc) {
+        let header = wire::read_header(stream).await.unwrap();
+        let payload = wire::read_payload(stream, &header).await.unwrap();
+        let doc = if header.op_code == wire::OP_REPLY {
+            wire::parse_op_reply(&payload).unwrap()
+        } else {
+            OpMsg::parse(&payload).unwrap().body().unwrap().clone()
+        };
+        (header, doc)
+    }
+
+    async fn legacy_hello(stream: &mut UnixStream) -> Doc {
+        stream
+            .write_all(&fake::legacy_frame(fake::legacy_hello(), 2))
+            .await
+            .unwrap();
+        let (header, doc) = read_doc(stream).await;
+        assert_eq!(header.op_code, wire::OP_REPLY);
+        doc
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_over_a_unix_socket_gets_the_brokered_session() {
+        let set = fake::start(Script::set(1, Some(0))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mongo.sock");
+        unix_listen(
+            &set,
+            &path,
+            fake::materialize(PASSWORD),
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let reply = legacy_hello(&mut client).await;
+        assert!(reply.truthy("ok"));
+        let socket = path.display().to_string();
+        assert_eq!(reply.strings("hosts"), Some(vec![socket.clone()]));
+        assert_eq!(reply.str("me"), Some(socket.as_str()));
+        client
+            .write_all(&OpMsg::new(fake::find()).encode(3, 0))
+            .await
+            .unwrap();
+        let (_, found) = read_doc(&mut client).await;
+
+        assert!(found.truthy("ok"));
+        assert_eq!(
+            set.seen(0, |s| s.commands.clone()),
+            vec!["find".to_string()]
+        );
+        assert!(set.seen(0, |s| s.authenticated));
+        assert!(
+            set.saw_bytes(b"appdb.alice"),
+            "positive: the detector reads upstream frames"
+        );
+        assert!(!set.saw_bytes(PASSWORD.as_bytes()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_unix_caller_is_closed_before_any_byte_is_read() {
+        let set = fake::start(Script::set(1, Some(0))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mongo.sock");
+        let (diag_path, diag) = fake::diag_log(dir.path());
+        let checked = Arc::new(Mutex::new(Vec::new()));
+        let record = checked.clone();
+        let refuse_unix: zs_protocol::CallerCheck = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            !matches!(caller, Caller::Unix { .. })
+        });
+        let (materialize, calls) = fake::counter();
+        unix_listen(&set, &path, materialize, diag.clone(), refuse_unix).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let _ = client
+            .write_all(&fake::legacy_frame(fake::legacy_hello(), 2))
+            .await;
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("the agent closes the refused connection");
+
+        assert!(received.is_empty(), "{received:?}");
+        assert!(
+            fake::eventually(|| checked.lock().unwrap().len() == 1).await,
+            "positive: the caller check ran for the connection"
+        );
+        assert_eq!(
+            *checked.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(set.accepts_total(), 0);
+        let (_text, events) = fake::read_diag(&diag_path, diag).await;
+        assert_eq!(fake::in_conn(&events, "caller_refused", 1).len(), 1);
+        assert!(fake::in_conn(&events, "conn_accepted", 1).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_admitted_unix_caller() {
+        let set = fake::start(Script::set(1, Some(0))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mongo.sock");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        unix_listen(
+            &set,
+            &path,
+            materialize,
+            DiagLog::disabled(),
+            fake::admit_all(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        assert!(legacy_hello(&mut client).await.truthy("ok"));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_peer_address_of_a_tcp_caller() {
+        let set = fake::start(Script::set(1, Some(0))).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(PASSWORD.as_bytes()))
+        });
+        let local = set.listen(None, materialize).await;
+
+        let client = fake::logged_in(local).await;
+        let source = client.stream.local_addr().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let Caller::Tcp { peer, local: to } = &seen[0] else {
+            panic!("a TCP client is a TCP caller: {:?}", seen[0]);
+        };
+        assert_eq!(*peer, source);
+        assert_eq!(*to, local);
+    }
+}

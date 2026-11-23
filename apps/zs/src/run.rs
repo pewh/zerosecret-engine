@@ -1187,7 +1187,7 @@ async fn start_services(
         let refusal_audit = l3_refusal_audit(audit.clone());
         let listen_addr = loopback_listen(prepared, binding)?;
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
-            &listen_addr.to_string(),
+            &zs_protocol::ListenSpec::Tcp(listen_addr),
             endpoint,
             tls,
             l3_materialize(audit),
@@ -1205,7 +1205,13 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
             }
         };
-        let local = mysql.local_addr();
+        let zs_protocol::ListenSpec::Tcp(local) = *mysql.local() else {
+            stderr_line!(
+                "zs: mysql listener for {}: no TCP address",
+                binding.resource
+            );
+            return Err(refuse_run(&prepared.diag, "mysql_bind", 1));
+        };
         announce_l3(prepared, "mysql", &binding.resource, local);
         tasks.push(tokio::spawn(async move {
             let _ = mysql.serve().await;
@@ -1253,7 +1259,7 @@ async fn start_services(
         );
         let listen_addr = loopback_listen(prepared, binding)?;
         let mongo = match zs_proto_mongo::MongoListener::bind_endpoint(
-            &listen_addr.to_string(),
+            &zs_protocol::ListenSpec::Tcp(listen_addr),
             endpoint,
             tls,
             auth,
@@ -1270,7 +1276,13 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
             }
         };
-        let local = mongo.local_addr();
+        let zs_protocol::ListenSpec::Tcp(local) = *mongo.local() else {
+            stderr_line!(
+                "zs: mongo listener for {}: no TCP address",
+                binding.resource
+            );
+            return Err(refuse_run(&prepared.diag, "mongo_bind", 1));
+        };
         announce_l3(prepared, "mongo", &binding.resource, local);
         tasks.push(tokio::spawn(async move {
             let _ = mongo.serve().await;

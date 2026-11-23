@@ -740,12 +740,48 @@ pub async fn listen_gated(
     budget: Option<Duration>,
     caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
+    tcp_addr(
+        &listen_on(
+            &loopback(),
+            seed,
+            tls,
+            materialize,
+            diag,
+            audit,
+            budget,
+            caller_check,
+        )
+        .await,
+    )
+}
+
+pub fn loopback() -> zs_protocol::ListenSpec {
+    zs_protocol::ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+pub fn tcp_addr(spec: &zs_protocol::ListenSpec) -> SocketAddr {
+    let zs_protocol::ListenSpec::Tcp(addr) = spec else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    *addr
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_on(
+    spec: &zs_protocol::ListenSpec,
+    seed: SocketAddr,
+    tls: Option<UpstreamTls>,
+    materialize: Materialize,
+    diag: DiagLog,
+    audit: Option<AuditRefusal>,
+    budget: Option<Duration>,
+    caller_check: Option<zs_protocol::CallerCheck>,
+) -> zs_protocol::ListenSpec {
     let endpoint = UpstreamEndpoint::new(seed.ip().to_string(), seed.port()).unwrap();
-    let mut listener =
-        MongoListener::bind_endpoint("127.0.0.1:0", endpoint, tls, auth(), materialize)
-            .await
-            .unwrap()
-            .with_diag(diag, RESOURCE);
+    let mut listener = MongoListener::bind_endpoint(spec, endpoint, tls, auth(), materialize)
+        .await
+        .unwrap()
+        .with_diag(diag, RESOURCE);
     if let Some(audit) = audit {
         listener = listener.with_refusal_audit(audit);
     }
@@ -756,7 +792,7 @@ pub async fn listen_gated(
         Some(check) => listener.with_caller_check(check),
         None => listener,
     };
-    let local = listener.local_addr();
+    let local = listener.local().clone();
     tokio::spawn(listener.serve());
     local
 }

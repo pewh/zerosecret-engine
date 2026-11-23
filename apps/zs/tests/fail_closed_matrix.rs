@@ -4734,7 +4734,7 @@ async fn row_95_a_database_user_other_than_the_bound_user_is_refused() {
     let (materialize, calls) = fake::counted(fake::PASSWORD);
     let (audit, refusals) = fake::audit_recorder();
     let listener = zs_proto_mysql::MysqlListener::bind_endpoint(
-        "127.0.0.1:0",
+        &zs_protocol::ListenSpec::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         zs_proto_mysql::UpstreamEndpoint::new("127.0.0.1", mysql.addr.port()).unwrap(),
         UpstreamTls::WhenOffered,
         materialize,
@@ -4744,7 +4744,9 @@ async fn row_95_a_database_user_other_than_the_bound_user_is_refused() {
     .with_expected_user(Some("app".to_string()))
     .with_refusal_audit(audit)
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let zs_protocol::ListenSpec::Tcp(local) = *listener.local() else {
+        panic!("a TCP listener reports a TCP address");
+    };
     tokio::spawn(listener.serve());
     let refused = fake::login_as(local, fake::CLIENT_CAPS, INTRUDER.as_bytes(), None).await;
     assert_eq!(
