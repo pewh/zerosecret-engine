@@ -154,6 +154,7 @@ pub(crate) fn unshipped_records(
                 .to_string(),
                 reason: record.reason,
                 credential_ref: record.credential_ref,
+                source_addr: record.source_addr,
                 timestamp_ms: record.timestamp_ms,
                 device_id: device_id.to_string(),
                 seq: Some(record.seq),
@@ -183,6 +184,7 @@ mod tests {
             decision: Decision::Deny,
             reason,
             credential_ref: None,
+            source_addr: None,
         }
     }
 
@@ -196,6 +198,7 @@ mod tests {
             decision: "deny".into(),
             reason: Some("r".repeat(reason_bytes)),
             credential_ref: None,
+            source_addr: None,
             timestamp_ms: 5000,
             device_id: "dev-1".into(),
             seq: None,
@@ -318,6 +321,34 @@ mod tests {
         assert_eq!(records[1].1.seq, Some(2));
         assert_eq!(records[1].1.hash.as_deref(), Some(hashes[1].as_str()));
         assert_eq!(unshipped_records(&path, 1, "dev-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_shipped_record_carries_source_addr_only_when_the_journal_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let journal = Journal::open(&path).unwrap();
+        journal.append(&request(None), 5000).unwrap();
+        journal
+            .append(
+                &AuditRequest {
+                    source_addr: Some("172.17.0.2".into()),
+                    ..request(Some("caller_refused".into()))
+                },
+                5000,
+            )
+            .unwrap();
+        let records = unshipped_records(&path, 0, "dev-1").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1.source_addr, None);
+        assert_eq!(records[1].1.source_addr.as_deref(), Some("172.17.0.2"));
+        let plain = serde_json::to_string(&records[0].1).unwrap();
+        let sourced = serde_json::to_string(&records[1].1).unwrap();
+        assert!(!plain.contains("source_addr"), "{plain}");
+        assert!(
+            sourced.contains("\"source_addr\":\"172.17.0.2\""),
+            "{sourced}"
+        );
     }
 
     fn client_for(wire_url: String) -> WireClient {

@@ -36,6 +36,8 @@ pub struct AuditRecord {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_addr: Option<String>,
     pub timestamp_ms: u64,
     pub prev_hash: String,
     pub hash: String,
@@ -51,6 +53,7 @@ pub struct AuditRequest {
     pub decision: Decision,
     pub reason: Option<String>,
     pub credential_ref: Option<String>,
+    pub source_addr: Option<String>,
 }
 
 struct ChainState {
@@ -94,6 +97,11 @@ fn hash_record(req: &AuditRequest, seq: u64, timestamp_ms: u64, prev_hash: &str)
         hasher.update(reference.as_bytes());
         hasher.update([0u8]);
     }
+    if let Some(source) = &req.source_addr {
+        hasher.update([2u8]);
+        hasher.update(source.as_bytes());
+        hasher.update([0u8]);
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -108,10 +116,14 @@ fn normalize(value: Option<&str>) -> Option<String> {
 }
 
 fn framed(record: &AuditRecord) -> bool {
-    [record.reason.as_deref(), record.credential_ref.as_deref()]
-        .into_iter()
-        .flatten()
-        .all(|value| !value.contains('\0'))
+    [
+        record.reason.as_deref(),
+        record.credential_ref.as_deref(),
+        record.source_addr.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|value| !value.contains('\0'))
 }
 
 impl Journal {
@@ -166,6 +178,7 @@ impl Journal {
                 decision: record.decision,
                 reason: record.reason.clone(),
                 credential_ref: record.credential_ref.clone(),
+                source_addr: record.source_addr.clone(),
             };
             let expected =
                 hash_record(&request, record.seq, record.timestamp_ms, &record.prev_hash);
@@ -199,6 +212,7 @@ impl Journal {
             operation: normalize_operation(&request.operation),
             reason: normalize(request.reason.as_deref()),
             credential_ref: normalize(request.credential_ref.as_deref()),
+            source_addr: normalize(request.source_addr.as_deref()),
             ..request.clone()
         };
         let hash = hash_record(&request, seq, timestamp_ms, &state.prev_hash);
@@ -212,6 +226,7 @@ impl Journal {
             decision: request.decision,
             reason: request.reason.clone(),
             credential_ref: request.credential_ref.clone(),
+            source_addr: request.source_addr.clone(),
             timestamp_ms,
             prev_hash: state.prev_hash.clone(),
             hash: hash.clone(),
@@ -270,6 +285,7 @@ pub fn verify_chain(path: impl AsRef<Path>) -> Result<u64, AuditError> {
             decision: record.decision,
             reason: record.reason.clone(),
             credential_ref: record.credential_ref.clone(),
+            source_addr: record.source_addr.clone(),
         };
         let expected = hash_record(&request, record.seq, record.timestamp_ms, &record.prev_hash);
         if expected != record.hash {
@@ -296,6 +312,7 @@ mod tests {
             decision: Decision::Allow,
             reason: None,
             credential_ref: None,
+            source_addr: None,
         }
     }
 
@@ -439,6 +456,7 @@ mod tests {
             decision: Decision::Allow,
             reason: None,
             credential_ref: None,
+            source_addr: None,
         };
         assert_eq!(journal.append_seq(&request, 1).unwrap(), 1);
         journal.append(&request, 2).unwrap();
@@ -637,6 +655,7 @@ mod tests {
             decision: Decision::Allow,
             reason: None,
             credential_ref: Some("file:vault:kv/stripe".into()),
+            source_addr: None,
         };
         journal.append(&record, 6000).unwrap();
         assert_eq!(verify_chain(&path).unwrap(), 2);

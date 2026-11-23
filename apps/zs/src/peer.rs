@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use zs::cidr::Cidr;
 use zs_protocol::Caller;
 
 #[cfg(target_os = "linux")]
@@ -9,6 +10,24 @@ mod macos;
 
 pub(crate) fn caller_check() -> zs_protocol::CallerCheck {
     std::sync::Arc::new(admits)
+}
+
+#[allow(dead_code)]
+pub(crate) fn allow_list_check(
+    allow: Vec<Cidr>,
+    refused: impl Fn(SocketAddr) + Send + Sync + 'static,
+) -> zs_protocol::CallerCheck {
+    std::sync::Arc::new(move |caller: &Caller| match *caller {
+        Caller::Tcp { peer, local } => {
+            let admitted =
+                !local.ip().is_unspecified() && allow.iter().any(|entry| entry.contains(peer.ip()));
+            if !admitted {
+                refused(peer);
+            }
+            admitted
+        }
+        Caller::Unix { .. } => false,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -185,5 +204,85 @@ mod tests {
             client.local_addr().unwrap(),
             peer.local_addr().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod allow_list_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn cidrs(entries: &[&str]) -> Vec<Cidr> {
+        entries.iter().map(|entry| entry.parse().unwrap()).collect()
+    }
+
+    fn tcp(peer: &str, local: &str) -> Caller {
+        Caller::Tcp {
+            peer: peer.parse().unwrap(),
+            local: local.parse().unwrap(),
+        }
+    }
+
+    fn check(entries: &[&str]) -> (zs_protocol::CallerCheck, Arc<Mutex<Vec<SocketAddr>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let check = allow_list_check(cidrs(entries), move |peer| sink.lock().unwrap().push(peer));
+        (check, seen)
+    }
+
+    #[test]
+    fn a_peer_inside_the_list_is_admitted_and_one_outside_is_refused() {
+        let (check, seen) = check(&["172.17.0.0/16", "10.1.2.3/32"]);
+        assert!(check(&tcp("172.17.0.2:40000", "172.17.0.1:5432")));
+        assert!(check(&tcp("10.1.2.3:41000", "172.17.0.1:5432")));
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!check(&tcp("172.18.0.2:40000", "172.17.0.1:5432")));
+        assert!(!check(&tcp("10.1.2.4:40000", "172.17.0.1:5432")));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "172.18.0.2:40000".parse::<SocketAddr>().unwrap(),
+                "10.1.2.4:40000".parse::<SocketAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_compared_as_ipv4() {
+        let (check, seen) = check(&["172.17.0.0/16"]);
+        assert!(check(&tcp("[::ffff:172.17.0.2]:40000", "172.17.0.1:5432")));
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!check(&tcp("[::ffff:172.18.0.2]:40000", "172.17.0.1:5432")));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_list_admits_nothing() {
+        let (check, seen) = check(&[]);
+        assert!(!check(&tcp("127.0.0.1:40000", "127.0.0.1:5432")));
+        assert!(!check(&tcp("172.17.0.2:40000", "172.17.0.1:5432")));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_caller_with_an_unknown_local_address_is_refused_even_inside_the_list() {
+        let (check, seen) = check(&["172.17.0.0/16"]);
+        assert!(check(&tcp("172.17.0.2:40000", "172.17.0.1:5432")));
+        assert!(!check(&tcp("172.17.0.2:40000", "0.0.0.0:0")));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["172.17.0.2:40000".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_unix_caller_is_refused_and_reported_to_nobody() {
+        let (check, seen) = check(&["0.0.0.0/0"]);
+        assert!(check(&tcp("172.17.0.2:40000", "172.17.0.1:5432")));
+        assert!(!check(&Caller::Unix { uid: Some(0) }));
+        assert!(!check(&Caller::Unix { uid: None }));
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

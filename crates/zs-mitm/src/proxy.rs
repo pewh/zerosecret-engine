@@ -1401,6 +1401,7 @@ fn audit_as(
         decision,
         reason: reason.map(str::to_string),
         credential_ref: shared.handler.credential_ref(&resource),
+        source_addr: None,
     };
     shared.journal.append_seq(&request, audit_now())
 }

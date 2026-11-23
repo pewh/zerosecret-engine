@@ -212,6 +212,7 @@ struct L3Audit {
     resource: String,
     protocol: &'static str,
     handler: std::sync::Arc<dyn zs_mitm::FlowHandler>,
+    network: bool,
 }
 
 impl L3Audit {
@@ -228,6 +229,20 @@ impl L3Audit {
             resource: resource.to_string(),
             protocol,
             handler,
+            network: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn on_network(mut self) -> Self {
+        self.network = true;
+        self
+    }
+
+    fn source_of(&self, caller: &zs_protocol::Caller) -> Option<std::net::IpAddr> {
+        match *caller {
+            zs_protocol::Caller::Tcp { peer, .. } if self.network => Some(peer.ip()),
+            _ => None,
         }
     }
 
@@ -236,6 +251,7 @@ impl L3Audit {
         operation: &str,
         reason: Option<&str>,
         decision: zs_audit::Decision,
+        source: Option<std::net::IpAddr>,
     ) -> Result<u64, zs_audit::AuditError> {
         let request = zs_audit::AuditRequest {
             subject: self.subject.clone(),
@@ -246,6 +262,7 @@ impl L3Audit {
             decision,
             reason: reason.map(str::to_string),
             credential_ref: self.handler.credential_ref(&self.resource),
+            source_addr: source.map(|ip| ip.to_canonical().to_string()),
         };
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -258,7 +275,7 @@ impl L3Audit {
 type L3Materialize = zs_protocol::Materialize;
 
 fn l3_materialize(audit: L3Audit) -> L3Materialize {
-    let build = |audit: &L3Audit| {
+    let build = |audit: &L3Audit, caller: &zs_protocol::Caller| {
         let outcome = audit
             .handler
             .session_access(&audit.resource)
@@ -280,6 +297,7 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
                 .err()
                 .map(zs_protocol::Denied::audit_reason),
             decision,
+            audit.source_of(caller),
         ) {
             return Err(
                 zs_protocol::Denied::new(format!("audit sink unavailable: {e}"))
@@ -300,7 +318,25 @@ fn l3_materialize(audit: L3Audit) -> L3Materialize {
         });
         Ok(zs_protocol::Materialized::new(credential, access, check))
     };
-    std::sync::Arc::new(move |_| with_grant_wake(&*audit.handler, || build(&audit)))
+    std::sync::Arc::new(move |caller| with_grant_wake(&*audit.handler, || build(&audit, caller)))
+}
+
+#[allow(dead_code)]
+fn l3_network_refusal(audit: L3Audit) -> impl Fn(std::net::SocketAddr) + Send + Sync + 'static {
+    move |peer| {
+        if let Err(e) = audit.record(
+            "connect",
+            Some("caller_refused"),
+            zs_audit::Decision::Deny,
+            Some(peer.ip()),
+        ) {
+            stderr_line!(
+                "zs: {} connect on {} was refused but not recorded: {e}",
+                audit.protocol,
+                audit.resource
+            );
+        }
+    }
 }
 
 // Subscribes to grant changes before `build` reads the grant, so a change that lands while the
@@ -323,7 +359,7 @@ fn l3_cancel_authorize(audit: L3Audit) -> zs_proto_postgres::CancelAuthorize {
 
 fn l3_refusal_audit(audit: L3Audit) -> zs_proto_postgres::AuditRefusal {
     std::sync::Arc::new(move |operation: &'static str, reason: &'static str| {
-        match audit.record(operation, Some(reason), zs_audit::Decision::Deny) {
+        match audit.record(operation, Some(reason), zs_audit::Decision::Deny, None) {
             Ok(seq) => Some(seq),
             Err(e) => {
                 stderr_line!(
@@ -1253,7 +1289,7 @@ async fn start_services(
         let refusal_audit = mongo_refusal_audit(
             binding.resource.clone(),
             move |operation, reason| {
-                refusals.record(operation, Some(reason), zs_audit::Decision::Deny)
+                refusals.record(operation, Some(reason), zs_audit::Decision::Deny, None)
             },
             |line| stderr_line!("{line}"),
         );
@@ -2090,6 +2126,116 @@ mod tests {
         assert!(!last.contains("not resolvable"), "{last}");
     }
 
+    fn journal_records(home: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(home.join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn tcp_caller(peer: &str) -> zs_protocol::Caller {
+        zs_protocol::Caller::Tcp {
+            peer: peer.parse().unwrap(),
+            local: "172.17.0.1:3306".parse().unwrap(),
+        }
+    }
+
+    fn denying_audit(home: &std::path::Path, network: bool) -> L3Audit {
+        let prepared = prepared_with_postgres_ports(home, &[]);
+        let audit = L3Audit::new(
+            &prepared,
+            "orders-db",
+            "postgres",
+            std::sync::Arc::new(DenyingHandler),
+        );
+        if network { audit.on_network() } else { audit }
+    }
+
+    #[test]
+    fn a_network_listener_records_the_source_of_an_allowed_connect() {
+        let session = open_session_on(60_000, zs_policy::Access::ReadWrite, true);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        assert!(
+            (session.materialize)(&tcp_caller("172.17.0.2:40000")).is_ok(),
+            "positive control: the grant admits the session"
+        );
+        assert!((session.materialize)(&tcp_caller("[::ffff:172.17.0.3]:40001")).is_ok());
+        assert!((session.materialize)(&zs_protocol::Caller::Unix { uid: Some(1) }).is_ok());
+        let records = journal_records(session._home.path());
+        let sources: Vec<_> = records
+            .iter()
+            .map(|record| record["source_addr"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                Some("127.0.0.1".to_string()),
+                Some("172.17.0.2".to_string()),
+                Some("172.17.0.3".to_string()),
+                None
+            ]
+        );
+        assert!(records.iter().all(|record| record["decision"] == "allow"));
+    }
+
+    #[test]
+    fn a_loopback_listener_records_no_source_of_an_allowed_connect() {
+        let session = open_session_on(60_000, zs_policy::Access::ReadWrite, false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        assert!((session.materialize)(&tcp_caller("172.17.0.2:40000")).is_ok());
+        let records = journal_records(session._home.path());
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("source_addr").is_none()),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn a_network_listener_records_the_source_of_a_denied_connect() {
+        let home = tempfile::tempdir().unwrap();
+        let materialize = l3_materialize(denying_audit(home.path(), true));
+        assert!(materialize(&tcp_caller("172.17.0.2:40000")).is_err());
+        let records = journal_records(home.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["decision"], "deny");
+        assert_eq!(records[0]["source_addr"], "172.17.0.2");
+    }
+
+    #[test]
+    fn a_unix_listener_records_no_source_of_a_denied_connect() {
+        let home = tempfile::tempdir().unwrap();
+        let materialize = l3_materialize(denying_audit(home.path(), false));
+        assert!(materialize(&tcp_caller("172.17.0.2:40000")).is_err());
+        assert!(materialize(&zs_protocol::Caller::Unix { uid: Some(1) }).is_err());
+        let records = journal_records(home.path());
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.get("source_addr").is_none()));
+    }
+
+    #[test]
+    fn a_refused_network_source_writes_one_deny_record_with_its_address() {
+        let home = tempfile::tempdir().unwrap();
+        let materialize = l3_materialize(denying_audit(home.path(), true));
+        assert!(materialize(&tcp_caller("172.17.0.2:40000")).is_err());
+        assert_eq!(journal_records(home.path()).len(), 1);
+        let refused = l3_network_refusal(denying_audit(home.path(), true));
+        refused("192.0.2.9:51000".parse().unwrap());
+        let records = journal_records(home.path());
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["operation"], "connect");
+        assert_eq!(records[1]["decision"], "deny");
+        assert_eq!(records[1]["reason"], "caller_refused");
+        assert_eq!(records[1]["source_addr"], "192.0.2.9");
+        assert_eq!(records[1]["protocol"], "postgres");
+        assert!(zs_audit::verify_chain(home.path().join("audit.jsonl")).is_ok());
+    }
+
     #[tokio::test]
     async fn dropping_background_tasks_cancels_a_pending_task() {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -2321,6 +2467,14 @@ mod tests {
     }
 
     fn open_session_with(expires_in_ms: u64, access: zs_policy::Access) -> OpenSession {
+        open_session_on(expires_in_ms, access, false)
+    }
+
+    fn open_session_on(
+        expires_in_ms: u64,
+        access: zs_policy::Access,
+        network: bool,
+    ) -> OpenSession {
         let home = tempfile::tempdir().unwrap();
         let key = zs_grant::ControlSigningKey::generate("k1");
         let mut binding: zs::ResourceBinding = serde_json::from_value(serde_json::json!({
@@ -2346,6 +2500,7 @@ mod tests {
             resource: "orders-mysql".into(),
             protocol: "mysql",
             handler: agent.clone(),
+            network,
         });
         let (access, watch) = begin(&materialize);
         OpenSession {

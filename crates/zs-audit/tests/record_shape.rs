@@ -13,6 +13,7 @@ fn record() -> AuditRecord {
         decision: Decision::Allow,
         reason: None,
         credential_ref: None,
+        source_addr: None,
         timestamp_ms: 1,
         prev_hash: String::new(),
         hash: String::new(),

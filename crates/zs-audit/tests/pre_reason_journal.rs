@@ -38,6 +38,7 @@ fn a_pre_reason_journal_accepts_records_with_a_reason() {
                     decision: Decision::Deny,
                     reason: Some("grant g-1 is revoked".into()),
                     credential_ref: None,
+                    source_addr: None,
                 },
                 5000,
             )
