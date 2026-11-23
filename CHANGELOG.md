@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+### Security
+
+- A `postgres`, `mysql`, `mongo` or `redis` binding can listen on a Unix socket or on a signed
+  network address, for a workload that cannot reach the host's loopback, such as a container on
+  a Linux bridge network (ADR-0065). A binding with none of the new fields keeps its loopback
+  listener, caller check, audit bytes and grant signature.
+- Route A: `listen_socket_dir` serves the binding on `.s.PGSQL.5432` (PostgreSQL) or
+  `<resource>.sock` in that directory, with mode `0600`. The agent makes a missing directory
+  with mode `0700`. It refuses the run when the directory is a symbolic link, has another owner
+  or is group- or world-writable, when the socket name is a symbolic link, a file that is not a
+  socket or a live socket, and when a stale socket cannot be removed. It removes its own socket
+  at exit. A client whose peer user ID is not the agent's is closed before a byte is read.
+- Route A child environment: `ZS_<RESOURCE>_SOCKET=<socket path>`; PostgreSQL also gets
+  `PGHOST=<directory>` and `PGPORT=5432`, MySQL `MYSQL_UNIX_PORT=<socket path>`. The agent
+  removes an inherited `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT`, and for MySQL
+  `MYSQL_HOST` and `MYSQL_TCP_PORT`. A MongoDB client connects with
+  `mongodb://<percent-encoded socket path>/?directConnection=true`.
+- Route B: `listen_addr` is an IP address of this host and a port. A loopback address works as
+  `listen_port` does. A non-loopback address needs `listen_allow`, a list of source CIDRs, and a
+  valid signed grant with the same two values. A connection from a source outside the list is
+  closed before a byte is read and audited `deny` `connect`, reason `caller_refused`. The leg
+  from the client to the agent stays plaintext (SECURITY §3).
+- Refused at load: a listener field on a binding of another protocol, conflicting listener
+  fields, a relative `listen_socket_dir` or one with `..`, `0.0.0.0`, `::`, port 0, a missing
+  or empty `listen_allow`, `0.0.0.0/0`, `::/0`, an entry with host bits set and an IPv4-mapped
+  IPv6 entry.
+- Fail closed: a route-B binding without a valid signed grant that carries its `listen_addr` and
+  `listen_allow` stops the whole run before the child, also when the control plane refused the
+  mint at startup. The line names the reason. A binding without a non-loopback `listen_addr`
+  keeps starting in that case, as before.
+- Grants: `listen_addr` and `listen_allow` enter the signed payload only when `listen_addr` is
+  set, with `listen_allow` sorted, and such a grant is version 3, read-write or read-only. Every
+  existing grant keeps its bytes and its signature. An agent from 0.8.0 or older refuses a
+  version-3 grant and a policy file with the new fields; update the agent before a control plane
+  signs the first one. A control plane that does not sign the two fields cannot serve a route-B
+  binding.
+- Audit: on a route-B listener, the materialization and caller-refusal `connect` records carry
+  `source_addr`, the peer IP address without the port. Later refusals in a session (a user
+  mismatch, a read-only refusal, a revocation) do not. It is part of the hash chain and is
+  shipped in `AuditIngestRecord`. Other records keep their bytes. An agent from 0.8.0 or older fails `Journal::open` with
+  `ChainBroken` on a journal that has such a record, so a downgrade fails closed, as it does
+  for a journal with `reason` or `credential_ref`.
+- Diagnostics: the line `zs: <protocol> <resource> -> ...` prints the bound address or the
+  socket path. `listener_bound` and `caller_refused` carry `listen` (`loopback`, `unix`,
+  `network`); `kind` and `listener` keep the protocol.
+- Windows refuses `listen_socket_dir` and a non-loopback `listen_addr` at load.
+- SECURITY §7 gains rows 138-148.
+
+### Development
+
+- On Linux CI, `ZS_REQUIRE_NETWORK=1` makes a route-B test fail instead of skip when the runner
+  has no routed address that receives inbound data. The other-OS-user steps also run row 146,
+  which needs `netcat-openbsd` on Linux.
+
 ## [0.8.0] - 2026-11-21
 
 ### Development

@@ -482,6 +482,90 @@ openssl s_client -starttls postgres -connect orders-db.internal.example:5432 </d
 If you cannot use the name, pin the leaf with `upstream_cert_sha256`. Change the pin when RDS
 rotates the certificate.
 
+### A workload that cannot reach loopback
+
+A database binding listens on `127.0.0.1`. A container on a Linux bridge network cannot reach
+the host's loopback. Such a workload uses a Unix socket (route A) or a signed network address
+(route B) (ADR-0065). Both work on Linux and macOS. On Windows, `zs run` refuses them at load.
+The container examples below are for Docker on Linux without user-namespace remapping. Docker
+Desktop on macOS does not pass a host Unix socket into a container. With rootless Docker or
+userns-remap, the peer user ID that the agent sees is not your user ID, and the agent refuses the
+client.
+
+**Route A, a Unix socket (preferred).** Set `listen_socket_dir` to an absolute directory. The
+agent makes a missing directory with mode `0700` and refuses a directory that another user owns
+or can write. The socket is `.s.PGSQL.5432` for PostgreSQL, so a directory holds one PostgreSQL
+binding, and `<resource>.sock` for MySQL, MongoDB and Redis. The socket has mode `0600`.
+
+```json
+{ "resource": "orders-pg", "host": "orders-db.internal.example", "protocol": "postgres",
+  "listen_socket_dir": "/tmp/zs-orders" }
+```
+
+`zs run` prints `zs: postgres orders-pg -> /tmp/zs-orders/.s.PGSQL.5432`. The child gets:
+
+| Variable | Value |
+|---|---|
+| `PGHOST` | `/tmp/zs-orders` |
+| `PGPORT` | `5432` |
+| `ZS_ORDERS_PG_SOCKET` | `/tmp/zs-orders/.s.PGSQL.5432` |
+
+The child gets no `ZS_ORDERS_PG_HOST` or `ZS_ORDERS_PG_PORT`; the agent removes them when your
+shell has them. A `mysql` binding sets `MYSQL_UNIX_PORT` to the socket path and removes
+`MYSQL_HOST` and `MYSQL_TCP_PORT`. The agent closes a connection whose peer user ID is not its
+own, so a client in a container must run as your user ID and see the directory at the same path,
+for example `docker run --user "$(id -u)" -v /tmp/zs-orders:/tmp/zs-orders -e PGHOST -e PGPORT ...`.
+
+A MongoDB client takes the percent-encoded socket path as the host, with
+`directConnection=true`:
+
+```js
+const uri = `mongodb://${encodeURIComponent(process.env.ZS_ORDERS_MONGO_SOCKET)}/?directConnection=true`;
+```
+
+Without `directConnection=true`, the Node driver follows the hosts that the listener advertises,
+and it lowercases them. A socket path with an upper-case letter then does not match, and the
+client cannot connect. This URL was checked with the Node driver 4.x and 5.x.
+
+**Route B, a signed network address.** Set `listen_addr` to an IP address of this host and a
+port, such as the bridge address `172.17.0.1:5433`, and `listen_allow` to the source networks.
+The signed grant must carry the same two values (a version-3 grant); a binding may leave them out
+and take the signed values. A value in the file alone does not open the listener. A binding that
+leaves both out and gets no grant at startup listens on loopback, and its connections are denied.
+
+```json
+{ "resource": "orders-pg", "host": "orders-db.internal.example", "protocol": "postgres",
+  "listen_addr": "172.17.0.1:5433", "listen_allow": ["172.17.0.0/16"] }
+```
+
+`zs run` prints `zs: postgres orders-pg -> 172.17.0.1:5433`. The child gets:
+
+| Variable | Value |
+|---|---|
+| `PGHOST` | `172.17.0.1` |
+| `PGPORT` | `5433` |
+| `ZS_ORDERS_PG_HOST` | `172.17.0.1` |
+| `ZS_ORDERS_PG_PORT` | `5433` |
+
+- The agent closes a connection from a source outside `listen_allow` before it reads a byte. It
+  audits `deny` `connect`, reason `caller_refused`, with the source IP address in `source_addr`.
+- `zs run` refuses `0.0.0.0` and `::`, port 0, a missing or empty `listen_allow`, `0.0.0.0/0`,
+  `::/0`, and an entry with host bits set (`10.0.0.1/8`).
+- When the file sets a non-loopback `listen_addr`, `zs run` stops before it starts your command
+  if it holds no valid grant with the same `listen_addr` and `listen_allow`, also when the control
+  plane refused the grant at startup:
+  `zs: orders-pg: listen_addr 172.17.0.1:5433 needs a valid signed grant with the same listen_addr and listen_allow (<reason>)`.
+  When the file leaves both out, a binding with no grant at startup listens on loopback
+  (`zs: no grant for orders-pg: ...`), and each connection is denied.
+- A loopback `listen_addr`, such as `127.0.0.1:5433` or `[::1]:5433`, works as `listen_port`
+  does and needs no `listen_allow` and no signature.
+
+On both routes the leg from the client to the agent is plaintext, as on loopback. On route B it
+crosses the bridge network, and a client that requires TLS to the listener (`sslmode=require`)
+fails.
+[SECURITY.md §3](docs/SECURITY.md#3-what-zerosecret-does-not-defend-against) states the boundary
+of each route.
+
 ## Signed connection fields
 
 With a control plane (`zs login` or `--enrollment-token`), the control plane signs how the agent
@@ -503,8 +587,10 @@ means the default:
 - `upstream_ca` stays a file in the repository. The admin enters only its hash, which
   `zs ca-sha256 <file>` prints. The hash covers the certificates in the file, so line endings
   and comments do not change it. `shasum -a 256` of the file is not the same value.
-- `auth`, `listen_port`, `paths`, `user`, `auth_source` and `client_auth_plugin` stay in the
-  file and are not signed ([SECURITY.md §3](docs/SECURITY.md#3-what-zerosecret-does-not-defend-against)).
+- `auth`, `listen_port`, `listen_socket_dir`, `paths`, `user`, `auth_source` and
+  `client_auth_plugin` stay in the file and are not signed ([SECURITY.md §3](docs/SECURITY.md#3-what-zerosecret-does-not-defend-against)).
+- A non-loopback `listen_addr` and its `listen_allow` are signed in a version-3 grant (see
+  [A workload that cannot reach loopback](#a-workload-that-cannot-reach-loopback)).
 - The connection is fixed when `zs run` starts. After an admin changes it, restart `zs run`.
   Until then, renewals print
   `zs: <resource>: the control plane changed <field> (signed <value>, running <value>); restart zs run to use it`.

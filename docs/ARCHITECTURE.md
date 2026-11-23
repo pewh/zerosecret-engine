@@ -331,6 +331,8 @@ A binding field that is set must equal the signed value. A field that is left ou
 | `upstream_host`, `upstream_port` | yes | may be left out |
 | `upstream_plaintext`, `upstream_ca`, `upstream_cert_sha256` | yes, as one `upstream_tls` mode | may be left out, except `upstream_ca` when the mode is `ca-sha256`: the CA bundle stays a file, and only its SHA-256 is signed (`zs ca-sha256 <file>`) |
 | `local_endpoint` | yes | may be left out |
+| `listen_addr`, `listen_allow` | yes, in a version-3 grant (ADR-0065) | may be left out. A non-loopback `listen_addr` and its `listen_allow` must equal the grant, or the run stops; a loopback `listen_addr` that the grant does not carry stays local |
+| `listen_socket_dir` | no | local. A Unix socket serves only the agent's OS user (SECURITY §3) |
 | `auth`, `listen_port`, `paths`, `auth_source`, `client_auth_plugin` | no | local; SECURITY §3 says why |
 | `user` | no | local. On `mongo`, the SCRAM user. On `postgres` and `mysql`, the only user a client may name; the agent refuses another before materialization. On `redis`, the user the agent authenticates as; a client may name only it, or `default` when the binding has no `user` (SECURITY §3) |
 
@@ -575,7 +577,7 @@ never a global mode.
 |---|---|---|
 | L1 | Explicit proxy — `HTTPS_PROXY` injected into the child process | Default. Dev containers work immediately |
 | L2 | Process-scoped `zs run <cmd>` — child environment plus local CA trust | The SDK ignores proxy variables. Validated 2026-09-06 by the synthetic hostname-routing probe and verifier (spike evidence, not published): an unchanged Node/Stripe fixture completes the mapped path with TLS verified on both legs, and the fail-closed controls held. Caveat carried from the probe: SDKs honor `HTTPS_PROXY` when a user or tool sets one, so the managed workspace must clear or pin proxy variables |
-| L3 | Protocol listener — a local TCP socket per resource | PostgreSQL, MySQL (ADR-0029), MongoDB (ADR-0031), Redis (ADR-0057) and every future non-HTTP protocol |
+| L3 | Protocol listener — one per resource: loopback TCP, a Unix socket or a signed network address (ADR-0065) | PostgreSQL, MySQL (ADR-0029), MongoDB (ADR-0031), Redis (ADR-0057) and every future non-HTTP protocol |
 | L4 | Transparent TUN | Deferred. Only when L1–L3 cannot hold the invariant |
 
 Always use the least invasive mechanism that satisfies the invariant.
@@ -598,6 +600,31 @@ MongoDB `getMore` and `killCursors` pass only for cursors that read-only session
 relay polls the session check that travels with the credential and closes an open session
 within 5 s when the access of the grant changes or the grant ends. This is a guardrail, not a
 boundary (SECURITY §3).
+
+**L3 listener kinds (ADR-0065).** `ResourceBinding::listen` (`apps/zs/src/lib.rs`) gives each
+database binding one kind, and the relay binds it through `zs_protocol::FrontListener`. Loopback
+TCP is the default: `127.0.0.1` with `listen_port`, or a loopback `listen_addr`.
+`listen_socket_dir` gives a Unix socket in that directory, `.s.PGSQL.5432` for PostgreSQL and
+`<resource>.sock` for the other protocols. Before the bind, `apps/zs/src/socket_dir.rs` makes a
+missing directory with mode `0700` and refuses a directory that is a symbolic link, has another
+owner or is group- or world-writable. At the socket name it refuses a symbolic link, a file that
+is not a socket and a live socket, and it removes a stale socket only after a connect to it is
+refused. The socket gets mode `0600`, and at exit the agent removes it when the name still holds
+the socket that it bound. A non-loopback `listen_addr` gives a TCP listener on that address; the
+agent binds it only when the run holds a valid grant with the same `listen_addr` and
+`listen_allow`. The caller check runs for each connection before a byte is read: the peer socket
+lookup on loopback, the peer user ID on a Unix socket (both `peer::caller_check`), and the signed
+`listen_allow` on a network listener (`peer::allow_list_check`), which audits a refused source
+with `source_addr`. The line `zs: <protocol> <resource> -> <address or socket path>` and the
+diag event `listener_bound` name the listener; `listener_bound` and `caller_refused` carry the
+kind in `listen` (`loopback`, `unix`, `network`). The child environment follows the kind:
+
+| Kind | PostgreSQL | MySQL | Each database binding |
+|---|---|---|---|
+| Loopback or network TCP | `PGHOST=<ip>`, `PGPORT=<port>` | `MYSQL_HOST=<ip>`, `MYSQL_TCP_PORT=<port>` | `ZS_<RESOURCE>_HOST=<ip>`, `ZS_<RESOURCE>_PORT=<port>` |
+| Unix socket | `PGHOST=<directory>`, `PGPORT=5432` | `MYSQL_UNIX_PORT=<socket path>`; an inherited `MYSQL_HOST` and `MYSQL_TCP_PORT` are removed | `ZS_<RESOURCE>_SOCKET=<socket path>`; an inherited `ZS_<RESOURCE>_HOST` and `ZS_<RESOURCE>_PORT` are removed |
+
+The `PG*` and `MYSQL_*` variables come from the first binding of that protocol.
 
 This is not a system-wide proxy. Browsers, banking sites, and unrelated applications are
 untouched. ZeroSecret is not Zscaler and must never be described as though it were.

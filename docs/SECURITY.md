@@ -98,10 +98,12 @@ real proxy, or a proxy that forwards a header its client supplied, lets a client
 limiter key it is bucketed under. Neither the peer nor the client becomes a metric label.
 
 **A hostile local process of the same OS user.** The agent's listeners bind to a loopback
-address only (`--listen` refuses any other address), and every local listener authenticates its
+address only (`--listen` refuses any other address), except a database binding that sets
+`listen_socket_dir` or a non-loopback `listen_addr` (below). Every local listener authenticates its
 caller (ADR-0052): the HTTP proxy requires the run token in `Proxy-Authorization`, the local
 endpoint and `/.zs/presign` require it as the first path segment, and the database listeners
-close a connection whose peer socket belongs to another OS user. A process of the developer's own
+close a connection whose peer socket belongs to another OS user. A route-B listener checks only
+the source address, not the OS user (below). A process of the developer's own
 user can read the token from the child's environment and passes the peer check, so it gets the
 same access the developer has: the boundary is the OS user, not the process. On Windows the
 database listeners do not check the peer, so there any local account that can reach a database
@@ -113,6 +115,60 @@ no session policy. For this source it gets the value itself. A file store or a V
 has the same exposure on the agent; only resource-side materialization (the v2 gateway)
 removes it. The workspace's own processes and coding agents still never get the value, the
 token or the AWS session keys.
+
+**Each database listener kind has its own boundary (ADR-0065).** A `postgres`, `mysql`, `mongo`
+or `redis` binding listens on loopback TCP unless it sets `listen_socket_dir` (route A) or
+`listen_addr` (route B). The agent checks the caller of each connection before it reads a byte:
+
+| Listener | Binding fields | Caller check | Who the agent serves |
+|---|---|---|---|
+| TCP on a loopback address | none, `listen_port`, or a loopback `listen_addr` | The peer socket lookup of ADR-0052 | Processes of the agent's OS user |
+| Unix socket in `listen_socket_dir` | `listen_socket_dir` | The peer user ID of the socket (`SO_PEERCRED` on Linux, `getpeereid` on macOS) must be the agent's user ID | Processes of the agent's OS user. The socket has mode `0600`, in a directory that the agent's user owns and that is not group- or world-writable |
+| TCP on a non-loopback `listen_addr` | `listen_addr` and `listen_allow`, both signed in the grant | The peer IP address must be inside `listen_allow` | Every process, in any container or on any host, that can send from an allowed address |
+
+A refused caller gets a closed connection, no materialization and no upstream contact. On
+Windows the run refuses `listen_socket_dir` and a non-loopback `listen_addr` at load (§7 row 147).
+
+**Route B is for the networks of one host, and its allow-list is the only control.** The agent
+cannot look up the OS user of a peer that is not a process of its own kernel, so a route-B
+listener serves every process that can send from an address in `listen_allow`: another container
+on the same bridge network, or a process that takes over an allowed address on that network.
+Bind the host's own address on that network, such as the bridge address `172.17.0.1`, and keep
+the list as narrow as the workload, a `/32` when its address is fixed. The run refuses `0.0.0.0`,
+`::`, a missing or empty list and a list that admits every address (§7 rows 143 and 148). The
+audit journal names each route-B source in `source_addr`: the peer IP address, without the port
+(§5). Only two kinds of record carry it: the `allow` or `deny` `connect` of the
+materialization and the `caller_refused` denial. A later refusal in the same session, such as a
+user mismatch, a read-only refusal or a revocation, is recorded without `source_addr`. The
+allow-list is read once, when the run starts. After an admin changes it, restart `zs run`.
+
+**The leg from the workload to the agent is plaintext on every listener kind.** As on loopback,
+the agent offers the client no TLS: PostgreSQL gets `N` to an SSLRequest, the MySQL greeting has
+no TLS flag, and the MongoDB and Redis listeners speak plaintext. On a Unix socket the leg stays
+inside the host's kernel. On route B it crosses a network of the host, such as a container
+bridge. An observer on that network sees the database user and database names, every query or
+command, and every result row or document. It sees no credential: the client holds none, and the
+agent adds the credential only on the upstream leg. An active attacker on that network can also
+send commands in an open session. Route B is not for a network that you do not trust, and it is
+not for another host.
+
+**A flood of refused route-B connections slows the listener.** A refused route-B connection
+writes one `deny` record to the audit journal, and the journal `sync_all`s it (§5). The listener's
+accept loop waits for that check, so it takes the next connection only after the write. A flood
+of refused connections from an address outside the list therefore slows accepts for allowed
+sources too, and adds one record per connection to the journal. There is no rate limit. A refused
+loopback or Unix-socket caller writes no audit record, so this limit is route B only.
+
+**A route-B binding without a valid signed grant stops the whole run.** At startup the agent
+binds a non-loopback `listen_addr` only when it holds a grant for the binding that verifies, is
+not expired or revoked, and carries the same `listen_addr` and `listen_allow`. Otherwise
+`zs run` stops before it starts the child, and the line names the reason (§7 row 144). This is
+also true when the control plane refused the mint at startup. A binding without a non-loopback
+`listen_addr` keeps starting in that case, and each of its connections is denied. A file value
+alone never opens a route-B listener, so a control plane that does not sign the two fields cannot
+serve a route-B binding. The check runs once. A grant that is withdrawn or expires later leaves
+the listener open with its startup allow-list, and each connection is then denied at
+materialization, as on loopback.
 
 **Data exfiltration through an authorized path.** If alice may `GET` from Stripe,
 ZeroSecret does not stop her, or her coding agent, reading and forwarding that data.
@@ -244,6 +300,9 @@ that boundary, these rules limit what a committed change can do:
   `upstream_tls`, and `local_endpoint`. On both paths, a binding field that differs from the
   signed value stops the run at startup, and a field the file leaves out takes the signed value
   (ADR-0038).
+- A non-loopback `listen_addr` and its `listen_allow` must be the values of a valid signed grant
+  for the binding, on both paths, or the run stops before the child starts (ADR-0065). A file
+  that leaves them out takes the signed values.
 
 With a control plane, these rules together mean that a committed binding cannot get a
 credential through a host, a port, a TLS mode, a CA, a pinned leaf or a local endpoint that the
@@ -278,6 +337,8 @@ and in local mode:
   It can be signed later as one more field.
 - `listen_port`. It is the local listener port on loopback. It never carries the credential off
   the machine.
+- `listen_socket_dir`, and a loopback `listen_addr`. A Unix socket and a loopback address do not
+  widen who can reach the listener: both serve only the agent's OS user (ADR-0065).
 - `paths`. It narrows where on the signed host the agent adds the credential. The grant's
   operations still bound every request.
 - `user` and `auth_source` on a `mongo` binding. They name the account and the database for SCRAM
@@ -652,8 +713,14 @@ Append-only and per-organization, written in two places with deliberately differ
 
 **The agent's local journal is hash-chained.** Each record carries `seq`, subject, workload
 label, resource, protocol, operation, decision, reason, timestamp, and the `prev_hash`/`hash`
-pair that makes an edit detectable. Each line is `sync_all`'d **before the decision
-proceeds**, so a record cannot be lost by a crash that still let the request through. On Unix
+pair that makes an edit detectable. On a listener on a non-loopback `listen_addr`, the
+materialization and caller-refusal `connect` records also carry `source_addr`, the peer IP
+address without the port, and it is part of the hash (§3). Other records have no such field, so
+their bytes do not change
+(ADR-0065). An agent older than the field drops it when it opens the journal, so the hash of that
+record does not match and the agent refuses the journal as broken. Each line is `sync_all`'d
+**before the decision proceeds**, so a record cannot be lost by a crash that still let the
+request through. On Unix
 the agent creates a new journal with mode 0600. A journal that already exists keeps the mode
 it has; the agent does not change it.
 
@@ -668,8 +735,8 @@ reorder a complete line. The journal is read for shipping on a blocking thread, 
 runtime worker, so its size cannot stall request handling.
 
 **A deny record says why (ADR-0032).** `operation` names the action: the request method,
-`connect`, or a protocol operation. A NUL byte in `operation`, `reason` or `credential_ref` is
-replaced with U+FFFD before the record is hashed, so a control character the ingest database
+`connect`, or a protocol operation. A NUL byte in `operation`, `reason`, `credential_ref` or
+`source_addr` is replaced with U+FFFD before the record is hashed, so a control character the ingest database
 refuses cannot stop later records from shipping. The recorded resource is the authority's host
 without any userinfo: a request target that carries `user:password@` is parsed down to its host,
 and the diagnostic log withholds that destination. `reason` is set on deny records only. It holds text the
