@@ -760,6 +760,23 @@ fn refuse_run(diag: &DiagLog, stage: &'static str, code: i32) -> i32 {
     code
 }
 
+fn loopback_listen(prepared: &PreparedRun, binding: &zs::ResourceBinding) -> Result<String, i32> {
+    match binding.listen() {
+        Ok(zs::Listen::Loopback(addr)) => Ok(addr.to_string()),
+        Ok(_) => {
+            stderr_line!(
+                "zs: {}: listen_socket_dir and listen_addr are not supported yet",
+                binding.resource
+            );
+            Err(refuse_run(&prepared.diag, "listen", 1))
+        }
+        Err(error) => {
+            stderr_line!("zs: {error}");
+            Err(refuse_run(&prepared.diag, "listen", 1))
+        }
+    }
+}
+
 fn run_with(args: &super::Args, diag: &DiagLog) -> i32 {
     let prepared = match prepare(args, diag) {
         Ok(prepared) => prepared,
@@ -1099,8 +1116,9 @@ async fn start_services(
         let audit = L3Audit::new(prepared, &binding.resource, "postgres", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
         let cancel_authorize = l3_cancel_authorize(audit.clone());
+        let listen_addr = loopback_listen(prepared, binding)?;
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
-            &binding.listen_addr(),
+            &listen_addr,
             endpoint,
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
@@ -1158,8 +1176,9 @@ async fn start_services(
         };
         let audit = L3Audit::new(prepared, &binding.resource, "mysql", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
+        let listen_addr = loopback_listen(prepared, binding)?;
         let mysql = match zs_proto_mysql::MysqlListener::bind_endpoint(
-            &binding.listen_addr(),
+            &listen_addr,
             endpoint,
             tls,
             l3_materialize(audit),
@@ -1223,8 +1242,9 @@ async fn start_services(
             },
             |line| stderr_line!("{line}"),
         );
+        let listen_addr = loopback_listen(prepared, binding)?;
         let mongo = match zs_proto_mongo::MongoListener::bind_endpoint(
-            &binding.listen_addr(),
+            &listen_addr,
             endpoint,
             tls,
             auth,
@@ -1270,8 +1290,9 @@ async fn start_services(
         };
         let audit = L3Audit::new(prepared, &binding.resource, "redis", l3_handler.clone());
         let refusal_audit = l3_refusal_audit(audit.clone());
+        let listen_addr = loopback_listen(prepared, binding)?;
         let redis = match zs_proto_redis::RedisListener::bind_endpoint(
-            &binding.listen_addr(),
+            &listen_addr,
             endpoint,
             tls,
             binding.redis_auth(),

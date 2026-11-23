@@ -33,6 +33,19 @@ pub const POLICY_JSON_SCHEMA: &str = r#"{
             "default": "https"
           },
           "listen_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "listen_socket_dir": {
+            "type": "string",
+            "description": "database bindings: an absolute directory for a Unix socket instead of a TCP port"
+          },
+          "listen_addr": {
+            "type": "string",
+            "description": "database bindings: an IP address and a port to listen on; not 0.0.0.0 or ::; a non-loopback address needs listen_allow"
+          },
+          "listen_allow": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "CIDR ranges that may connect to a non-loopback listen_addr"
+          },
           "local_endpoint": { "type": "boolean", "default": false },
           "upstream_host": { "type": "string" },
           "upstream_port": { "type": "integer", "minimum": 0, "maximum": 65535 },

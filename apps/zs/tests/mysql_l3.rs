@@ -250,8 +250,14 @@ fn listen_port_is_checked_at_config_load() {
         r#"{"resource":"a","host":"db","protocol":"mysql","listen_port":13306},{"resource":"b","host":"db","protocol":"postgres","listen_port":15432},{"resource":"c","host":"db","protocol":"mongo","user":"app","listen_port":27117},{"resource":"d","host":"db","protocol":"mysql"}"#,
     )
     .expect("positive control: listen_port on each L3 protocol loads");
-    assert_eq!(valid.bindings[0].listen_addr(), "127.0.0.1:13306");
-    assert_eq!(valid.bindings[3].listen_addr(), "127.0.0.1:0");
+    assert_eq!(
+        valid.bindings[0].listen().unwrap(),
+        zs::Listen::Loopback("127.0.0.1:13306".parse().unwrap())
+    );
+    assert_eq!(
+        valid.bindings[3].listen().unwrap(),
+        zs::Listen::Loopback("127.0.0.1:0".parse().unwrap())
+    );
 
     for bad in [
         r#"{"resource":"a","host":"api.stripe.com","listen_port":13306}"#,

@@ -1,3 +1,4 @@
+pub mod cidr;
 pub mod connection;
 pub mod device;
 #[cfg(zs_test_endpoints)]
@@ -5,9 +6,11 @@ mod test_network;
 pub mod wire_client;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::cidr::{Cidr, CidrError};
 use serde::Deserialize;
 use zs_credential::{Credential, IdentityToken};
 use zs_grant::{AgentVerifier, SignedGrant, VerifyContext};
@@ -27,6 +30,13 @@ pub enum ConfigError {
     Identity(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listen {
+    Loopback(SocketAddr),
+    Unix(PathBuf),
+    Network { addr: SocketAddr, allow: Vec<Cidr> },
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceBinding {
@@ -44,6 +54,12 @@ pub struct ResourceBinding {
     pub upstream_auth_optional: bool,
     #[serde(default)]
     pub listen_port: Option<u16>,
+    #[serde(default)]
+    pub listen_socket_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    #[serde(default)]
+    pub listen_allow: Vec<String>,
     #[serde(default)]
     pub local_endpoint: bool,
     #[serde(default)]
@@ -342,8 +358,125 @@ impl ResourceBinding {
         Ok(None)
     }
 
-    pub fn listen_addr(&self) -> String {
-        format!("127.0.0.1:{}", self.listen_port.unwrap_or(0))
+    pub fn listen(&self) -> Result<Listen, String> {
+        let resource = &self.resource;
+        let has_new_field = self.listen_socket_dir.is_some()
+            || self.listen_addr.is_some()
+            || !self.listen_allow.is_empty();
+        if has_new_field && !self.is_l3() {
+            return Err(format!(
+                "{resource}: listen_socket_dir, listen_addr and listen_allow are allowed only on a mysql, postgres, mongo or redis binding"
+            ));
+        }
+        if self.listen_socket_dir.is_some() && self.listen_port.is_some() {
+            return Err(format!(
+                "{resource}: listen_port cannot be set with listen_socket_dir"
+            ));
+        }
+        if self.listen_addr.is_some()
+            && (self.listen_port.is_some() || self.listen_socket_dir.is_some())
+        {
+            return Err(format!(
+                "{resource}: listen_addr cannot be set with listen_port or listen_socket_dir"
+            ));
+        }
+        let listen = if let Some(dir) = &self.listen_socket_dir {
+            if !self.listen_allow.is_empty() {
+                return Err(format!(
+                    "{resource}: listen_allow needs a non-loopback listen_addr"
+                ));
+            }
+            if !dir.is_absolute() {
+                return Err(format!(
+                    "{resource}: listen_socket_dir must be an absolute path"
+                ));
+            }
+            if dir.components().any(|c| c == Component::ParentDir) {
+                return Err(format!("{resource}: listen_socket_dir must not contain .."));
+            }
+            let name = if self.is_postgres() {
+                ".s.PGSQL.5432".to_string()
+            } else {
+                format!("{resource}.sock")
+            };
+            let mut parts = Path::new(&name).components();
+            if resource.is_empty()
+                || !matches!(parts.next(), Some(Component::Normal(_)))
+                || parts.next().is_some()
+            {
+                return Err(format!(
+                    "{resource}: a resource with listen_socket_dir must be a plain file name"
+                ));
+            }
+            Listen::Unix(dir.components().collect::<PathBuf>().join(name))
+        } else if let Some(text) = &self.listen_addr {
+            let addr: SocketAddr = text.parse().map_err(|_| {
+                format!(
+                    "{resource}: listen_addr must be an IP address and a port, such as 172.17.0.1:5433"
+                )
+            })?;
+            let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            if addr.port() == 0 {
+                return Err(format!("{resource}: listen_addr port must be 1 to 65535"));
+            }
+            if addr.ip().is_unspecified() {
+                return Err(format!("{resource}: listen_addr must not be 0.0.0.0 or ::"));
+            }
+            if addr.ip().is_loopback() {
+                if !self.listen_allow.is_empty() {
+                    return Err(format!(
+                        "{resource}: listen_allow needs a non-loopback listen_addr"
+                    ));
+                }
+                Listen::Loopback(addr)
+            } else {
+                if self.listen_allow.is_empty() {
+                    return Err(format!(
+                        "{resource}: a non-loopback listen_addr needs listen_allow"
+                    ));
+                }
+                let mut allow = Vec::with_capacity(self.listen_allow.len());
+                for entry in &self.listen_allow {
+                    let cidr = entry.parse::<Cidr>().map_err(|e| match e {
+                        CidrError::Invalid => {
+                            format!("{resource}: listen_allow entry {entry:?} is not a CIDR")
+                        }
+                        CidrError::HostBits => {
+                            format!("{resource}: listen_allow entry {entry:?} has host bits set")
+                        }
+                        CidrError::Mapped => {
+                            format!(
+                                "{resource}: listen_allow entry {entry:?} is an IPv4-mapped IPv6 address; write it as IPv4"
+                            )
+                        }
+                    })?;
+                    allow.push(cidr);
+                }
+                if allow.iter().any(Cidr::is_everything) {
+                    return Err(format!(
+                        "{resource}: listen_allow must not admit every address"
+                    ));
+                }
+                Listen::Network { addr, allow }
+            }
+        } else {
+            if !self.listen_allow.is_empty() {
+                return Err(format!(
+                    "{resource}: listen_allow needs a non-loopback listen_addr"
+                ));
+            }
+            Listen::Loopback(SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                self.listen_port.unwrap_or(0),
+            )))
+        };
+        #[cfg(windows)]
+        if !matches!(listen, Listen::Loopback(_)) {
+            return Err(format!(
+                "{resource}: listen_socket_dir and listen_addr are not supported on Windows"
+            ));
+        }
+        Ok(listen)
     }
 
     pub fn l3_fields(&self) -> Result<(), String> {
@@ -356,6 +489,7 @@ impl ResourceBinding {
                 self.resource
             ));
         }
+        self.listen()?;
         if !self.is_redis() && self.upstream_auth_optional {
             return Err(format!(
                 "{}: upstream_auth_optional is allowed only on a redis binding",
@@ -767,7 +901,8 @@ impl AgentFile {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut prefixes = std::collections::HashSet::new();
-        let mut listen_ports = std::collections::HashSet::new();
+        let mut listen_addrs = std::collections::HashSet::new();
+        let mut socket_paths = std::collections::HashSet::new();
         let mut keys = std::collections::HashSet::new();
         for signed in &self.grants {
             if !matches!(
@@ -804,13 +939,30 @@ impl AgentFile {
                 .auth
                 .validate()
                 .map_err(|e| ConfigError::Policy(format!("{}: {e}", binding.resource)))?;
-            if let Some(port) = binding.listen_port
-                && !listen_ports.insert(port)
-            {
-                return Err(ConfigError::Policy(format!(
-                    "{}: listen_port {port} is already used by another binding",
-                    binding.resource
-                )));
+            match binding.listen().map_err(ConfigError::Policy)? {
+                Listen::Loopback(addr) | Listen::Network { addr, .. }
+                    if addr.port() != 0 && !listen_addrs.insert(addr) =>
+                {
+                    return Err(ConfigError::Policy(format!(
+                        "{}: listen address {addr} is already used by another binding",
+                        binding.resource
+                    )));
+                }
+                Listen::Unix(path) if !socket_paths.insert(path.clone()) => {
+                    return Err(ConfigError::Policy(match path.parent() {
+                        Some(dir) if binding.is_postgres() => format!(
+                            "{}: listen_socket_dir {} already holds the socket of another postgres binding",
+                            binding.resource,
+                            dir.display()
+                        ),
+                        _ => format!(
+                            "{}: the socket path {} is already used by another binding",
+                            binding.resource,
+                            path.display()
+                        ),
+                    }));
+                }
+                _ => {}
             }
             if binding.local_endpoint
                 && zs_protocol::classify_intercepted_protocol(&binding.protocol)
@@ -2082,5 +2234,423 @@ mod grant_policy_tests {
         assert!(!handler.withdraw_grant(RESOURCE, Some(9)));
         assert!(handler.note_policy_version(Some(9)));
         assert!(!handler.grant_policy_stale(RESOURCE));
+    }
+}
+
+#[cfg(test)]
+mod listen_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::{AgentFile, Listen, ResourceBinding};
+    use crate::cidr::Cidr;
+    use serde_json::{Value, json};
+    use std::path::PathBuf;
+
+    fn binding_json(extra: Value) -> Value {
+        let mut value = json!({ "resource": "db", "host": "db.internal", "protocol": "postgres" });
+        for (key, field) in extra.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        value
+    }
+
+    fn binding(extra: Value) -> ResourceBinding {
+        serde_json::from_value(binding_json(extra)).unwrap()
+    }
+
+    fn refusal(bindings: Value) -> String {
+        let file: AgentFile = serde_json::from_value(json!({ "bindings": bindings })).unwrap();
+        file.validate().unwrap_err().to_string()
+    }
+
+    fn refusal_one(extra: Value) -> String {
+        refusal(json!([binding_json(extra)]))
+    }
+
+    #[test]
+    fn a_binding_with_no_new_field_listens_on_loopback() {
+        assert_eq!(
+            binding(json!({})).listen().unwrap(),
+            Listen::Loopback("127.0.0.1:0".parse().unwrap())
+        );
+        assert_eq!(
+            binding(json!({ "listen_port": 54320 })).listen().unwrap(),
+            Listen::Loopback("127.0.0.1:54320".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_loopback_listen_addr_is_a_loopback_listener() {
+        for addr in ["127.0.0.1:5433", "[::1]:5433"] {
+            assert_eq!(
+                binding(json!({ "listen_addr": addr })).listen().unwrap(),
+                Listen::Loopback(addr.parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_socket_dir_is_a_unix_listener_with_the_protocol_socket_name() {
+        assert_eq!(
+            binding(json!({ "listen_socket_dir": "/run/zs" }))
+                .listen()
+                .unwrap(),
+            Listen::Unix(PathBuf::from("/run/zs/.s.PGSQL.5432"))
+        );
+        for protocol in ["mysql", "mongo", "redis"] {
+            let b = binding(json!({
+                "protocol": protocol,
+                "user": "app",
+                "listen_socket_dir": "/run/zs"
+            }));
+            assert_eq!(
+                b.listen().unwrap(),
+                Listen::Unix(PathBuf::from("/run/zs/db.sock"))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_non_loopback_listen_addr_with_an_allow_list_is_a_network_listener() {
+        let b = binding(json!({
+            "listen_addr": "172.17.0.1:5433",
+            "listen_allow": ["172.17.0.0/16", "fd00::/8"]
+        }));
+        assert_eq!(
+            b.listen().unwrap(),
+            Listen::Network {
+                addr: "172.17.0.1:5433".parse().unwrap(),
+                allow: vec![
+                    "172.17.0.0/16".parse::<Cidr>().unwrap(),
+                    "fd00::/8".parse::<Cidr>().unwrap()
+                ],
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_refuses_a_unix_and_a_network_listener() {
+        assert!(
+            binding(json!({ "listen_socket_dir": "C:\\zs" }))
+                .listen()
+                .is_err()
+        );
+        assert!(
+            binding(json!({
+                "listen_addr": "172.17.0.1:5433",
+                "listen_allow": ["172.17.0.0/16"]
+            }))
+            .listen()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_new_field_on_a_non_database_binding_is_refused() {
+        for field in [
+            json!({ "listen_socket_dir": "/run/zs" }),
+            json!({ "listen_addr": "127.0.0.1:5433" }),
+            json!({ "listen_allow": ["10.0.0.0/8"] }),
+        ] {
+            let mut extra = field;
+            extra["protocol"] = json!("https");
+            assert_eq!(
+                refusal_one(extra),
+                "policy: db: listen_socket_dir, listen_addr and listen_allow are allowed only on a mysql, postgres, mongo or redis binding"
+            );
+        }
+    }
+
+    #[test]
+    fn listen_port_with_listen_socket_dir_is_refused() {
+        assert_eq!(
+            refusal_one(json!({ "listen_port": 5433, "listen_socket_dir": "/run/zs" })),
+            "policy: db: listen_port cannot be set with listen_socket_dir"
+        );
+    }
+
+    #[test]
+    fn listen_addr_with_listen_port_or_listen_socket_dir_is_refused() {
+        for extra in [
+            json!({ "listen_addr": "127.0.0.1:5433", "listen_port": 5433 }),
+            json!({ "listen_addr": "127.0.0.1:5433", "listen_socket_dir": "/run/zs" }),
+        ] {
+            assert_eq!(
+                refusal_one(extra),
+                "policy: db: listen_addr cannot be set with listen_port or listen_socket_dir"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_listen_socket_dir_is_refused() {
+        assert_eq!(
+            refusal_one(json!({ "listen_socket_dir": "run/zs" })),
+            "policy: db: listen_socket_dir must be an absolute path"
+        );
+    }
+
+    #[test]
+    fn a_resource_that_is_not_a_plain_file_name_is_refused_with_a_socket_dir() {
+        for resource in ["a/b", "/abs", ""] {
+            assert_eq!(
+                refusal_one(json!({
+                    "protocol": "mysql",
+                    "user": "app",
+                    "resource": resource,
+                    "listen_socket_dir": "/run"
+                })),
+                format!(
+                    "policy: {resource}: a resource with listen_socket_dir must be a plain file name"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_dot_dot_in_listen_socket_dir_is_refused() {
+        for dir in ["/run/zs/../zs", "/run/..", "/.."] {
+            assert_eq!(
+                refusal_one(json!({ "listen_socket_dir": dir })),
+                "policy: db: listen_socket_dir must not contain .."
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_socket_dir_is_normalised_before_the_name_is_joined() {
+        for dir in ["/run/./zs", "/run/zs/", "/run//zs/."] {
+            assert_eq!(
+                binding(json!({ "listen_socket_dir": dir }))
+                    .listen()
+                    .unwrap(),
+                Listen::Unix(PathBuf::from("/run/zs/.s.PGSQL.5432"))
+            );
+        }
+    }
+
+    #[test]
+    fn socket_dirs_that_differ_only_by_dot_or_slash_are_one_directory() {
+        let first = binding_json(json!({ "listen_socket_dir": "/run/zs" }));
+        for dir in ["/run/./zs", "/run/zs/", "/run//zs"] {
+            let second = binding_json(json!({
+                "resource": "db2",
+                "host": "db2.internal",
+                "listen_socket_dir": dir
+            }));
+            assert_eq!(
+                refusal(json!([first.clone(), second])),
+                "policy: db2: listen_socket_dir /run/zs already holds the socket of another postgres binding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mapped_ipv4_listen_addr_is_judged_as_ipv4() {
+        assert_eq!(
+            refusal_one(json!({
+                "listen_addr": "[::ffff:0.0.0.0]:5433",
+                "listen_allow": ["10.0.0.0/8"]
+            })),
+            "policy: db: listen_addr must not be 0.0.0.0 or ::"
+        );
+        assert_eq!(
+            binding(json!({ "listen_addr": "[::ffff:127.0.0.1]:5433" }))
+                .listen()
+                .unwrap(),
+            Listen::Loopback("127.0.0.1:5433".parse().unwrap())
+        );
+        assert_eq!(
+            refusal_one(json!({
+                "listen_addr": "[::ffff:127.0.0.1]:5433",
+                "listen_allow": ["10.0.0.0/8"]
+            })),
+            "policy: db: listen_allow needs a non-loopback listen_addr"
+        );
+        assert_eq!(
+            binding(json!({
+                "listen_addr": "[::ffff:172.17.0.1]:5433",
+                "listen_allow": ["172.17.0.0/16"]
+            }))
+            .listen()
+            .unwrap(),
+            Listen::Network {
+                addr: "172.17.0.1:5433".parse().unwrap(),
+                allow: vec!["172.17.0.0/16".parse::<Cidr>().unwrap()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_mapped_ipv4_listen_allow_entry_is_refused() {
+        for entry in ["::ffff:10.0.0.0/104", "::ffff:0.0.0.0/96"] {
+            assert_eq!(
+                refusal_one(json!({
+                    "listen_addr": "172.17.0.1:5433",
+                    "listen_allow": [entry]
+                })),
+                format!(
+                    "policy: db: listen_allow entry \"{entry}\" is an IPv4-mapped IPv6 address; write it as IPv4"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn two_postgres_bindings_in_one_socket_dir_are_refused() {
+        let first = binding_json(json!({ "listen_socket_dir": "/run/zs" }));
+        let second = binding_json(json!({
+            "resource": "db2",
+            "host": "db2.internal",
+            "listen_socket_dir": "/run/zs"
+        }));
+        assert_eq!(
+            refusal(json!([first, second])),
+            "policy: db2: listen_socket_dir /run/zs already holds the socket of another postgres binding"
+        );
+    }
+
+    #[test]
+    fn two_bindings_with_one_tcp_address_are_refused() {
+        let first = binding_json(json!({ "listen_port": 5433 }));
+        let second = binding_json(json!({
+            "resource": "db2",
+            "host": "db2.internal",
+            "listen_addr": "127.0.0.1:5433"
+        }));
+        assert_eq!(
+            refusal(json!([first, second.clone()])),
+            "policy: db2: listen address 127.0.0.1:5433 is already used by another binding"
+        );
+        let third = binding_json(json!({
+            "resource": "db3",
+            "host": "db3.internal",
+            "listen_port": 5433
+        }));
+        assert_eq!(
+            refusal(json!([second, third])),
+            "policy: db3: listen address 127.0.0.1:5433 is already used by another binding"
+        );
+        let a = binding_json(json!({
+            "listen_addr": "172.17.0.1:5433",
+            "listen_allow": ["172.17.0.0/16"]
+        }));
+        let b = binding_json(json!({
+            "resource": "db2",
+            "host": "db2.internal",
+            "listen_addr": "172.17.0.1:5433",
+            "listen_allow": ["172.17.0.0/16"]
+        }));
+        assert_eq!(
+            refusal(json!([a, b])),
+            "policy: db2: listen address 172.17.0.1:5433 is already used by another binding"
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_listen_addr_needs_an_allow_list() {
+        assert_eq!(
+            refusal_one(json!({ "listen_addr": "172.17.0.1:5433" })),
+            "policy: db: a non-loopback listen_addr needs listen_allow"
+        );
+        assert_eq!(
+            refusal_one(json!({ "listen_addr": "172.17.0.1:5433", "listen_allow": [] })),
+            "policy: db: a non-loopback listen_addr needs listen_allow"
+        );
+    }
+
+    #[test]
+    fn an_allow_list_that_admits_every_address_is_refused() {
+        for entry in ["0.0.0.0/0", "::/0"] {
+            assert_eq!(
+                refusal_one(json!({
+                    "listen_addr": "172.17.0.1:5433",
+                    "listen_allow": ["172.17.0.0/16", entry]
+                })),
+                "policy: db: listen_allow must not admit every address"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listen_allow_entry_that_is_not_a_cidr_is_refused() {
+        for entry in [
+            "172.17.0.0",
+            "172.17.0.0/33",
+            "nope/8",
+            "fd00::/129",
+            "/8",
+            "",
+        ] {
+            assert_eq!(
+                refusal_one(json!({
+                    "listen_addr": "172.17.0.1:5433",
+                    "listen_allow": [entry]
+                })),
+                format!("policy: db: listen_allow entry \"{entry}\" is not a CIDR")
+            );
+        }
+    }
+
+    #[test]
+    fn a_listen_allow_entry_with_host_bits_is_refused() {
+        for entry in ["10.0.0.1/8", "fd00::1/8"] {
+            assert_eq!(
+                refusal_one(json!({
+                    "listen_addr": "172.17.0.1:5433",
+                    "listen_allow": [entry]
+                })),
+                format!("policy: db: listen_allow entry \"{entry}\" has host bits set")
+            );
+        }
+    }
+
+    #[test]
+    fn listen_allow_without_listen_addr_is_refused() {
+        assert_eq!(
+            refusal_one(json!({ "listen_allow": ["10.0.0.0/8"] })),
+            "policy: db: listen_allow needs a non-loopback listen_addr"
+        );
+    }
+
+    #[test]
+    fn listen_allow_with_a_loopback_listen_addr_is_refused() {
+        assert_eq!(
+            refusal_one(json!({
+                "listen_addr": "127.0.0.1:5433",
+                "listen_allow": ["10.0.0.0/8"]
+            })),
+            "policy: db: listen_allow needs a non-loopback listen_addr"
+        );
+    }
+
+    #[test]
+    fn a_listen_addr_needs_a_port_between_1_and_65535() {
+        for addr in ["172.17.0.1", "172.17.0.1:x", "db.internal:5433", ""] {
+            assert_eq!(
+                refusal_one(json!({ "listen_addr": addr, "listen_allow": ["172.17.0.0/16"] })),
+                "policy: db: listen_addr must be an IP address and a port, such as 172.17.0.1:5433"
+            );
+        }
+        assert_eq!(
+            refusal_one(json!({
+                "listen_addr": "172.17.0.1:0",
+                "listen_allow": ["172.17.0.0/16"]
+            })),
+            "policy: db: listen_addr port must be 1 to 65535"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_listen_addr_is_refused() {
+        for addr in ["0.0.0.0:5433", "[::]:5433"] {
+            assert_eq!(
+                refusal_one(json!({ "listen_addr": addr, "listen_allow": ["10.0.0.0/8"] })),
+                "policy: db: listen_addr must not be 0.0.0.0 or ::"
+            );
+        }
     }
 }
