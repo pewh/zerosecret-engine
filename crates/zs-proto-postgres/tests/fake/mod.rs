@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use zs_credential::Credential;
 use zs_diag::DiagLog;
 use zs_proto_postgres::{Materialize, PostgresListener, SslPolicy, UpstreamEndpoint, UpstreamTls};
+use zs_protocol::ListenSpec;
 
 pub const PASSWORD: &str = "zs-pg-test-password";
 pub const WRONG: &str = "zs-pg-test-wrong-password";
@@ -456,9 +457,37 @@ pub async fn listen_gated(
     diag: DiagLog,
     caller_check: Option<zs_protocol::CallerCheck>,
 ) -> SocketAddr {
+    let ListenSpec::Tcp(local) = listen_on(
+        &loopback(),
+        host,
+        port,
+        tls,
+        materialize,
+        diag,
+        caller_check,
+        Arc::new(|| Ok(())),
+    )
+    .await
+    else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    local
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn listen_on(
+    spec: &ListenSpec,
+    host: &str,
+    port: u16,
+    tls: UpstreamTls,
+    materialize: Materialize,
+    diag: DiagLog,
+    caller_check: Option<zs_protocol::CallerCheck>,
+    cancel_authorize: zs_proto_postgres::CancelAuthorize,
+) -> ListenSpec {
     let endpoint = UpstreamEndpoint::new(host, port).unwrap();
     let listener = PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        spec,
         endpoint,
         SslPolicy::RefuseOnLoopback,
         tls,
@@ -467,14 +496,25 @@ pub async fn listen_gated(
     .await
     .unwrap()
     .with_diag(diag, RESOURCE)
-    .with_cancel_authorize(Arc::new(|| Ok(())));
+    .with_cancel_authorize(cancel_authorize);
     let listener = match caller_check {
         Some(check) => listener.with_caller_check(check),
         None => listener,
     };
-    let local = listener.local_addr();
+    let local = listener.local().clone();
     tokio::spawn(listener.serve());
     local
+}
+
+pub fn loopback() -> ListenSpec {
+    ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+pub fn tcp_addr(spec: &ListenSpec) -> SocketAddr {
+    let ListenSpec::Tcp(addr) = spec else {
+        panic!("a TCP listener reports a TCP address");
+    };
+    *addr
 }
 
 pub fn granted(password: &[u8]) -> zs_protocol::Materialized {
@@ -525,7 +565,14 @@ pub fn startup(params: &[(&str, &str)]) -> Vec<u8> {
 }
 
 pub async fn login_with(local: SocketAddr, startup: &[u8]) -> Result<TcpStream, Vec<u8>> {
-    let mut client = TcpStream::connect(local).await.unwrap();
+    let client = TcpStream::connect(local).await.unwrap();
+    login_over(client, startup).await
+}
+
+pub async fn login_over<S: AsyncRead + AsyncWrite + Unpin>(
+    mut client: S,
+    startup: &[u8],
+) -> Result<S, Vec<u8>> {
     client.write_all(startup).await.unwrap();
     loop {
         let (tag, body) = tokio::time::timeout(Duration::from_secs(10), read_tagged(&mut client))
@@ -540,7 +587,7 @@ pub async fn login_with(local: SocketAddr, startup: &[u8]) -> Result<TcpStream, 
     }
 }
 
-pub async fn query(client: &mut TcpStream, sql: &str) -> String {
+pub async fn query<S: AsyncRead + AsyncWrite + Unpin>(client: &mut S, sql: &str) -> String {
     let mut body = sql.as_bytes().to_vec();
     body.push(0);
     write_tagged(client, b'Q', &body).await.unwrap();

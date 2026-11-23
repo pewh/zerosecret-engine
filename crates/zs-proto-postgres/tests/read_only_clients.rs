@@ -78,7 +78,7 @@ async fn listen(db: &Database, access: SessionAccess) -> (SocketAddr, Refusals) 
         Some(1)
     });
     let listener = PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        &fake::loopback(),
         UpstreamEndpoint::new(db.host.clone(), db.port).unwrap(),
         SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
@@ -88,7 +88,7 @@ async fn listen(db: &Database, access: SessionAccess) -> (SocketAddr, Refusals) 
     .unwrap()
     .with_refusal_audit(audit)
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(listener.serve());
     (local, refusals)
 }

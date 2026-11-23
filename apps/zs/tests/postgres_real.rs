@@ -680,7 +680,7 @@ fn through_listener(up: &Upstream, tls_fields: &str) -> TlsRun {
     let rt = runtime();
     let local = rt.block_on(async {
         let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &zs_protocol::ListenSpec::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
             zs_proto_postgres::UpstreamEndpoint::new(host, port).unwrap(),
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
@@ -697,7 +697,9 @@ fn through_listener(up: &Upstream, tls_fields: &str) -> TlsRun {
         .unwrap()
         .with_diag(diag.clone(), "appdb")
         .with_caller_check(std::sync::Arc::new(|_| true));
-        let local = listener.local_addr();
+        let zs_protocol::ListenSpec::Tcp(local) = *listener.local() else {
+            panic!("a TCP listener reports a TCP address");
+        };
         tokio::spawn(listener.serve());
         local
     });

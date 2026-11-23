@@ -187,7 +187,7 @@ fn credential() -> zs_protocol::Materialized {
 async fn client_authenticates_through_the_listener_without_a_password() {
     let upstream = mock_upstream().await;
     let listener = PostgresListener::bind(
-        "127.0.0.1:0",
+        &fake::loopback(),
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
         Arc::new(|_| Ok(credential())),
@@ -195,7 +195,7 @@ async fn client_authenticates_through_the_listener_without_a_password() {
     .await
     .expect("listener must bind")
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(async move { listener.serve().await });
 
     let mut client = TcpStream::connect(local).await.unwrap();
@@ -233,7 +233,7 @@ async fn client_authenticates_through_the_listener_without_a_password() {
 async fn sslrequest_is_explicitly_refused_on_loopback() {
     let upstream = mock_upstream().await;
     let listener = PostgresListener::bind(
-        "127.0.0.1:0",
+        &fake::loopback(),
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
         Arc::new(|_| Ok(credential())),
@@ -241,7 +241,7 @@ async fn sslrequest_is_explicitly_refused_on_loopback() {
     .await
     .unwrap()
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(async move { listener.serve().await });
 
     let mut client = TcpStream::connect(local).await.unwrap();
@@ -267,7 +267,7 @@ async fn sslrequest_is_explicitly_refused_on_loopback() {
 async fn materialization_failure_denies_the_connection() {
     let upstream = mock_upstream().await;
     let listener = PostgresListener::bind(
-        "127.0.0.1:0",
+        &fake::loopback(),
         upstream.addr,
         SslPolicy::RefuseOnLoopback,
         Arc::new(|_| Err(zs_protocol::Denied::new("vault unavailable"))),
@@ -275,7 +275,7 @@ async fn materialization_failure_denies_the_connection() {
     .await
     .unwrap()
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(async move { listener.serve().await });
 
     let mut client = TcpStream::connect(local).await.unwrap();
@@ -304,7 +304,7 @@ async fn binding_does_not_probe_upstream() {
     let raw = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = UpstreamEndpoint::new("127.0.0.1", raw.local_addr().unwrap().port()).unwrap();
     let listener = PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        &fake::loopback(),
         endpoint,
         SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
@@ -313,7 +313,7 @@ async fn binding_does_not_probe_upstream() {
     .await
     .unwrap()
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(async move { listener.serve().await });
 
     let early = tokio::time::timeout(std::time::Duration::from_millis(100), raw.accept()).await;
@@ -896,4 +896,331 @@ async fn a_listener_without_a_caller_check_refuses() {
         1,
         "{events:?}"
     );
+}
+
+#[cfg(unix)]
+mod unix_front {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use zs_protocol::{Caller, ListenSpec, Materialize};
+
+    use super::*;
+
+    fn socket(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".s.PGSQL.5432")
+    }
+
+    fn own_uid(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    fn allow_cancel() -> zs_proto_postgres::CancelAuthorize {
+        Arc::new(|| Ok(()))
+    }
+
+    async fn unix_listen(
+        upstream: &fake::Fake,
+        path: &std::path::Path,
+        materialize: zs_proto_postgres::Materialize,
+        diag: zs_diag::DiagLog,
+        check: zs_protocol::CallerCheck,
+        cancel: zs_proto_postgres::CancelAuthorize,
+    ) {
+        let spec = ListenSpec::Unix(path.to_path_buf());
+        let bound = fake::listen_on(
+            &spec,
+            "127.0.0.1",
+            upstream.addr.port(),
+            UpstreamTls::WhenOffered,
+            materialize,
+            diag,
+            Some(check),
+            cancel,
+        )
+        .await;
+        assert_eq!(bound, spec);
+    }
+
+    async fn unix_cancel(path: &std::path::Path) {
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let _ = client.write_all(&fake::cancel_packet()).await;
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_over_a_unix_socket_gets_the_brokered_session() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket(dir.path());
+        let (materialize, calls) = fake::counted(fake::PASSWORD);
+        unix_listen(
+            &upstream,
+            &path,
+            materialize,
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            allow_cancel(),
+        )
+        .await;
+
+        let client = UnixStream::connect(&path).await.unwrap();
+        let mut client = fake::login_over(client, &fake::startup(&[("user", "alice")]))
+            .await
+            .expect("the unix client logs in without a credential");
+        assert_eq!(fake::query(&mut client, "SELECT 1").await, "SELECT 1");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(upstream.seen(|s| s.authenticated));
+        assert_eq!(upstream.seen(|s| s.startups), 1);
+        assert_eq!(upstream.seen(|s| s.queries.clone()), vec!["SELECT 1"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_over_a_unix_socket_reaches_the_upstream_without_materializing() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket(dir.path());
+        let (materialize, calls) = fake::counted(fake::PASSWORD);
+        unix_listen(
+            &upstream,
+            &path,
+            materialize,
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            allow_cancel(),
+        )
+        .await;
+
+        unix_cancel(&path).await;
+
+        assert!(
+            fake::eventually(|| upstream.seen(|s| s.cancels.len()) == 1).await,
+            "the cancel never reached the upstream"
+        );
+        assert_eq!(
+            upstream.seen(|s| s.cancels.clone()),
+            vec![fake::cancel_packet()]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_the_authorizer_refuses_does_not_reach_the_upstream() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let control = socket(dir.path());
+        unix_listen(
+            &upstream,
+            &control,
+            fake::materialize(fake::PASSWORD),
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            allow_cancel(),
+        )
+        .await;
+        unix_cancel(&control).await;
+        assert!(
+            fake::eventually(|| upstream.seen(|s| s.cancels.len()) == 1).await,
+            "negative control: an authorized cancel reaches the upstream"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let refused = socket(other.path());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        unix_listen(
+            &upstream,
+            &refused,
+            fake::materialize(fake::PASSWORD),
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(zs_protocol::Denied::new("no grant"))
+            }),
+        )
+        .await;
+        unix_cancel(&refused).await;
+
+        assert!(
+            fake::eventually(|| asked.load(Ordering::SeqCst) == 1).await,
+            "positive: the authorizer ran for the cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            upstream.seen(|s| s.cancels.len()),
+            1,
+            "a refused cancel reached the upstream"
+        );
+        assert_eq!(upstream.seen(|s| s.accepts), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_unix_caller_is_closed_before_any_byte_is_read() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket(dir.path());
+        let home = tempfile::tempdir().unwrap();
+        let (diag, log) = fake::open_diag(home.path());
+        let checked = Arc::new(Mutex::new(Vec::new()));
+        let record = checked.clone();
+        let refuse_unix: zs_protocol::CallerCheck = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            !matches!(caller, Caller::Unix { .. })
+        });
+        let (materialize, calls) = fake::counted(fake::PASSWORD);
+        unix_listen(
+            &upstream,
+            &path,
+            materialize,
+            diag.clone(),
+            refuse_unix,
+            allow_cancel(),
+        )
+        .await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let _ = client.write_all(&fake::startup(&[("user", "alice")])).await;
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("the agent closes the refused connection");
+        unix_cancel(&path).await;
+
+        assert!(received.is_empty(), "{received:?}");
+        assert!(
+            fake::eventually(|| checked.lock().unwrap().len() == 2).await,
+            "positive: the caller check ran for both connections"
+        );
+        assert_eq!(
+            *checked.lock().unwrap(),
+            vec![
+                Caller::Unix {
+                    uid: Some(own_uid(dir.path()))
+                };
+                2
+            ]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream.seen(|s| s.accepts), 0);
+        assert!(upstream.seen(|s| s.cancels.is_empty()));
+        let events = fake::events(&diag, &log).await;
+        assert_eq!(
+            fake::named(&events, "caller_refused").len(),
+            2,
+            "{events:?}"
+        );
+        assert!(fake::named(&events, "conn_accepted").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ssl_request_on_a_unix_socket_gets_the_answer_a_tcp_client_gets() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let tcp = upstream.listen(UpstreamTls::WhenOffered).await;
+        let mut over_tcp = TcpStream::connect(tcp).await.unwrap();
+        over_tcp.write_all(&fake::SSL_REQUEST).await.unwrap();
+        let mut tcp_reply = [0u8; 1];
+        over_tcp.read_exact(&mut tcp_reply).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket(dir.path());
+        unix_listen(
+            &upstream,
+            &path,
+            fake::materialize(fake::PASSWORD),
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            allow_cancel(),
+        )
+        .await;
+        let mut over_unix = UnixStream::connect(&path).await.unwrap();
+        over_unix.write_all(&fake::SSL_REQUEST).await.unwrap();
+        let mut unix_reply = [0u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            over_unix.read_exact(&mut unix_reply),
+        )
+        .await
+        .expect("the listener answers the SSLRequest")
+        .unwrap();
+
+        assert_eq!(tcp_reply, [b'N']);
+        assert_eq!(unix_reply, tcp_reply);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_admitted_unix_caller() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket(dir.path());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(fake::PASSWORD.as_bytes()))
+        });
+        unix_listen(
+            &upstream,
+            &path,
+            materialize,
+            zs_diag::DiagLog::disabled(),
+            fake::admit_all(),
+            allow_cancel(),
+        )
+        .await;
+
+        let client = UnixStream::connect(&path).await.unwrap();
+        fake::login_over(client, &fake::startup(&[("user", "alice")]))
+            .await
+            .expect("the unix client logs in");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Caller::Unix {
+                uid: Some(own_uid(dir.path()))
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_receives_the_peer_address_of_a_tcp_caller() {
+        let upstream = fake::start(Script::new(Answer::N)).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let materialize: Materialize = Arc::new(move |caller| {
+            record.lock().unwrap().push(*caller);
+            Ok(fake::granted(fake::PASSWORD.as_bytes()))
+        });
+        let ListenSpec::Tcp(local) = fake::listen_on(
+            &fake::loopback(),
+            "127.0.0.1",
+            upstream.addr.port(),
+            UpstreamTls::WhenOffered,
+            materialize,
+            zs_diag::DiagLog::disabled(),
+            Some(fake::admit_all()),
+            allow_cancel(),
+        )
+        .await
+        else {
+            panic!("a TCP listener reports a TCP address");
+        };
+
+        let client = fake::login(local).await.expect("the tcp client logs in");
+        let source = client.local_addr().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let Caller::Tcp { peer, local: to } = &seen[0] else {
+            panic!("a TCP client is a TCP caller: {:?}", seen[0]);
+        };
+        assert_eq!(*peer, source);
+        assert_eq!(*to, local);
+    }
 }

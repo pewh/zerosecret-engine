@@ -206,6 +206,17 @@ mod tests {
         Arc::new(|_| true)
     }
 
+    fn loopback() -> ListenSpec {
+        ListenSpec::Tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
+    fn tcp_addr(spec: &ListenSpec) -> SocketAddr {
+        let ListenSpec::Tcp(addr) = spec else {
+            panic!("a TCP listener reports a TCP address");
+        };
+        *addr
+    }
+
     fn loopback_caller() -> Caller {
         Caller::Tcp {
             peer: SocketAddr::from(([127, 0, 0, 1], 40_000)),
@@ -219,6 +230,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use tokio::net::TcpListener;
     use zs_upstream::connect_with;
 
     const PASSWORD: &str = "unit-test-upstream-pencil";
@@ -492,7 +504,7 @@ mod tests {
     {
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let listener = PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &loopback(),
             endpoint,
             SslPolicy::RefuseOnLoopback,
             UpstreamTls::WhenOffered,
@@ -501,7 +513,7 @@ mod tests {
         .await
         .unwrap()
         .with_caller_check(admit_all());
-        let local = listener.local_addr();
+        let local = tcp_addr(listener.local());
         tokio::spawn(
             listener
                 .with_cancel_authorize(Arc::new(|| Ok(())))
@@ -587,6 +599,7 @@ mod tests {
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 Upstream::new(endpoint, UpstreamTls::WhenOffered).unwrap(),
@@ -636,6 +649,7 @@ mod tests {
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 Upstream::new(endpoint, UpstreamTls::WhenOffered).unwrap(),
@@ -764,6 +778,7 @@ mod tests {
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 Upstream::new(endpoint, UpstreamTls::WhenOffered).unwrap(),
@@ -809,6 +824,7 @@ mod tests {
         .unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 target,
@@ -993,7 +1009,7 @@ mod tests {
         let (connect, asked) = scripted(vec![vec![]]);
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let listener = PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &loopback(),
             endpoint,
             SslPolicy::RefuseOnLoopback,
             UpstreamTls::WhenOffered,
@@ -1002,7 +1018,7 @@ mod tests {
         .await
         .unwrap()
         .with_caller_check(admit_all());
-        let local = listener.local_addr();
+        let local = tcp_addr(listener.local());
         tokio::spawn(listener.serve_with(connect));
 
         let mut client = TcpStream::connect(local).await.unwrap();
@@ -1051,6 +1067,7 @@ mod tests {
         .unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 target,
@@ -1150,6 +1167,7 @@ mod tests {
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let handled = tokio::spawn(async move {
             let (client, _) = front.accept().await.unwrap();
+            let client = ClientStream::Tcp(client);
             handle_connection(
                 client,
                 Upstream::new(endpoint, UpstreamTls::WhenOffered).unwrap(),
@@ -1238,7 +1256,7 @@ mod tests {
         let (connect, _asked) = scripted(vec![vec![live.addr]]);
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let listener = PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &loopback(),
             endpoint,
             SslPolicy::RefuseOnLoopback,
             UpstreamTls::WhenOffered,
@@ -1248,7 +1266,7 @@ mod tests {
         .unwrap()
         .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
-        let local = listener.local_addr();
+        let local = tcp_addr(listener.local());
         tokio::spawn(listener.serve_with(connect));
 
         let reply = tokio::time::timeout(Duration::from_secs(5), startup_reply(local))
@@ -1291,7 +1309,7 @@ mod tests {
         let (connect, _asked) = scripted(vec![vec![live.addr]]);
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let listener = PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &loopback(),
             endpoint,
             SslPolicy::RefuseOnLoopback,
             UpstreamTls::WhenOffered,
@@ -1301,7 +1319,7 @@ mod tests {
         .unwrap()
         .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
-        let local = listener.local_addr();
+        let local = tcp_addr(listener.local());
         tokio::spawn(listener.serve_with(connect));
 
         let mut client = TcpStream::connect(local).await.unwrap();
@@ -1358,7 +1376,7 @@ mod tests {
         let (connect, _asked) = scripted(vec![vec![upstream]]);
         let endpoint = UpstreamEndpoint::new(UNRESOLVABLE_HOST, 5432).unwrap();
         let listener = PostgresListener::bind_endpoint(
-            "127.0.0.1:0",
+            &loopback(),
             endpoint,
             SslPolicy::RefuseOnLoopback,
             UpstreamTls::WhenOffered,
@@ -1368,7 +1386,7 @@ mod tests {
         .unwrap()
         .with_caller_check(admit_all())
         .with_diag(diag.clone(), "orders-db");
-        let local = listener.local_addr();
+        let local = tcp_addr(listener.local());
         tokio::spawn(listener.serve_with(connect));
 
         let reply = tokio::time::timeout(Duration::from_secs(5), startup_reply(local))
@@ -1505,9 +1523,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use zs_credential::Credential;
-use zs_protocol::{Caller, SessionAccess};
+use zs_protocol::{Caller, ClientStream, FrontListener, ListenSpec, SessionAccess};
 
 pub use zs_upstream::{TlsConfigError, UpstreamEndpoint, UpstreamTls};
 
@@ -1821,7 +1839,7 @@ fn auth_method(code: u32) -> &'static str {
 }
 
 pub struct PostgresListener {
-    listener: TcpListener,
+    listener: FrontListener,
     caller_check: Option<zs_protocol::CallerCheck>,
     upstream: Upstream,
     ssl: SslPolicy,
@@ -1840,7 +1858,7 @@ impl PostgresListener {
     }
 
     pub async fn bind(
-        local: &str,
+        local: &ListenSpec,
         upstream: SocketAddr,
         ssl: SslPolicy,
         materialize: Materialize,
@@ -1850,7 +1868,7 @@ impl PostgresListener {
     }
 
     pub async fn bind_endpoint(
-        local: &str,
+        local: &ListenSpec,
         upstream: UpstreamEndpoint,
         ssl: SslPolicy,
         tls: UpstreamTls,
@@ -1858,7 +1876,7 @@ impl PostgresListener {
     ) -> std::io::Result<Self> {
         let upstream = Upstream::new(upstream, tls)?;
         Ok(Self {
-            listener: TcpListener::bind(local).await?,
+            listener: FrontListener::bind(local).await?,
             caller_check: None,
             upstream,
             ssl,
@@ -1892,10 +1910,8 @@ impl PostgresListener {
         self
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.listener
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)))
+    pub fn local(&self) -> &ListenSpec {
+        self.listener.local()
     }
 
     pub async fn serve(self) -> std::io::Result<()> {
@@ -1909,8 +1925,7 @@ impl PostgresListener {
         F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
     {
         loop {
-            let (client, peer) = self.listener.accept().await?;
-            let caller = Caller::tcp(peer, client.local_addr());
+            let (client, caller) = self.listener.accept().await?;
             if !zs_protocol::admitted(self.caller_check.as_ref(), &caller).await {
                 self.diag.emit(
                     Event::new(Component::Postgres, "caller_refused")
@@ -1969,7 +1984,7 @@ fn at(stage: &'static str) -> impl FnOnce(std::io::Error) -> Staged {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<C, F>(
-    mut client: TcpStream,
+    mut client: ClientStream,
     target: Upstream,
     ssl: SslPolicy,
     materialize: Materialize,
@@ -2247,7 +2262,7 @@ const READ_ONLY_UNAVAILABLE: (&str, &str) =
     ("08004", "zs: the server cannot open a read-only session");
 
 async fn refuse(
-    client: &mut TcpStream,
+    client: &mut ClientStream,
     (code, reason): (&str, &str),
     error: std::io::Error,
 ) -> std::io::Result<()> {
@@ -2266,7 +2281,7 @@ enum Startup {
     Closed,
 }
 
-async fn read_startup(client: &mut TcpStream, ssl: SslPolicy) -> std::io::Result<Startup> {
+async fn read_startup(client: &mut ClientStream, ssl: SslPolicy) -> std::io::Result<Startup> {
     let mut packet = read_client_packet(client)
         .await?
         .ok_or_else(|| std::io::Error::other("implausible startup length"))?;
@@ -2289,7 +2304,7 @@ async fn read_startup(client: &mut TcpStream, ssl: SslPolicy) -> std::io::Result
     })
 }
 
-async fn read_client_packet(client: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+async fn read_client_packet(client: &mut ClientStream) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     client.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
@@ -2540,7 +2555,7 @@ fn counted(joined: Copied, counter: &AtomicU64) -> std::io::Result<u64> {
 }
 
 async fn relay(
-    client: TcpStream,
+    client: ClientStream,
     upstream: Box<dyn Io>,
     gate: Option<Arc<Gate>>,
     watch: zs_protocol::SessionWatch,

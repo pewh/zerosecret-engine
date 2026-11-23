@@ -57,7 +57,7 @@ async fn listen_as(port: u16, access: SessionAccess) -> Session {
     let home = tempfile::tempdir().unwrap();
     let (diag, log) = fake::open_diag(home.path());
     let listener = PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        &fake::loopback(),
         UpstreamEndpoint::new("127.0.0.1", port).unwrap(),
         SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
@@ -68,7 +68,7 @@ async fn listen_as(port: u16, access: SessionAccess) -> Session {
     .with_diag(diag.clone(), fake::RESOURCE)
     .with_refusal_audit(audit)
     .with_caller_check(fake::admit_all());
-    let local = listener.local_addr();
+    let local = fake::tcp_addr(listener.local());
     tokio::spawn(listener.serve());
     Session {
         local,

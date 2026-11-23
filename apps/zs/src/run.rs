@@ -1121,7 +1121,7 @@ async fn start_services(
         let cancel_authorize = l3_cancel_authorize(audit.clone());
         let listen_addr = loopback_listen(prepared, binding)?;
         let pg = match zs_proto_postgres::PostgresListener::bind_endpoint(
-            &listen_addr.to_string(),
+            &zs_protocol::ListenSpec::Tcp(listen_addr),
             endpoint,
             zs_proto_postgres::SslPolicy::RefuseOnLoopback,
             tls,
@@ -1140,7 +1140,13 @@ async fn start_services(
                 return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
             }
         };
-        let local = pg.local_addr();
+        let zs_protocol::ListenSpec::Tcp(local) = *pg.local() else {
+            stderr_line!(
+                "zs: postgres listener for {}: no TCP address",
+                binding.resource
+            );
+            return Err(refuse_run(&prepared.diag, "postgres_bind", 1));
+        };
         announce_l3(prepared, "postgres", &binding.resource, local);
         tasks.push(tokio::spawn(async move {
             let _ = pg.serve().await;

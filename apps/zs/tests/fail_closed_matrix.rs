@@ -4680,7 +4680,7 @@ async fn bound_pg_listener(
     let (materialize, calls) = pg_fake::counted(pg_fake::PASSWORD);
     let (audit, refusals) = fake::audit_recorder();
     let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        &zs_protocol::ListenSpec::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         zs_proto_postgres::UpstreamEndpoint::new("127.0.0.1", upstream.addr.port()).unwrap(),
         zs_proto_postgres::SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
@@ -4691,7 +4691,9 @@ async fn bound_pg_listener(
     .with_expected_user(user.map(str::to_string))
     .with_refusal_audit(audit)
     .with_caller_check(pg_fake::admit_all());
-    let local = listener.local_addr();
+    let zs_protocol::ListenSpec::Tcp(local) = *listener.local() else {
+        panic!("a TCP listener reports a TCP address");
+    };
     tokio::spawn(listener.serve());
     (local, calls, refusals)
 }
@@ -5790,7 +5792,7 @@ async fn pg_access_listener(
     let materialize: zs_proto_postgres::Materialize =
         Arc::new(move |_| Ok(pg_fake::granted_as(pg_fake::PASSWORD.as_bytes(), access)));
     let listener = zs_proto_postgres::PostgresListener::bind_endpoint(
-        "127.0.0.1:0",
+        &zs_protocol::ListenSpec::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         zs_proto_postgres::UpstreamEndpoint::new("127.0.0.1", upstream.port()).unwrap(),
         zs_proto_postgres::SslPolicy::RefuseOnLoopback,
         UpstreamTls::WhenOffered,
@@ -5800,7 +5802,9 @@ async fn pg_access_listener(
     .unwrap()
     .with_refusal_audit(audit)
     .with_caller_check(pg_fake::admit_all());
-    let local = listener.local_addr();
+    let zs_protocol::ListenSpec::Tcp(local) = *listener.local() else {
+        panic!("a TCP listener reports a TCP address");
+    };
     tokio::spawn(listener.serve());
     (local, refusals)
 }
